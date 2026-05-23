@@ -1,0 +1,34 @@
+# TouchDesigner
+*.toe.bak
+*.toe.tmp
+Backup/
+Local/
+*.dmp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Python (if we end up using scripts)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Large local-only stuff
+media/raw/
+media/captures/
+scratch/
+tmp/
+
+# Secrets (just in case)
+.env
+*.key
+*.pem
