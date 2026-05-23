@@ -8,11 +8,16 @@ Real-time projection mapping. Track a hand-held object with an Intel RealSense d
 
 - **PC:** Windows, RTX 5090 32GB (PC-5090)
 - **Depth camera:** Intel RealSense D455 (USB-C, 87°×58° FOV, 0.4-6m depth range)
-- **Projector:** JMGO N3 Ultimate 4K Triple Laser
-  - 5800 ISO lumens (bright enough for ambient light)
-  - **1ms low latency mode + ALLM** — the key spec, removes projector from latency budget
-  - VRR support
+- **Projector (current):** Dangbei MP1 MAX 4K Triple Laser
+  - 3100 ISO lumens
+  - Game Mode input lag: ~12-35ms (HDMI 2.1, auto ALLM + VRR)
+  - 4K UHD native, 240Hz at 1080p
+  - Used for office MVP testing
+- **Projector (incoming Tuesday):** JMGO N3 Ultimate 4K Triple Laser
+  - 5800 ISO lumens (brighter, better for larger / well-lit rooms)
+  - 1ms low latency mode + ALLM
   - AI Gimbal (360° pan / 150° tilt) for repositioning without remounting
+  - Used for larger demos (Cobblestone room, etc.)
 
 ## Software
 
@@ -22,13 +27,22 @@ Real-time projection mapping. Track a hand-held object with an Intel RealSense d
 
 ## Latency Budget
 
-End-to-end target: under 80ms (the "feels attached" threshold). Expected:
+End-to-end target: under 80ms (the "feels attached" threshold).
+
+**With Dangbei MP1 MAX (current MVP setup):**
 
 - Camera capture (D455 @ 60fps): ~16ms
 - Depth → mask processing in TD: ~10-15ms
 - Effect compositing: ~10-15ms
-- HDMI out → projector in (ALLM mode): ~1ms
-- **Total: ~40ms** — well under threshold
+- HDMI out → Dangbei in (Game Mode): ~12-35ms
+- **Total: ~50-80ms** — right at the threshold, should feel attached
+
+**With JMGO N3 Ultimate (future, brighter rooms):**
+
+- Camera capture: ~16ms
+- TD processing: ~25-30ms
+- HDMI out → JMGO in (ALLM): ~1ms
+- **Total: ~42-47ms** — well under threshold
 
 ## Repository Layout
 

@@ -12,19 +12,21 @@ Hold any object (white guitar, hand, prop) in front of the projector. RealSense 
 - Switchable effects (fire, water, lightning, glow) — at least 3 variants
 - Setup takes under 10 minutes from cold boot
 
-## Phase 1: Setup Verification (pre-Tuesday)
+## Phase 1: Setup Verification
 
 Done with what's already on the PC.
 
 - [x] RealSense D455 enumerates (Status: OK on both Depth and RGB nodes)
 - [x] RealSense SDK 2.0 installed
 - [x] TouchDesigner installed with full license
+- [x] Projector: Dangbei MP1 MAX confirmed (HDMI 2.1, Game Mode, ~12-35ms lag)
 - [ ] **Action:** open `realsense-viewer.exe`, confirm live depth + RGB feeds
 - [ ] **Action:** in TouchDesigner, drop a `Realsense TOP`, confirm the D455 appears in its dropdown and produces live depth output
+- [ ] **Action:** enable Game Mode on the Dangbei MP1 MAX, confirm HDMI (not wireless) connection
 
-## Phase 2: MVP — Silhouette + Fire (Tue 2026-05-26 → following weekend)
+## Phase 2: MVP — Silhouette + Fire
 
-The "I hold a white guitar and it lights up" demo.
+The "I hold a white guitar and it lights up" demo. Office setup: Dangbei MP1 MAX on shelf, projecting across to couch wall, white guitar on couch. Couch and framed maps behind are far enough back that depth thresholding excludes them.
 
 ### 2a. Projector physical setup
 
@@ -88,9 +90,10 @@ UI: a simple TouchDesigner panel with effect buttons, or MIDI/OSC trigger from a
 
 ## Known Risks
 
-- **Projector throw distance:** N3 Ultimate has 0.88-1.7:1 zoom. At ~3m throw distance we get ~1.5-3m diagonal image. Confirm the room allows this.
-- **Ambient light:** even at 5800 lumens, direct sunlight will wash out the projection. Plan for evening / curtained demos.
-- **RealSense placement:** if camera and projector are too far apart, parallax means the effect "leans" off the object as you move toward/away from the camera. Mounting them on the same bracket helps.
+- **Glossy white guitar:** RealSense D455's IR stereo may have dropouts on glossy lacquer surfaces. Mitigation: depth filling/inpainting in TD, or matte spray (not happening on this guitar).
+- **Office wall has framed glass maps:** they would cause IR reflections and projection hot spots, but they're behind the couch which is behind the depth threshold, so they should be excluded from the tracking mask. Test will confirm.
+- **Ambient light:** Dangbei is 3100 lumens. Side lamp in office reduces contrast. Lights-off testing for best results until white-wall room (1-2 months out).
+- **RealSense placement:** if camera and projector are too far apart, parallax means the effect "leans" off the object as you move toward/away from the camera. Mount the D455 on top of the Dangbei (it has a flat top).
 - **TD network performance:** if the depth → mask → effect chain doesn't hit 60fps, drop to 30fps but keep latency low. Don't accept frame buffering.
 
 ## References
