@@ -47,6 +47,10 @@ class CobblestoneLayout:
     width: int
     height: int
     stones: List[Stone] = field(default_factory=list)
+    # Cached, computed by _bake_layout: shadow alpha map + per-stone int polygons.
+    shadow_rgb: np.ndarray = None
+    base_bg: np.ndarray = None
+    stone_polys_px: List[np.ndarray] = field(default_factory=list)
 
 
 def _make_irregular_polygon(rng: np.random.Generator, n_sides: int = 7,
@@ -62,7 +66,11 @@ def _make_irregular_polygon(rng: np.random.Generator, n_sides: int = 7,
 
 
 def build_layout(width: int, height: int, seed: int = 1664) -> CobblestoneLayout:
-    """Create a deterministic cobblestone layout for the given canvas size."""
+    """Create a deterministic cobblestone layout for the given canvas size.
+
+    Also bakes the expensive-to-recompute pieces (shadow alpha, per-stone
+    pixel polygons, mortar background) so render() can stay cheap.
+    """
     rng = np.random.default_rng(seed)
     layout = CobblestoneLayout(width=width, height=height)
     for j in range(GRID_ROWS):
@@ -74,7 +82,27 @@ def build_layout(width: int, height: int, seed: int = 1664) -> CobblestoneLayout
             palette_idx = (i * 3 + j * 5 + int(rng.integers(0, len(IDLE_PALETTE_BGR)))) % len(IDLE_PALETTE_BGR)
             layout.stones.append(Stone(grid_i=i, grid_j=j, polygon_unit=poly,
                                        palette_idx=palette_idx))
+    _bake_layout(layout)
     return layout
+
+
+def _bake_layout(layout: CobblestoneLayout) -> None:
+    w, h = layout.width, layout.height
+    # Per-stone pixel polygons, computed once.
+    layout.stone_polys_px = [_polygon_pixels(s, w, h, breathe=0.0)
+                             for s in layout.stones]
+    # Mortar + baked drop-shadow rolled into a single uint8 background.
+    base = np.full((h, w, 3), (28, 30, 36), dtype=np.uint8)
+    shadow = np.zeros((h, w), dtype=np.uint8)
+    shadow_offset = np.array((3, 4), dtype=np.int32)
+    for pts in layout.stone_polys_px:
+        cv2.fillPoly(shadow, [pts + shadow_offset], 255)
+    shadow = cv2.GaussianBlur(shadow, (0, 0), sigmaX=4.0)
+    # Burn shadow darkening into the background once (uint8 saturated subtract).
+    s3 = cv2.merge([shadow, shadow, shadow])
+    base = cv2.subtract(base, cv2.convertScaleAbs(s3, alpha=0.35))
+    layout.base_bg = base
+    layout.shadow_rgb = None  # no longer used per-frame
 
 
 def _cell_center(width: int, height: int, i: int, j: int) -> Tuple[float, float]:
@@ -114,56 +142,40 @@ def render(layout: CobblestoneLayout, mode: str, t: float,
     mode: "idle" (warm low-contrast, slow animation)
         | "calibration" (high-contrast position-encoded colors)
         | "selection_bg" (dim warm palette, used as a backdrop)
-    dim: scales final brightness in 0..1 (selection_bg uses ~0.25).
+    dim: scales final brightness in 0..1.
+
+    Heavy pieces (shadow alpha + per-stone pixel polygons + mortar bg) are
+    baked once in build_layout; per-frame work is just the color fills plus
+    a global gain. The stones' shape is fixed (no breathing) so the same
+    polygons render every frame.
     """
     w, h = layout.width, layout.height
-    # Mortar background (cool slate). Subtle vignette so edges read softer.
-    img = np.full((h, w, 3), (28, 30, 36), dtype=np.uint8)
+    img = layout.base_bg.copy()
 
-    # Shadow pass (offset, blurred). Cheap drop shadow.
-    shadow = np.zeros((h, w), dtype=np.uint8)
-    shadow_offset = (3, 4)
-    for stone in layout.stones:
-        pts = _polygon_pixels(stone, w, h, breathe=0.0)
-        pts_shadow = pts + np.array(shadow_offset, dtype=np.int32)
-        cv2.fillPoly(shadow, [pts_shadow], 255)
-    shadow = cv2.GaussianBlur(shadow, (0, 0), sigmaX=4.0)
-    shadow_rgb = (shadow.astype(np.float32) * 0.35)[..., None]
-    img = (img.astype(np.float32) - shadow_rgb).clip(0, 255).astype(np.uint8)
-
-    # Stone fills.
-    pulse = 0.5 + 0.5 * math.sin(t * 0.6)
-    for stone in layout.stones:
+    for stone, pts in zip(layout.stones, layout.stone_polys_px):
         if mode == "calibration":
             base = _encoded_color_bgr(stone.grid_i, stone.grid_j)
-            # Encoded colors should stay vivid; tiny breathing keeps decoder happy.
-            breathe = 0.0
         elif mode == "selection_bg":
             base = IDLE_PALETTE_BGR[stone.palette_idx]
             base = tuple(int(c * 0.45) for c in base)
-            breathe = 0.0
-        else:  # idle
+        else:  # idle: per-stone phase keeps the field gently breathing.
             base = IDLE_PALETTE_BGR[stone.palette_idx]
-            # Per-stone phase so the field "breathes" rather than blinks in unison.
             phase = (stone.grid_i * 0.7 + stone.grid_j * 1.1)
             local = 0.85 + 0.15 * math.sin(t * 0.5 + phase)
             base = tuple(int(c * local) for c in base)
-            breathe = 0.02 * math.sin(t * 0.4 + phase)
-
-        pts = _polygon_pixels(stone, w, h, breathe=breathe)
         cv2.fillPoly(img, [pts], base)
-        # Subtle highlight rim (a brighter outline) so stones look 3D.
         cv2.polylines(img, [pts], isClosed=True,
                       color=tuple(min(255, int(c * 1.25)) for c in base),
                       thickness=1, lineType=cv2.LINE_AA)
 
+    gain = 1.0
     if mode == "idle":
-        # Slow global pulse for the idle state — very gentle.
-        gain = 0.85 + 0.10 * pulse
-        img = (img.astype(np.float32) * gain).clip(0, 255).astype(np.uint8)
-
+        pulse = 0.5 + 0.5 * math.sin(t * 0.6)
+        gain *= 0.85 + 0.10 * pulse
     if dim != 1.0:
-        img = (img.astype(np.float32) * dim).clip(0, 255).astype(np.uint8)
+        gain *= dim
+    if gain != 1.0:
+        img = cv2.convertScaleAbs(img, alpha=gain)
     return img
 
 

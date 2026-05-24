@@ -1,6 +1,7 @@
 """Frame capture: RealSense D455 with webcam + synthetic fallback."""
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -126,25 +127,37 @@ class FrameSource:
     def _read_synthetic(self) -> Frame:
         t = time.time() - self._t0
         h, w = self.height, self.width
-        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-        # gradient background
-        r = (xx / w * 200 + 30).astype(np.uint8)
-        g = (yy / h * 200 + 30).astype(np.uint8)
-        b = (np.full_like(r, 80) + (np.sin(t) * 30).astype(np.int32)).clip(0, 255).astype(np.uint8)
-        color = np.stack([b, g, r], axis=-1)
-        # two moving "objects"
-        cx1 = int(w * 0.35 + np.sin(t * 0.7) * w * 0.1)
-        cy1 = int(h * 0.5 + np.cos(t * 0.5) * h * 0.1)
-        cx2 = int(w * 0.7 + np.sin(t * 1.1) * w * 0.05)
-        cy2 = int(h * 0.4 + np.cos(t * 0.9) * h * 0.08)
+        # Cache the static gradient + grid once; per-frame work is just
+        # stamping moving "objects" onto a copy.
+        if getattr(self, "_synth_bg", None) is None:
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            r = (xx / w * 200 + 30).astype(np.uint8)
+            g = (yy / h * 200 + 30).astype(np.uint8)
+            b = np.full_like(r, 80)
+            self._synth_bg = np.stack([b, g, r], axis=-1)
+            self._synth_xx = xx
+            self._synth_yy = yy
+        color = self._synth_bg.copy()
         depth_m = np.full((h, w), 5.0, dtype=np.float32)
+        # two moving "objects" — small enough that boolean masking is cheap.
+        cx1 = int(w * 0.35 + math.sin(t * 0.7) * w * 0.1)
+        cy1 = int(h * 0.5 + math.cos(t * 0.5) * h * 0.1)
+        cx2 = int(w * 0.7 + math.sin(t * 1.1) * w * 0.05)
+        cy2 = int(h * 0.4 + math.cos(t * 0.9) * h * 0.08)
         for (cx, cy, rad, dist, col) in [
             (cx1, cy1, 90, 1.2, (240, 220, 200)),
             (cx2, cy2, 60, 0.9, (180, 230, 240)),
         ]:
-            mask = (xx - cx) ** 2 + (yy - cy) ** 2 < rad * rad
-            depth_m[mask] = dist
-            color[mask] = col
+            # Local bbox only — much faster than whole-image distance check.
+            x0 = max(0, cx - rad); x1 = min(w, cx + rad)
+            y0 = max(0, cy - rad); y1 = min(h, cy + rad)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            xs = self._synth_xx[y0:y1, x0:x1]
+            ys = self._synth_yy[y0:y1, x0:x1]
+            mask = (xs - cx) ** 2 + (ys - cy) ** 2 < rad * rad
+            depth_m[y0:y1, x0:x1][mask] = dist
+            color[y0:y1, x0:x1][mask] = col
         return Frame(color=color, depth_m=depth_m, timestamp=time.time(), source="synthetic")
 
     @staticmethod

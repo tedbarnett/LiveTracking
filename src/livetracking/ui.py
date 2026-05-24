@@ -306,37 +306,37 @@ class App:
             mask_disp = cv2.resize(
                 mask_u8, (self.width, self.height), interpolation=cv2.INTER_LINEAR
             )
-            halo = cv2.GaussianBlur(mask_disp, (0, 0), sigmaX=18.0)
-            alpha = (halo.astype(np.uint16) * 200 // 255).clip(0, 220).astype(np.uint8)
-            # Painters' overlay: max-blend each channel.
-            np.maximum(self._sel_rgba[..., 0], (alpha * color[0] // 255).astype(np.uint8),
-                       out=self._sel_rgba[..., 0])
-            np.maximum(self._sel_rgba[..., 1], (alpha * color[1] // 255).astype(np.uint8),
-                       out=self._sel_rgba[..., 1])
-            np.maximum(self._sel_rgba[..., 2], (alpha * color[2] // 255).astype(np.uint8),
-                       out=self._sel_rgba[..., 2])
+            # Wider sigma for a soft halo; downscale-blur-upscale is much
+            # faster than a giant 1280×720 Gaussian at sigma=18.
+            small = cv2.resize(mask_disp, (self.width // 4, self.height // 4),
+                               interpolation=cv2.INTER_LINEAR)
+            small = cv2.GaussianBlur(small, (0, 0), sigmaX=5.0)
+            halo = cv2.resize(small, (self.width, self.height),
+                              interpolation=cv2.INTER_LINEAR)
+            alpha = cv2.convertScaleAbs(halo, alpha=200.0 / 255.0)
+            for c in range(3):
+                tinted = cv2.convertScaleAbs(alpha, alpha=color[c] / 255.0)
+                np.maximum(self._sel_rgba[..., c], tinted,
+                           out=self._sel_rgba[..., c])
             np.maximum(self._sel_rgba[..., 3], alpha, out=self._sel_rgba[..., 3])
 
-        # Numeric labels — easier on CPU via pygame surface blits, then read back.
-        label_surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        # Numeric badges via cv2 — no pygame surfarray round-trip.
         for seg in self.segments:
-            cx, cy = seg.centroid_xy
-            cx_d = int(cx * sx)
-            cy_d = int(cy * sy)
+            cx_d = int(seg.centroid_xy[0] * sx)
+            cy_d = int(seg.centroid_xy[1] * sy)
             color = HALO_COLORS_RGB[(seg.index - 1) % len(HALO_COLORS_RGB)]
-            badge_r = 18
-            pygame.draw.circle(label_surf, (*color, 230), (cx_d, cy_d), badge_r)
-            pygame.draw.circle(label_surf, (0, 0, 0, 255), (cx_d, cy_d), badge_r, 2)
-            text = self.font_big.render(str(seg.index), True, (10, 10, 10))
-            label_surf.blit(text, (cx_d - text.get_width() // 2,
-                                   cy_d - text.get_height() // 2))
-        label_arr = pygame.surfarray.array3d(label_surf).swapaxes(0, 1)
-        label_a = pygame.surfarray.array_alpha(label_surf).swapaxes(0, 1)
-        mask = label_a > 0
-        self._sel_rgba[mask, 0] = label_arr[mask, 0]
-        self._sel_rgba[mask, 1] = label_arr[mask, 1]
-        self._sel_rgba[mask, 2] = label_arr[mask, 2]
-        self._sel_rgba[mask, 3] = np.maximum(self._sel_rgba[mask, 3], label_a[mask])
+            badge_r = 22
+            cv2.circle(self._sel_rgba, (cx_d, cy_d), badge_r,
+                       (color[0], color[1], color[2], 230), thickness=-1)
+            cv2.circle(self._sel_rgba, (cx_d, cy_d), badge_r,
+                       (0, 0, 0, 255), thickness=2, lineType=cv2.LINE_AA)
+            label = str(seg.index)
+            ts, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.9, 2)
+            tx = cx_d - ts[0] // 2
+            ty = cy_d + ts[1] // 2
+            cv2.putText(self._sel_rgba, label, (tx, ty),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.9, (10, 10, 10, 255),
+                        2, cv2.LINE_AA)
         return self._sel_rgba
 
     def build_effect_mask(self) -> Optional[np.ndarray]:
@@ -351,14 +351,15 @@ class App:
         return (seg.mask.astype(np.uint8) * 255)
 
     def build_overlay(self, t: float) -> np.ndarray:
-        surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        # Direct numpy/cv2 path — avoids pygame.surfarray conversion (~12 ms).
+        out = np.zeros((self.height, self.width, 4), dtype=np.uint8)
         fps = self._compute_fps()
         lat = self.last_render_ms
         cap_src = self.source.source if hasattr(self, "source") else "?"
         if self.mode == MODE_EFFECT and self.selected_index is not None:
             sel_str = f"#{self.selected_index} (effect: {EFFECT_NAMES[self.effect]})"
         elif self.mode == MODE_SELECT:
-            sel_str = f"{len(self.segments)} candidates — press 1..{len(self.segments)}"
+            sel_str = f"{len(self.segments)} candidates - press 1..{len(self.segments)}"
         else:
             sel_str = "-"
         lines = [
@@ -368,26 +369,27 @@ class App:
             f"capture: {cap_src}",
             HELP_LINE,
         ]
+        highlight_first = False
         if self.mode == MODE_CALIBRATE and self.calibration_start is not None:
             remaining = max(0.0, 3.0 - (time.perf_counter() - self.calibration_start))
-            lines.insert(0, f"CALIBRATING — {remaining:.1f}s remaining")
-        pad = 8
+            lines.insert(0, f"CALIBRATING - {remaining:.1f}s remaining")
+            highlight_first = True
+        pad = 12
         line_h = 22
         box_h = pad * 2 + line_h * len(lines)
-        pygame.draw.rect(surf, (0, 0, 0, 170), pygame.Rect(0, 0, 620, box_h))
+        # Translucent black panel behind the text.
+        cv2.rectangle(out, (0, 0), (620, box_h), (0, 0, 0, 170), thickness=-1)
+        font = cv2.FONT_HERSHEY_SIMPLEX
         for i, line in enumerate(lines):
-            color = (255, 220, 120) if i == 0 and self.mode == MODE_CALIBRATE else (240, 240, 240)
-            text = self.font.render(line, True, color)
-            surf.blit(text, (pad, pad + i * line_h))
-
+            col = (120, 220, 255, 255) if (i == 0 and highlight_first) else (240, 240, 240, 255)
+            org = (pad, pad + i * line_h + 14)
+            cv2.putText(out, line, (org[0] + 1, org[1] + 1), font,
+                        0.5, (0, 0, 0, 220), 1, cv2.LINE_AA)
+            cv2.putText(out, line, org, font, 0.5, col, 1, cv2.LINE_AA)
         if self.errors:
-            err_text = self.font.render(f"errors: {len(self.errors)} — last: {self.errors[-1][:60]}",
-                                        True, (255, 120, 120))
-            surf.blit(err_text, (pad, self.height - 28))
-
-        rgba = pygame.surfarray.array3d(surf).swapaxes(0, 1)
-        alpha = pygame.surfarray.array_alpha(surf).swapaxes(0, 1)
-        out = np.dstack([rgba, alpha]).astype(np.uint8)
+            err = f"errors: {len(self.errors)} - last: {self.errors[-1][:60]}"
+            cv2.putText(out, err, (pad, self.height - 18), font,
+                        0.5, (120, 120, 255, 255), 1, cv2.LINE_AA)
         return out
 
     def _compute_fps(self) -> float:
