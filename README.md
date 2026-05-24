@@ -2,7 +2,7 @@
 
 Real-time projection mapping. Track a hand-held object with an Intel RealSense depth camera, project effects (fire, glow, particles) back onto it using TouchDesigner.
 
-**Status:** On hold pending new projector. Ted is waiting on the new projector before doing more work on this. Current Dangbei MP1 MAX setup is still usable for crude tests at the office, but active build work is paused. Resume when projector arrives.
+**Status:** On hold pending new projector arrival (JMGO N3 Ultimate, expected Tuesday 2026-05-26). Current Dangbei MP1 MAX setup is still usable for crude tests at the office, but Ted is pausing active build work until the new projector lands. Resume once it arrives.
 
 *Last updated by Helm — 2026-05-24*
 
@@ -15,7 +15,14 @@ Real-time projection mapping. Track a hand-held object with an Intel RealSense d
   - Game Mode input lag: ~12-35ms (auto ALLM + VRR)
   - Sitting on the office shelf, aimed at the wall opposite, white guitar as test subject
   - Good enough for crude MVP tests; physical setup constrained by couch and existing office furniture for now
-- **Projector (incoming, model TBD):** Ted is sourcing a new projector. Specs and arrival date pending confirmation. Update this section when the order is placed.
+- **Projector (incoming Tuesday 2026-05-26):** JMGO N3 Ultimate 4K Triple Laser
+  - 5800 ISO lumens (brighter, better for larger / well-lit rooms)
+  - 3-in-1 Lens Shift, Optical Zoom
+  - AI Gimbal (no remounting when repositioning)
+  - 20000:1 contrast
+  - 1ms low latency mode + VRR + ALLM (huge — wipes out the projector latency floor)
+  - Dolby Vision
+  - Use case: larger demos (Cobblestone Labs room, etc.) and the daily driver once it arrives
 
 ## Software
 
@@ -35,7 +42,12 @@ End-to-end target: under 80ms (the "feels attached" threshold).
 - HDMI out → Dangbei in (Game Mode): ~12-35ms
 - **Total: ~50-80ms** — right at the threshold, should feel attached
 
-The incoming projector's latency profile will be added once the model is confirmed.
+**With JMGO N3 Ultimate (incoming, will be the primary projector):**
+
+- Camera capture: ~16ms
+- TD processing: ~25-30ms
+- HDMI out → JMGO in (1ms low-latency mode + ALLM): ~1ms
+- **Total: ~42-47ms** — well under threshold, comfortable margin
 
 ## Repository Layout
 

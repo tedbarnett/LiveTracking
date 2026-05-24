@@ -33,7 +33,7 @@ The "I hold a white guitar and it lights up" demo. Office setup: Dangbei MP1 MAX
 - Mount projector (ceiling, table, or temporary tripod)
 - Aim it at a flat wall or large board
 - Aim the RealSense from roughly the same axis as the projector (parallax-minimizing — they don't need to be coincident but closer is better)
-- Confirm "Game Mode" / ALLM is enabled on whichever projector is in use (Dangbei MP1 MAX for current MVP)
+- Confirm "Game Mode" / ALLM is enabled on whichever projector is in use (Dangbei MP1 MAX for current crude tests; JMGO N3 Ultimate's 1ms low-latency mode + ALLM once it arrives Tuesday 2026-05-26)
 - Set projector to 1080p input (4K is overkill for this and adds processing — we can revisit)
 
 ### 2b. Depth → mask in TouchDesigner
