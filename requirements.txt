@@ -1,0 +1,6 @@
+# LiveTracking Phase 0 dependencies (Python 3.11+ on Windows)
+numpy==1.26.4
+opencv-python==4.10.0.84
+moderngl==5.10.0
+pygame==2.5.2
+pyrealsense2==2.55.1.6486
