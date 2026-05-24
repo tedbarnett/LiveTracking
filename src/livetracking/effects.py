@@ -231,13 +231,18 @@ class EffectRenderer:
         self.overlay_tex.write(np.ascontiguousarray(rgba).tobytes())
 
     # ---- draw --------------------------------------------------------------
-    def render(self, t: float, effect: int):
+    def render(self, t: float, effect: int, target=None):
+        """Render the composited frame.
+
+        target: a moderngl.Framebuffer to render into. Defaults to ctx.screen
+                (the windowed surface). Headless callers pass an offscreen FBO.
+        """
         self.prog["u_time"].value = float(t)
         self.prog["u_effect"].value = int(effect)
         self.pattern_tex.use(0)
         self.selection_tex.use(1)
         self.mask_tex.use(2)
         self.overlay_tex.use(3)
-        self.ctx.screen.use()
+        (target if target is not None else self.ctx.screen).use()
         self.ctx.clear(0.02, 0.02, 0.03)
         self.vao.render(moderngl.TRIANGLE_STRIP)

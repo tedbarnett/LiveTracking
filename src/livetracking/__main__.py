@@ -21,17 +21,24 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="camera capture height (default 480)")
     p.add_argument("--capture-fps", type=int, default=30, help="camera fps (default 30)")
     p.add_argument("--no-camera", action="store_true",
-                   help="skip real cameras; use synthetic frames only")
+                   help="skip all real cameras; use synthetic frames only")
+    p.add_argument("--no-realsense", action="store_true",
+                   help="skip the RealSense; allow webcam, else synthetic")
     p.add_argument("--fullscreen", action="store_true", help="fullscreen window")
     p.add_argument("--test", action="store_true",
-                   help="run a short headless-ish boot test (30 frames) and exit")
+                   help="run a headless 30-frame test and exit with FPS report")
     p.add_argument("--test-frames", type=int, default=30,
                    help="number of frames in --test mode (default 30)")
+    p.add_argument("--headless", action="store_true",
+                   help="run without a window (moderngl standalone context)")
     return p.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    # --test implies headless + no camera (deterministic synthetic frames).
+    headless = args.headless or args.test
+    headless_camera = args.no_camera or args.test
     opts = AppOptions(
         width=args.width,
         height=args.height,
@@ -40,8 +47,10 @@ def main(argv=None) -> int:
         capture_fps=args.capture_fps,
         test_mode=args.test,
         test_frames=args.test_frames,
-        headless_camera=args.no_camera,
+        headless_camera=headless_camera,
+        no_realsense=args.no_realsense,
         fullscreen=args.fullscreen,
+        headless=headless,
     )
 
     app = App(opts)

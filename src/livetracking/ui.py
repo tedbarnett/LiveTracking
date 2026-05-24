@@ -58,6 +58,27 @@ HALO_COLORS_RGB = [
 HELP_LINE = "C=calibrate  S=select  1-9=pick  E=effect  R=reseg  Esc=idle  Q=quit"
 
 
+class _SyntheticOnlySource:
+    """Forces FrameSource into synthetic mode for deterministic --test runs."""
+    def __init__(self, width: int, height: int):
+        # Build a FrameSource then mark it synthetic and release any handles.
+        self._inner = FrameSource(prefer_realsense=False, width=width,
+                                  height=height, fps=30, serial=None)
+        self._inner.close()
+        self._inner.source = "synthetic"
+        self._inner._cap = None
+        self._inner._pipeline = None
+        self.source = "synthetic"
+        self._w = width
+        self._h = height
+
+    def read(self):
+        return self._inner._read_synthetic()
+
+    def close(self):
+        pass
+
+
 @dataclass
 class AppOptions:
     width: int = 1280
@@ -68,7 +89,12 @@ class AppOptions:
     test_mode: bool = False
     test_frames: int = 30
     headless_camera: bool = False
+    no_realsense: bool = False
     fullscreen: bool = False
+    realsense_serial: Optional[str] = "241122304828"
+    # When True, run without a visible window: moderngl standalone context
+    # + offscreen FBO. Used by --test on CI / build agents.
+    headless: bool = False
 
 
 class App:
@@ -91,32 +117,66 @@ class App:
 
     # ------------------------------------------------------------------ setup
     def setup(self):
-        pygame.init()
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
-        pygame.display.gl_set_attribute(
-            pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
-        )
-        flags = pygame.OPENGL | pygame.DOUBLEBUF
-        if self.opts.fullscreen:
-            flags |= pygame.FULLSCREEN
-        self.screen = pygame.display.set_mode((self.width, self.height), flags)
-        pygame.display.set_caption("LiveTracking — Phase 0")
+        self._headless = self.opts.headless
+        if self._headless:
+            # Use SDL's dummy video driver so pygame.font / pygame.Surface work
+            # without an actual window; GL goes through a standalone context.
+            os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+            pygame.init()
+            # Initialize a dummy SDL surface so pygame.Surface(SRCALPHA) works
+            # for the overlay/selection layer compositing.
+            pygame.display.set_mode((self.width, self.height))
+            self.ctx = moderngl.create_standalone_context(require=330)
+            self._fbo = self.ctx.simple_framebuffer((self.width, self.height))
+            self._fbo.use()
+            self.screen = None
+        else:
+            pygame.init()
+            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+            pygame.display.gl_set_attribute(
+                pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
+            )
+            flags = pygame.OPENGL | pygame.DOUBLEBUF
+            if self.opts.fullscreen:
+                flags |= pygame.FULLSCREEN
+            self.screen = pygame.display.set_mode((self.width, self.height), flags)
+            pygame.display.set_caption("LiveTracking — Phase 0")
+            self.ctx = moderngl.create_context()
 
-        self.ctx = moderngl.create_context()
         self.fx = EffectRenderer(self.ctx, self.width, self.height)
 
         # Pattern layout is generated at display resolution.
         self.layout = build_layout(self.width, self.height)
 
-        # Frame source.
-        prefer_rs = not self.opts.headless_camera
-        self.source = FrameSource(
-            prefer_realsense=prefer_rs,
-            width=self.opts.capture_width,
-            height=self.opts.capture_height,
-            fps=self.opts.capture_fps,
-        )
+        # Frame source. --no-camera forces synthetic; --no-realsense skips
+        # the depth camera but still allows a webcam if one is present.
+        if self.opts.headless_camera:
+            prefer_rs = False
+            # Force-disable webcam too by requesting an obviously-unavailable
+            # serial — capture.py's fallback chain ends at synthetic.
+            self.source = FrameSource(
+                prefer_realsense=False,
+                width=self.opts.capture_width,
+                height=self.opts.capture_height,
+                fps=self.opts.capture_fps,
+                serial=None,
+            )
+            # If a webcam attached anyway, override to synthetic so tests are
+            # deterministic.
+            if self.source.source == "webcam":
+                self.source.close()
+                self.source = _SyntheticOnlySource(
+                    self.opts.capture_width, self.opts.capture_height
+                )
+        else:
+            self.source = FrameSource(
+                prefer_realsense=not self.opts.no_realsense,
+                width=self.opts.capture_width,
+                height=self.opts.capture_height,
+                fps=self.opts.capture_fps,
+                serial=self.opts.realsense_serial if not self.opts.no_realsense else None,
+            )
         print(f"[ui] capture source: {self.source.source}")
 
         self.font = pygame.font.SysFont("Consolas", 18)
@@ -131,6 +191,8 @@ class App:
 
     # ------------------------------------------------------------------ input
     def handle_events(self):
+        if self._headless:
+            return
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
@@ -359,8 +421,11 @@ class App:
         overlay = self.build_overlay(t)
         self.fx.upload_overlay_rgba(overlay)
 
-        self.fx.render(t=t, effect=self.effect)
-        pygame.display.flip()
+        if self._headless:
+            self.fx.render(t=t, effect=self.effect, target=self._fbo)
+        else:
+            self.fx.render(t=t, effect=self.effect)
+            pygame.display.flip()
 
         now = time.perf_counter()
         self.fps_times.append(now)
@@ -369,13 +434,51 @@ class App:
 
     def run(self):
         try:
-            while self.running:
-                self.frame()
-                if self.opts.test_mode and self.frame_count >= self.opts.test_frames:
-                    print(f"[ui] test mode — ran {self.frame_count} frames; exiting.")
-                    self.running = False
+            if self.opts.test_mode:
+                self._run_scripted_test()
+            else:
+                while self.running:
+                    self.frame()
         finally:
             self.shutdown()
+
+    def _run_scripted_test(self):
+        """Headless-ish test: walk through idle → select → effect to exercise
+        every render path, segment pass and effect shader. Skip calibrate
+        (would block 3s and isn't part of the FPS metric we care about).
+        """
+        n = max(6, self.opts.test_frames)
+        per_effect = max(1, n // 6)
+        # Phase 1: IDLE
+        self.mode = MODE_IDLE
+        for _ in range(per_effect):
+            self.frame()
+            if not self.running:
+                return
+        # Phase 2: SELECT (run segmentation; auto-pick #1 if any)
+        self.mode = MODE_SELECT
+        self._run_segmentation()
+        for _ in range(per_effect):
+            self.frame()
+        if self.segments:
+            self._select_object(1)
+        # Phase 3: cycle each effect for `per_effect` frames
+        for eff_idx in range(len(CYCLE_ORDER)):
+            self.effect_cycle_idx = eff_idx
+            self.effect = CYCLE_ORDER[eff_idx]
+            self.mode = MODE_EFFECT if self.segments else MODE_IDLE
+            for _ in range(per_effect):
+                self.frame()
+                if self.frame_count >= n:
+                    break
+            if self.frame_count >= n:
+                break
+        # Fill any remaining budget back in idle.
+        while self.frame_count < n and self.running:
+            self.mode = MODE_IDLE
+            self.frame()
+        print(f"[ui] test mode — ran {self.frame_count} frames; exiting.")
+        self.running = False
 
     def shutdown(self):
         try:
