@@ -2,7 +2,11 @@
 
 Real-time projection mapping. Track a hand-held object with an Intel RealSense depth camera, project effects (fire, glow, particles) back onto it using TouchDesigner.
 
-**Status:** On hold pending new projector arrival (JMGO N3 Ultimate, expected Tuesday 2026-05-26). Current Dangbei MP1 MAX setup is still usable for crude tests at the office, but Ted is pausing active build work until the new projector lands. Resume once it arrives.
+**Status:** Active build, Phase 0 in progress (Sunday night 2026-05-24). Software pipeline being built against camera + monitor as virtual projector. Phase 1 (real projector) starts Tuesday 2026-05-26 when the JMGO N3 Ultimate arrives.
+
+**Full product spec:** see [`docs/SPEC.md`](docs/SPEC.md).
+
+**Design language:** the calibration pattern is an animated **cobblestone field** — doubles as branding (Cobblestone Labs, TimeWalk 1664 Manhattan) and as a strong structured-light feature pattern. Stones encode position via color; layout follows a hidden 8×6 grid for fast decoding.
 
 *Last updated by Helm — 2026-05-24*
 
