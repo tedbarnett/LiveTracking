@@ -2,22 +2,20 @@
 
 Real-time projection mapping. Track a hand-held object with an Intel RealSense depth camera, project effects (fire, glow, particles) back onto it using TouchDesigner.
 
-**Status:** Setup phase. Projector arrives Tuesday 2026-05-26. MVP target: that weekend.
+**Status:** On hold pending new projector. Ted is waiting on the new projector before doing more work on this. Current Dangbei MP1 MAX setup is still usable for crude tests at the office, but active build work is paused. Resume when projector arrives.
+
+*Last updated by Helm — 2026-05-24*
 
 ## Hardware
 
 - **PC:** Windows, RTX 5090 32GB (PC-5090)
 - **Depth camera:** Intel RealSense D455 (USB-C, 87°×58° FOV, 0.4-6m depth range)
 - **Projector (current):** Dangbei MP1 MAX 4K Triple Laser
-  - 3100 ISO lumens
-  - Game Mode input lag: ~12-35ms (HDMI 2.1, auto ALLM + VRR)
-  - 4K UHD native, 240Hz at 1080p
-  - Used for office MVP testing
-- **Projector (incoming Tuesday):** JMGO N3 Ultimate 4K Triple Laser
-  - 5800 ISO lumens (brighter, better for larger / well-lit rooms)
-  - 1ms low latency mode + ALLM
-  - AI Gimbal (360° pan / 150° tilt) for repositioning without remounting
-  - Used for larger demos (Cobblestone room, etc.)
+  - 3100 ISO lumens, 4K UHD native, HDMI 2.1
+  - Game Mode input lag: ~12-35ms (auto ALLM + VRR)
+  - Sitting on the office shelf, aimed at the wall opposite, white guitar as test subject
+  - Good enough for crude MVP tests; physical setup constrained by couch and existing office furniture for now
+- **Projector (incoming, model TBD):** Ted is sourcing a new projector. Specs and arrival date pending confirmation. Update this section when the order is placed.
 
 ## Software
 
@@ -29,7 +27,7 @@ Real-time projection mapping. Track a hand-held object with an Intel RealSense d
 
 End-to-end target: under 80ms (the "feels attached" threshold).
 
-**With Dangbei MP1 MAX (current MVP setup):**
+**With Dangbei MP1 MAX (current setup):**
 
 - Camera capture (D455 @ 60fps): ~16ms
 - Depth → mask processing in TD: ~10-15ms
@@ -37,12 +35,7 @@ End-to-end target: under 80ms (the "feels attached" threshold).
 - HDMI out → Dangbei in (Game Mode): ~12-35ms
 - **Total: ~50-80ms** — right at the threshold, should feel attached
 
-**With JMGO N3 Ultimate (future, brighter rooms):**
-
-- Camera capture: ~16ms
-- TD processing: ~25-30ms
-- HDMI out → JMGO in (ALLM): ~1ms
-- **Total: ~42-47ms** — well under threshold
+The incoming projector's latency profile will be added once the model is confirmed.
 
 ## Repository Layout
 
@@ -56,11 +49,13 @@ End-to-end target: under 80ms (the "feels attached" threshold).
 
 See `docs/PLAN.md` for the full build plan with phases:
 
-1. **Setup verification** (pre-Tuesday) — confirm hardware and SDK
-2. **MVP: silhouette + fire** (Tuesday-Sunday) — guitar held in projection field, fire effect tracks silhouette
+1. **Setup verification** — confirm hardware and SDK (mostly done)
+2. **MVP: silhouette + fire** — guitar held in projection field, fire effect tracks silhouette
 3. **Calibration** — projector/camera alignment
 4. **Effect library** — multiple effects, switchable live
 5. **Hands-free interaction** — gesture triggers, motion-reactive effects
+
+**Currently paused** at Phase 1 / pre-Phase-2 pending the new projector.
 
 ## Cloning on Other Machines
 
@@ -83,4 +78,4 @@ Large binary files (`.toe` project files, video recordings, particle textures ov
 
 ---
 
-*Repo created 2026-05-23 by Helm + Ted. Project doc: `docs/PLAN.md`.*
+*Repo created 2026-05-23 by Helm + Ted. Updated 2026-05-24 to reflect on-hold status pending new projector. Project doc: `docs/PLAN.md`.*
