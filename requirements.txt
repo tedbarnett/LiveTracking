@@ -1,6 +1,12 @@
-# LiveTracking Phase 0 dependencies (Python 3.11+ on Windows)
+# LiveTracking — Phase 0 pinned dependencies
+# Tested on Python 3.11 / Windows 11 / RTX 5090.
+
 numpy==1.26.4
 opencv-python==4.10.0.84
+pygame==2.6.1
 moderngl==5.10.0
-pygame==2.5.2
+PyQt6==6.7.1
+
+# RealSense (Windows wheel). If install fails, the app still runs in webcam
+# fallback mode; you can comment this line out and reinstall.
 pyrealsense2==2.55.1.6486
