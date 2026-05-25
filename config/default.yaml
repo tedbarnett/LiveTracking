@@ -1,0 +1,52 @@
+# LiveTracking default configuration
+# Tuned for Windows 11 / PC-5090 / Intel RealSense D455 / 1080p projector output.
+
+camera:
+  width: 848
+  height: 480
+  fps: 60
+  align_depth_to_color: true
+  lock_exposure: true
+  exposure: 120
+  gain: 16
+
+projector:
+  width: 1920
+  height: 1080
+  display_index: 1
+  fullscreen: true
+
+segmentation:
+  mode: depth_first
+  min_depth_delta_mm: 60
+  min_depth_mm: 250
+  max_depth_mm: 4500
+  min_object_area_px: 500
+  max_object_area_px: 500000
+  morphology_kernel_px: 5
+  blur_kernel_px: 5
+  fill_holes: true
+  require_projector_roi: true
+
+tracking:
+  max_centroid_jump_px: 90
+  max_lost_frames: 10
+  min_stable_frames: 3
+  iou_weight: 0.55
+  centroid_weight: 0.30
+  area_weight: 0.15
+
+ui:
+  show_fps: true
+  show_object_numbers: true
+  show_all_contours: true
+  selected_outline_thickness_px: 4
+  unselected_outline_thickness_px: 2
+
+controls:
+  capture_background: b
+  recalibrate: c
+  rescan: r
+  cycle_effect: e
+  lock_selection: enter
+  clear_selection: escape
