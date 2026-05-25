@@ -52,6 +52,18 @@ Calibration improvements landed 2026-05-25 morning:
 - Full 2x2 Jacobian for projector↔camera mapping (replaces diagonal sx/sy approximation that broke on rotated targets)
 - minAreaRect bbox center for post-it detection (replaces brightness centroid that biased toward whichever side of the post-it reflected more light)
 - Per-target manual nudge for residual offset correction
+- Greedy nearest-neighbor data association in self-heal (was sort-by-x which paired the wrong winner with the wrong post-it when targets moved across each other in x)
+- Clamp `current_proj` and `corrected_proj` to projector frame bounds so failed convergence still keeps the + visible (stuck at edge) instead of rendering off-screen
+
+## Known issue (parked 2026-05-25)
+
+Closed-loop convergence sometimes **diverges to a frame-edge clamp** for one or more targets, especially after a post-it is moved to a new cam_y range. Diagnostic signature: `err_px > 10`, `proj_xy` at (0/W, 0/H) edge.
+
+**Workaround:** manual nudge controls in the web UI. Tap the arrow buttons until the + sign lands on the post-it. Nudges persist across daemon restarts (`runtime/nudges.json`).
+
+**Real fix (parked for v2):** init the closed-loop search using **already-converged peer targets' (cam_xy → proj_xy) mapping** instead of the global planar homography. Predicts T1's projector position from T2 + T3's converged positions via 2-point Procrustes or N-point affine. Combined with a "failed-target retry pass" after initial convergence, this should eliminate the divergence-to-edge symptom.
+
+Attempted 2026-05-25 (commit `ef52197`) but the daemon hung in the new retry path — reverted to `a3cb9a6`. Will retry properly in a fresh subagent session with offline tests before live-deploying, or just rebuild around image-registration / structured-light when the JMGO arrives.
 
 Architecture:
 - [`projection_daemon.py`](src/livetracking/daemon/projection_daemon.py) —
