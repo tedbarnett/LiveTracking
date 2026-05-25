@@ -2,7 +2,13 @@
 
 Real-time projection mapping. Track a hand-held object with an Intel RealSense depth camera, project effects (fire, glow, particles) back onto it using TouchDesigner.
 
-**Status:** Active build, Phase 0 in progress (Sunday night 2026-05-24). Software pipeline being built against camera + monitor as virtual projector. Phase 1 (real projector) starts Tuesday 2026-05-26 when the JMGO N3 Ultimate arrives.
+**Status:** Active build. **2026-05-24 night session: SUCCESS** — system now reliably detects three post-it notes on a wall via edge detection, then projects three distinct colored `+` signs that land on each post-it via closed-loop iterative search. Errors 10-16 px (well inside post-it bounds). Works on weak hardware (Kodak Pocket Projector + RealSense D455 + room lights on). JMGO N3 Ultimate arrives Tuesday 2026-05-26 — will make this much faster, sharper, and brighter.
+
+**Working algorithm** lives at [`src/livetracking/calibration/`](src/livetracking/calibration/):
+- `edge_detect.py` — finds projection rectangle + post-its from a single white-flood camera capture
+- `closed_loop_search.py` — per-target iterative search; for each detected target, projects a `+` at the current best projector estimate, diffs the camera frame against a baseline (threshold=30 on the diff, locked RealSense exposure), measures the offset, applies proportional correction, repeats until error < 12 px
+
+The 2/3 vs 3/3 breakthrough came from two fixes after hours of grinding: (a) threshold=30 instead of 15 on the diff (lower threshold connected scene-wide noise into one giant fake blob), and (b) locking RealSense auto-exposure (the camera was auto-compensating for projector brightness changes between baseline and lit frames).
 
 **Full product spec:** see [`docs/SPEC.md`](docs/SPEC.md).
 
@@ -14,7 +20,7 @@ Real-time projection mapping. Track a hand-held object with an Intel RealSense d
 
 **Design language:** the calibration pattern is an animated **cobblestone field** — doubles as branding (Cobblestone Labs, TimeWalk 1664 Manhattan) and as a strong structured-light feature pattern. Stones encode position via color; layout follows a hidden 8×6 grid for fast decoding.
 
-*Last updated by Helm — 2026-05-24*
+*Last updated by Helm — 2026-05-24 night, after the 3/3 win.*
 
 ## Hardware
 
