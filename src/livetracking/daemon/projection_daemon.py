@@ -718,11 +718,42 @@ def main():
                     print(f"  heal: only {len(new_postits) if new_postits else 0} found, skipping",
                           flush=True)
                 else:
+                    # Nearest-neighbor data association: match each existing
+                    # winner to its closest detected post-it (by Euclidean
+                    # distance in camera coords), greedy. Prevents the
+                    # heal-failure-on-large-move bug where new_postits got
+                    # re-sorted left-to-right and a moved target got compared
+                    # to a different post-it's position.
+                    assigned = [None] * len(winners)
+                    available = list(range(len(new_postits)))
+                    pairs = []
+                    for wi, old_w in enumerate(winners):
+                        for pi in available:
+                            ocx, ocy = old_w["target_cam"]
+                            ncx, ncy = new_postits[pi]["centroid_cam"]
+                            dist = math.hypot(ocx - ncx, ocy - ncy)
+                            pairs.append((dist, wi, pi))
+                    pairs.sort(key=lambda x: x[0])
+                    used_winners = set()
+                    for dist, wi, pi in pairs:
+                        if wi in used_winners or pi not in available:
+                            continue
+                        assigned[wi] = pi
+                        used_winners.add(wi)
+                        available.remove(pi)
+
                     shifted_indices = []
-                    for i, (old_w, new_p) in enumerate(zip(winners, new_postits)):
-                        oc = old_w["target_cam"]
+                    matched_postits = {}  # winner-idx -> new_postit dict
+                    for i, pi in enumerate(assigned):
+                        if pi is None:
+                            print(f"  heal #{i+1}: no match found in new detections",
+                                  flush=True)
+                            continue
+                        new_p = new_postits[pi]
+                        oc = winners[i]["target_cam"]
                         nc = new_p["centroid_cam"]
                         shift = math.hypot(oc[0] - nc[0], oc[1] - nc[1])
+                        matched_postits[i] = new_p
                         if shift > SHIFT_THRESHOLD_PX:
                             print(f"  shift #{i+1}: {shift:.1f}px ({oc} -> {nc}) RECONVERGING",
                                   flush=True)
@@ -732,7 +763,7 @@ def main():
                     if shifted_indices:
                         baseline = capture_baseline()
                         for i in shifted_indices:
-                            new_p = new_postits[i]
+                            new_p = matched_postits[i]
                             new_target = new_p["centroid_cam"]
                             init_proj = list(winners[i]["proj_center"])  # start near prior
                             best = converge_target(screen, pipe, baseline, new_target,
