@@ -32,12 +32,14 @@ _SRC = os.path.normpath(os.path.join(_HERE, "..", ".."))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 from livetracking.calib_v1.peer_init import predict_proj_from_peers
+from livetracking.calib_v1.nudge_memory import NudgeMemory
 
 STATE_DIR = r"D:\Github-D\LiveTracking\runtime"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 FRAME_FILE = os.path.join(STATE_DIR, "latest_frame.jpg")
 COMMAND_FILE = os.path.join(STATE_DIR, "command.txt")
 NUDGES_FILE = os.path.join(STATE_DIR, "nudges.json")
+LEARNED_OFFSETS_FILE = os.path.join(STATE_DIR, "learned_offsets.jsonl")
 LEGACY_CMD_FILE = r"D:\Github-D\LiveTracking\tmp\iv10_cmd.txt"
 os.makedirs(STATE_DIR, exist_ok=True)
 
@@ -807,8 +809,29 @@ def main():
         running = True
         render_mode = "plus"  # default - clearer for diagnosing per-target placement  # "fill" or "plus"
         last_status = "ok"
-        nudges = load_nudges()  # {1: [dx, dy], 2: [dx, dy], 3: [dx, dy]} in projector px
-        print(f"[run] loaded nudges: {nudges}", flush=True)
+        nudges = load_nudges()  # {1: [dx, dy], 2: [dx, dy], 3: [dx, dy]} in projector px - session-level
+        print(f"[run] loaded session nudges: {nudges}", flush=True)
+        nudge_memory = NudgeMemory(LEARNED_OFFSETS_FILE)
+        print(f"[run] loaded {len(nudge_memory.entries)} learned offsets from {LEARNED_OFFSETS_FILE}",
+              flush=True)
+        # Apply learned offsets as INITIAL session nudges per target, based
+        # on each target's cam_xy. Future manual nudges add on top of this
+        # and also append to the learned memory.
+        for tgt_idx, w in enumerate(winners):
+            learned = nudge_memory.lookup(w["target_cam"])
+            if learned is not None:
+                # Only seed if there's no existing session nudge for this target
+                # (don't double-apply if the saved nudges.json already has one).
+                if nudges.get(tgt_idx + 1, [0.0, 0.0]) == [0.0, 0.0]:
+                    nudges[tgt_idx + 1] = list(learned)
+                    print(f"   T{tgt_idx+1} cam{w['target_cam']}: applied learned offset {learned}",
+                          flush=True)
+                else:
+                    print(f"   T{tgt_idx+1} cam{w['target_cam']}: session nudge already set, learned offset {learned} ignored",
+                          flush=True)
+            else:
+                print(f"   T{tgt_idx+1} cam{w['target_cam']}: no learned offset within radius",
+                      flush=True)
         clock = pygame.time.Clock()
         while running and (time.time() - t0) < 12 * 3600:
             t = time.time() - t0
@@ -1048,7 +1071,15 @@ def main():
                                         elif direction == "reset":
                                             nudges[idx] = [0.0, 0.0]
                                         save_nudges(nudges)
-                                        last_status = f"nudge t{idx} {direction} -> {nudges[idx]}"
+                                        # Persist to learned memory keyed by
+                                        # the target's current cam_xy so
+                                        # future runs auto-apply this offset.
+                                        # Skip on reset (offset=0 isn't useful learning).
+                                        if direction != "reset" and idx - 1 < len(winners):
+                                            target_cam = winners[idx - 1]["target_cam"]
+                                            nudge_memory.append(target_cam,
+                                                                  nudges[idx])
+                                        last_status = f"nudge t{idx} {direction} -> {nudges[idx]} (learned)"
                                 except (ValueError, IndexError) as e:
                                     print(f"  bad nudge cmd '{cmd}': {e}", flush=True)
                         elif cmd == "reset_nudges":
