@@ -2,13 +2,22 @@
 
 Real-time projection mapping. Track a hand-held object with an Intel RealSense depth camera, project effects (fire, glow, particles) back onto it using TouchDesigner.
 
-**Status:** Active build. **2026-05-24 night session: SUCCESS** — system now reliably detects three post-it notes on a wall via edge detection, then projects three distinct colored `+` signs that land on each post-it via closed-loop iterative search. Errors 10-16 px (well inside post-it bounds). Works on weak hardware (Kodak Pocket Projector + RealSense D455 + room lights on). JMGO N3 Ultimate arrives Tuesday 2026-05-26 — will make this much faster, sharper, and brighter.
+**Status:** Active build. **Working in two regimes:**
+- 2026-05-24 night (dark room, locked exposure): closed-loop iterative search lands 3/3 `+` signs on post-its, errors 10-16 px.
+- 2026-05-25 morning (daylight): the night detector broke. Replaced with `diff_detect.py` (project black + white, diff = projection rectangle, ambient-independent). 3/3 sub-pixel convergence under morning sun.
 
-**Working algorithm** lives at [`src/livetracking/calibration/`](src/livetracking/calibration/):
-- `edge_detect.py` — finds projection rectangle + post-its from a single white-flood camera capture
-- `closed_loop_search.py` — per-target iterative search; for each detected target, projects a `+` at the current best projector estimate, diffs the camera frame against a baseline (threshold=30 on the diff, locked RealSense exposure), measures the offset, applies proportional correction, repeats until error < 12 px
+**Working modules** at [`src/livetracking/calib_v1/`](src/livetracking/calib_v1/):
+- `diff_detect.py` — **canonical detector**. Ambient-independent projector↔scene differencing. Use this.
+- `closed_loop_search.py` — per-target iterative search to land `+` signs / fills on detected targets.
+- `edge_detect.py` — original Otsu detector. Kept for dark-room reference; breaks at sunrise.
 
-The 2/3 vs 3/3 breakthrough came from two fixes after hours of grinding: (a) threshold=30 instead of 15 on the diff (lower threshold connected scene-wide noise into one giant fake blob), and (b) locking RealSense auto-exposure (the camera was auto-compensating for projector brightness changes between baseline and lit frames).
+**Standing rule (Ted, 2026-05-25):** analysis happens ONLY inside the projection rectangle. Everything outside (walls, chairs, desks) is masked out before detection runs. Detection looking outside the rectangle is the source of every false-positive we ever hit.
+
+**Tried and shelved 2026-05-25:**
+- `iter_v11_grid_homography.py` — 9×7 checkerboard for one-shot projector↔camera homography. Kodak's contrast is too low; `findChessboardCorners` fails. Targets occluding the board (post-its on the wall) also break the all-corners-required detector.
+- `iter_v12_aruco_homography.py` — 4 corner ArUco markers. Kodak's contrast is too low to decode the markers' internal 4×4 binary patterns; 8 candidate quads detected, 0 decoded. **Retry on JMGO Tuesday.**
+
+The right v2 architecture (Ted's idea, 2026-05-25): project the camera frame back onto the wall, gradient-descend the projector↔camera homography to minimize image-registration error. Continuous calibration, no per-target detection. Build on JMGO.
 
 **Full product spec:** see [`docs/SPEC.md`](docs/SPEC.md).
 
@@ -20,7 +29,7 @@ The 2/3 vs 3/3 breakthrough came from two fixes after hours of grinding: (a) thr
 
 **Design language:** the calibration pattern is an animated **cobblestone field** — doubles as branding (Cobblestone Labs, TimeWalk 1664 Manhattan) and as a strong structured-light feature pattern. Stones encode position via color; layout follows a hidden 8×6 grid for fast decoding.
 
-*Last updated by Helm — 2026-05-24 night, after the 3/3 win.*
+*Last updated by Helm — 2026-05-25 morning, after the diff-detect ship + ArUco/checkerboard shelving.*
 
 ## Hardware
 
@@ -116,7 +125,8 @@ Large binary files (`.toe` project files, video recordings, particle textures ov
 
 1. **Set up the rig**: projector on Windows extended display (note the offset, e.g. (5120, 0)); USB camera pointed at the same wall area; room lights stable.
 
-2. **Lock the camera exposure** (s.option.enable_auto_exposure=0, rs.option.exposure=150). Auto-exposure compensates for projector content shifts and breaks the differencing logic.
+2. **Lock the camera exposure** (
+s.option.enable_auto_exposure=0, rs.option.exposure=150). Auto-exposure compensates for projector content shifts and breaks the differencing logic.
 
 3. **White-flood capture** the scene -> Otsu threshold finds the projection rectangle in camera coords -> Canny edges + contour filtering finds your targets inside it. For post-it-style rectangles: area 800-8000 px, 4-6 vertices, aspect < 1.6, solidity > 0.85.
 
