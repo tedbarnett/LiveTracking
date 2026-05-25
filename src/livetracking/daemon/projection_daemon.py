@@ -660,7 +660,7 @@ def main():
         screenshot_taken = False
         heal_count = 0
         running = True
-        render_mode = "fill"  # "fill" or "plus"
+        render_mode = "plus"  # default - clearer for diagnosing per-target placement  # "fill" or "plus"
         last_status = "ok"
         clock = pygame.time.Clock()
         while running and (time.time() - t0) < 12 * 3600:
