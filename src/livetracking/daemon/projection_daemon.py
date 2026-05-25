@@ -656,6 +656,13 @@ def main():
                 damp = 0.7
                 current_proj[0] += dx_proj * damp
                 current_proj[1] += dy_proj * damp
+                # CLAMP: prevent runaway divergence outside projector frame.
+                # If Jacobian is locally degenerate (e.g. probe blob lost),
+                # the step can blow up. Without this, proj_xy can land at
+                # y=3666 and the + sign is invisible. Clamp keeps it in
+                # the projector frame so at minimum we know we failed.
+                current_proj[0] = max(0, min(DISPLAY_W - 1, current_proj[0]))
+                current_proj[1] = max(0, min(DISPLAY_H - 1, current_proj[1]))
                 # Reproject and measure
                 blit(screen, render_one_plus(current_proj[0], current_proj[1]))
                 for _ in range(8):
@@ -783,6 +790,9 @@ def main():
                                         J, np.array([dx_cam, dy_cam], dtype=float))
                                     current_proj[0] += float(proj_delta[0]) * 0.7
                                     current_proj[1] += float(proj_delta[1]) * 0.7
+                                    # Clamp - see initial-converge loop above.
+                                    current_proj[0] = max(0, min(DISPLAY_W - 1, current_proj[0]))
+                                    current_proj[1] = max(0, min(DISPLAY_H - 1, current_proj[1]))
                                     blit(screen, render_one_plus(current_proj[0], current_proj[1]))
                                     for _ in range(6):
                                         for _ in pygame.event.get(): pass
