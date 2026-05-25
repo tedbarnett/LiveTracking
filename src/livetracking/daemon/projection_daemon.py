@@ -26,6 +26,13 @@ import os, sys, time, math, json, threading
 import numpy as np, cv2, pygame
 import pyrealsense2 as rs
 
+# Make src/ importable when this file is run directly (not as a module).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.path.normpath(os.path.join(_HERE, "..", ".."))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+from livetracking.calib_v1.peer_init import predict_proj_from_peers
+
 STATE_DIR = r"D:\Github-D\LiveTracking\runtime"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 FRAME_FILE = os.path.join(STATE_DIR, "latest_frame.jpg")
@@ -632,9 +639,19 @@ def main():
         for tgt_idx, p in enumerate(postits):
             label = f"#{tgt_idx+1}"
             target_cam = p["centroid_cam"]
-            pt = np.array([[target_cam]], dtype=np.float32)
-            proj_pt = cv2.perspectiveTransform(pt, H_init)
-            init_proj = [float(proj_pt[0][0][0]), float(proj_pt[0][0][1])]
+            # Prefer peer-init if we already have 2+ converged peers.
+            # Falls back to global planar H if not enough peers yet.
+            peer_pred = predict_proj_from_peers(target_cam, winners)
+            if peer_pred is not None:
+                init_proj = peer_pred
+                init_src = f"peer-affine({len(winners)})"
+            else:
+                pt = np.array([[target_cam]], dtype=np.float32)
+                proj_pt = cv2.perspectiveTransform(pt, H_init)
+                init_proj = [float(proj_pt[0][0][0]), float(proj_pt[0][0][1])]
+                init_src = "planar-H"
+            print(f"   {label}: init from {init_src} -> ({init_proj[0]:.0f},{init_proj[1]:.0f})",
+                  flush=True)
             best = converge_target(screen, pipe, baseline, target_cam, init_proj,
                                     max_iter=18, label=label)
             J = probe_jacobian(screen, pipe, baseline, best["proj_xy"],
@@ -701,6 +718,80 @@ def main():
                                           J, final_err))
             blit(screen, render_solid((0, 0, 0)))
             for _ in range(15):
+                for _ in pygame.event.get(): pass
+                pipe.wait_for_frames()
+
+        # RETRY PASS: any target with err_px > 10 gets one more shot using
+        # peer-affine init from the targets that succeeded. T1 commonly
+        # fails on planar-H init when T2+T3 converge fine, and peer-affine
+        # init drops it onto the right post-it cleanly.
+        FAIL_ERR_THRESHOLD = 10.0
+        for i in range(len(winners)):
+            if winners[i]["err_px"] <= FAIL_ERR_THRESHOLD:
+                continue
+            good_peers = [w for j, w in enumerate(winners)
+                          if j != i and w["err_px"] <= FAIL_ERR_THRESHOLD]
+            if len(good_peers) < 2:
+                print(f"[retry #{i+1}] only {len(good_peers)} good peers, skipping",
+                      flush=True)
+                continue
+            target_cam = postits[i]["centroid_cam"]
+            retry_init = predict_proj_from_peers(target_cam, good_peers)
+            if retry_init is None:
+                print(f"[retry #{i+1}] peer prediction None, skipping", flush=True)
+                continue
+            print(f"[retry #{i+1}] peer-init -> ({retry_init[0]:.0f},{retry_init[1]:.0f})",
+                  flush=True)
+            retry_best = converge_target(screen, pipe, baseline, target_cam,
+                                          retry_init, max_iter=18,
+                                          label=f"#{i+1}-retry")
+            if retry_best is None:
+                print(f"[retry #{i+1}] converge_target returned None", flush=True)
+                continue
+            new_err = float(retry_best.get("err", 999.0))
+            old_err = float(winners[i]["err_px"])
+            print(f"[retry #{i+1}] new_err={new_err:.1f} old_err={old_err:.1f}",
+                  flush=True)
+            if new_err >= old_err:
+                continue
+            # Improved - probe Jacobian, do residual refinement, build new winner.
+            J_retry = probe_jacobian(screen, pipe, baseline,
+                                      retry_best["proj_xy"], retry_best["cam_xy"])
+            current_proj = list(retry_best["proj_xy"])
+            current_cam = retry_best["cam_xy"]
+            for r_iter in range(6):
+                dx_cam = target_cam[0] - current_cam[0]
+                dy_cam = target_cam[1] - current_cam[1]
+                if math.hypot(dx_cam, dy_cam) < 1.0:
+                    break
+                proj_delta = np.linalg.solve(
+                    J_retry, np.array([dx_cam, dy_cam], dtype=float))
+                current_proj[0] += float(proj_delta[0]) * 0.7
+                current_proj[1] += float(proj_delta[1]) * 0.7
+                current_proj[0] = max(0, min(DISPLAY_W - 1, current_proj[0]))
+                current_proj[1] = max(0, min(DISPLAY_H - 1, current_proj[1]))
+                blit(screen, render_one_plus(current_proj[0], current_proj[1]))
+                for _ in range(6):
+                    for _ in pygame.event.get(): pass
+                    pipe.wait_for_frames()
+                f = pipe.wait_for_frames()
+                wp = np.asanyarray(f.get_color_frame().get_data())
+                blob = find_plus_blob(baseline, wp,
+                                       target_cam=target_cam, search_r=200)
+                if blob is None:
+                    break
+                current_cam = (blob[0], blob[1])
+            final_err = math.hypot(current_cam[0] - target_cam[0],
+                                    current_cam[1] - target_cam[1])
+            winners[i] = build_winner(target_cam,
+                                        postits[i]["rot_size"],
+                                        postits[i]["rot_angle_deg"],
+                                        current_proj, current_cam,
+                                        J_retry, final_err)
+            print(f"[retry #{i+1}] FINAL err={final_err:.1f} proj=({current_proj[0]:.0f},{current_proj[1]:.0f})",
+                  flush=True)
+            blit(screen, render_solid((0, 0, 0)))
+            for _ in range(10):
                 for _ in pygame.event.get(): pass
                 pipe.wait_for_frames()
 
