@@ -497,6 +497,13 @@ def build_winner(target_cam, rot_size, rot_angle, converged_proj,
 
     corrected_proj = [converged_proj[0] + dx_proj,
                        converged_proj[1] + dy_proj]
+    # CLAMP: keep the rendered + visible. If convergence failed (very
+    # large cam-residual + uncertain Jacobian), the corrected position
+    # can land way outside the projector frame. Clamp to [0, frame-1]
+    # so the + at least stays on the wall. Operator sees it stuck at
+    # an edge and triggers Restart.
+    corrected_proj[0] = max(0.0, min(DISPLAY_W - 1, corrected_proj[0]))
+    corrected_proj[1] = max(0.0, min(DISPLAY_H - 1, corrected_proj[1]))
 
     # Build cam-space corner offsets for the (shrunk) rotated rect, then
     # map each through J_inv into projector-space corner offsets.
