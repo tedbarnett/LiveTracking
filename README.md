@@ -39,11 +39,19 @@ and control:
 
 Features:
 - Live RealSense RGB camera frame (refreshes ~1×/sec)
-- Tracked-targets table: cam coords, projector coords, sub-pixel error, rotation angle
-- Mode toggle: render `+` signs or animated colored fills per target
+- Tracked-targets table: cam coords, projector coords, sub-pixel error, rotation angle, current nudge
+- Per-target color coding (target 1 = red, 2 = green, 3 = blue) matching the projected + signs
+- Mode toggle: render `+` signs (default) or animated colored fills per target
+- **Per-target manual nudge controls** (▲ ▼ ◀ ▶ arrow grid + reset per row). Compensates for residual parallax / per-target wiggle that no algorithm fully solves. Each click = 5 projector pixels. Persisted to `runtime/nudges.json` so nudges survive daemon restarts.
 - Restart / Recalibrate button (daemon exits 42, supervisor relaunches, fresh detection)
 - Screenshot button (forces a fresh camera capture)
-- Status: uptime, heal-cycle count, current mode
+- Status: uptime, heal-cycle count, current mode, last-status
+- Cobblestone favicon + apple-touch-icon + webmanifest for proper iOS/Android "Add to Home Screen"
+
+Calibration improvements landed 2026-05-25 morning:
+- Full 2x2 Jacobian for projector↔camera mapping (replaces diagonal sx/sy approximation that broke on rotated targets)
+- minAreaRect bbox center for post-it detection (replaces brightness centroid that biased toward whichever side of the post-it reflected more light)
+- Per-target manual nudge for residual offset correction
 
 Architecture:
 - [`projection_daemon.py`](src/livetracking/daemon/projection_daemon.py) —
