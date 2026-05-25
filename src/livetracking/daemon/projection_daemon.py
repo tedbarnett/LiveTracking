@@ -56,16 +56,31 @@ def render_solid(c):
                    np.array(c, dtype=np.uint8), dtype=np.uint8)
 
 
-def render_one_plus(px, py, length=45, thick=16):
+# BGR colors matching the web UI per-target legend.
+# Target 1 = red, 2 = green, 3 = blue.
+PLUS_COLORS_BGR = [
+    (60, 60, 255),    # red
+    (60, 255, 60),    # green
+    (255, 80, 80),    # blue
+]
+
+
+def render_one_plus(px, py, length=45, thick=16, color=(255, 255, 255)):
+    """Render a single + sign at (px, py) in the given BGR color.
+
+    Defaults to white because the closed-loop search depends on white-on-black
+    for differencing-based detection. Only the live render-mode loop should
+    pass a non-white color.
+    """
     canvas = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype=np.uint8)
     if not (0 <= px < DISPLAY_W and 0 <= py < DISPLAY_H):
         return canvas
     px = int(px); py = int(py)
     cv2.line(canvas, (px - length, py), (px + length, py),
-             (255, 255, 255), thick, cv2.LINE_AA)
+             color, thick, cv2.LINE_AA)
     cv2.line(canvas, (px, py - length), (px, py + length),
-             (255, 255, 255), thick, cv2.LINE_AA)
-    cv2.circle(canvas, (px, py), 8, (255, 255, 255), -1, cv2.LINE_AA)
+             color, thick, cv2.LINE_AA)
+    cv2.circle(canvas, (px, py), 8, color, -1, cv2.LINE_AA)
     return canvas
 
 
@@ -106,22 +121,28 @@ def gen_water(w, h, t_s):
 
 
 def render_animated_fills(rect_specs, t_s):
+    """rect_specs is a list of (proj_quad, content_fn).
+
+    proj_quad is a 4x2 float array of projector-space corners in order
+    [top-left, top-right, bottom-right, bottom-left] (matching the
+    cam-space rotated-rect ordering, just mapped through the Jacobian into
+    projector space, so the quad may be sheared/skewed).
+    """
     canvas = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype=np.uint8)
     overall_pulse = 0.75 + 0.25 * (0.5 + 0.5 * math.sin(t_s * 1.8))
-    for i, (cx, cy, hw, hh, rot_deg, content_fn) in enumerate(rect_specs):
-        w = max(2, int(round(2 * hw)))
-        h = max(2, int(round(2 * hh)))
+    for i, (proj_quad, content_fn) in enumerate(rect_specs):
+        dst = np.asarray(proj_quad, dtype=np.float32)
+        # Pick a content texture size that roughly matches the quad's
+        # projector-space extent so the warp resamples sensibly.
+        side_top = np.linalg.norm(dst[1] - dst[0])
+        side_bot = np.linalg.norm(dst[2] - dst[3])
+        side_left = np.linalg.norm(dst[3] - dst[0])
+        side_right = np.linalg.norm(dst[2] - dst[1])
+        w = max(2, int(round((side_top + side_bot) * 0.5)))
+        h = max(2, int(round((side_left + side_right) * 0.5)))
         content = content_fn(w, h, t_s)
         content = (content.astype(np.float32) * overall_pulse).clip(0, 255).astype(np.uint8)
-        rad = math.radians(rot_deg)
-        cosr, sinr = math.cos(rad), math.sin(rad)
         src = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
-        dst = []
-        for lx, ly in [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]:
-            rx = lx * cosr - ly * sinr
-            ry = lx * sinr + ly * cosr
-            dst.append([cx + rx, cy + ry])
-        dst = np.array(dst, dtype=np.float32)
         M = cv2.getPerspectiveTransform(src, dst)
         warped = cv2.warpPerspective(content, M, (DISPLAY_W, DISPLAY_H),
                                       borderValue=(0, 0, 0))
@@ -354,56 +375,109 @@ def converge_target(screen, pipe, baseline, target_cam, initial_proj_xy,
     return best
 
 
-def probe_scale(screen, pipe, baseline, converged_proj, converged_cam):
-    """Return signed Jacobian. sx, sy can be negative if axes are inverted."""
-    # +X probe
-    blit(screen, render_one_plus(converged_proj[0] + 30, converged_proj[1]))
+def probe_jacobian(screen, pipe, baseline, converged_proj, converged_cam,
+                    probe_px=30.0):
+    """Measure the full 2x2 local Jacobian J of the projector->camera mapping.
+
+    Probes +probe_px displacements in proj-x and proj-y, captures the FULL
+    2D camera-space delta of the rendered + blob for each probe, and
+    assembles J such that  cam_delta = J @ proj_delta  for small
+    displacements near (converged_proj, converged_cam).
+
+    Returns J as a 2x2 numpy array. Falls back to a sensible diagonal
+    default if a probe fails to detect a blob.
+    """
+    # +X probe in projector space
+    blit(screen, render_one_plus(converged_proj[0] + probe_px, converged_proj[1]))
     for _ in range(8):
         for _ in pygame.event.get(): pass
         pipe.wait_for_frames()
     f = pipe.wait_for_frames()
     wp = np.asanyarray(f.get_color_frame().get_data())
-    blob = find_plus_blob(baseline, wp, target_cam=converged_cam, search_r=180)
-    sx = ((blob[0] - converged_cam[0]) / 30.0) if blob else 0.22
-    # +Y probe
-    blit(screen, render_one_plus(converged_proj[0], converged_proj[1] + 30))
+    blob_x = find_plus_blob(baseline, wp, target_cam=converged_cam, search_r=180)
+    if blob_x is not None:
+        col_x = np.array([(blob_x[0] - converged_cam[0]) / probe_px,
+                          (blob_x[1] - converged_cam[1]) / probe_px])
+    else:
+        col_x = np.array([0.22, 0.0])
+
+    # +Y probe in projector space
+    blit(screen, render_one_plus(converged_proj[0], converged_proj[1] + probe_px))
     for _ in range(8):
         for _ in pygame.event.get(): pass
         pipe.wait_for_frames()
     f = pipe.wait_for_frames()
     wp = np.asanyarray(f.get_color_frame().get_data())
-    blob = find_plus_blob(baseline, wp, target_cam=converged_cam, search_r=180)
-    sy = ((blob[1] - converged_cam[1]) / 30.0) if blob else 0.22
-    # ensure non-zero magnitudes
-    if abs(sx) < 0.05: sx = 0.22 * (1 if sx >= 0 else -1)
-    if abs(sy) < 0.05: sy = 0.22 * (1 if sy >= 0 else -1)
-    return sx, sy
+    blob_y = find_plus_blob(baseline, wp, target_cam=converged_cam, search_r=180)
+    if blob_y is not None:
+        col_y = np.array([(blob_y[0] - converged_cam[0]) / probe_px,
+                          (blob_y[1] - converged_cam[1]) / probe_px])
+    else:
+        col_y = np.array([0.0, 0.22])
+
+    J = np.column_stack([col_x, col_y])  # 2x2; columns are camera-deltas per unit proj displacement.
+
+    # Guard against degenerate (near-singular) Jacobians. If det is tiny,
+    # fall back to a diagonal approximation using whichever column has
+    # signal so np.linalg.solve doesn't blow up downstream.
+    det = float(np.linalg.det(J))
+    if abs(det) < 1e-4:
+        sx = col_x[0] if abs(col_x[0]) > 0.05 else 0.22
+        sy = col_y[1] if abs(col_y[1]) > 0.05 else 0.22
+        J = np.array([[sx, 0.0], [0.0, sy]])
+    return J
 
 
 def build_winner(target_cam, rot_size, rot_angle, converged_proj,
-                  converged_cam, scale_x, scale_y, err):
+                  converged_cam, J, err):
     """Compute the projector center for the FILL such that the camera-observed
-    center of the fill lands on target_cam.
+    center of the fill lands on target_cam, plus the projector-space quad
+    that the fill should be rendered into.
 
-    scale_x, scale_y can be negative if the projector axes are inverted
-    relative to the camera (typical for inverted-mount projectors).
+    J is the local 2x2 camera<-projector Jacobian (cam_delta = J @ proj_delta).
+    To convert a desired camera-space shift back into a projector-space shift
+    we solve J @ proj_delta = cam_delta -> proj_delta = solve(J, cam_delta).
+
+    The fill quad in camera space is the (shrunk) rotated rectangle from the
+    detector. To map it into projector space we transform each corner's
+    cam-space offset (from the cam center) through J_inv and add it to the
+    projector-space center. The result is a general quadrilateral, not
+    necessarily a rotated rectangle - which is the whole point of this fix.
     """
     cam_w, cam_h = rot_size
     cam_w_eff = cam_w * FILL_SHRINK
     cam_h_eff = cam_h * FILL_SHRINK
-    half_w_proj = abs((cam_w_eff / 2.0) / scale_x)
-    half_h_proj = abs((cam_h_eff / 2.0) / scale_y)
 
-    # Residual correction: project moves blob in proj_to_cam direction defined
-    # by the scale Jacobian. Need to shift proj position so blob lands at target.
+    # Residual correction: shift proj so the rendered + lands at target_cam.
     dx_cam = target_cam[0] - converged_cam[0]
     dy_cam = target_cam[1] - converged_cam[1]
-    # To move blob by (dx_cam, dy_cam), shift proj by (dx_cam/sx, dy_cam/sy)
-    dx_proj = dx_cam / scale_x
-    dy_proj = dy_cam / scale_y
+    cam_delta = np.array([dx_cam, dy_cam], dtype=float)
+    proj_delta = np.linalg.solve(J, cam_delta)
+    dx_proj, dy_proj = float(proj_delta[0]), float(proj_delta[1])
 
     corrected_proj = [converged_proj[0] + dx_proj,
                        converged_proj[1] + dy_proj]
+
+    # Build cam-space corner offsets for the (shrunk) rotated rect, then
+    # map each through J_inv into projector-space corner offsets.
+    rad = math.radians(rot_angle)
+    cosr, sinr = math.cos(rad), math.sin(rad)
+    hw = cam_w_eff / 2.0
+    hh = cam_h_eff / 2.0
+    cam_corner_offsets = []
+    for lx, ly in [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]:
+        rx = lx * cosr - ly * sinr
+        ry = lx * sinr + ly * cosr
+        cam_corner_offsets.append([rx, ry])
+    cam_corner_offsets = np.array(cam_corner_offsets, dtype=float)  # 4x2
+    # Solve J @ proj_off = cam_off  for each corner. np.linalg.solve
+    # broadcasts on the RHS columns, so transpose -> solve -> transpose.
+    proj_corner_offsets = np.linalg.solve(J, cam_corner_offsets.T).T  # 4x2
+    proj_quad = proj_corner_offsets + np.array(corrected_proj)
+
+    # Diagonal scale equivalents for diagnostics + state.json.
+    sx_diag = float(J[0, 0])
+    sy_diag = float(J[1, 1])
 
     return {
         "target_cam": list(target_cam),
@@ -414,10 +488,11 @@ def build_winner(target_cam, rot_size, rot_angle, converged_proj,
         "converged_proj": list(converged_proj),
         "residual_cam": [dx_cam, dy_cam],
         "residual_proj": [dx_proj, dy_proj],
-        "scale_x": float(scale_x),
-        "scale_y": float(scale_y),
-        "half_w_proj": half_w_proj,
-        "half_h_proj": half_h_proj,
+        "jacobian": [[float(J[0, 0]), float(J[0, 1])],
+                       [float(J[1, 0]), float(J[1, 1])]],
+        "scale_x": sx_diag,
+        "scale_y": sy_diag,
+        "proj_quad": proj_quad.tolist(),
         "err_px": err,
     }
 
@@ -426,9 +501,7 @@ def winners_to_rect_specs(winners, content_fns):
     specs = []
     for i, w in enumerate(winners):
         specs.append((
-            w["proj_center"][0], w["proj_center"][1],
-            w["half_w_proj"], w["half_h_proj"],
-            w["rot_angle_deg"],
+            np.asarray(w["proj_quad"], dtype=np.float32),
             content_fns[i % len(content_fns)],
         ))
     return specs
@@ -517,14 +590,15 @@ def main():
             init_proj = [float(proj_pt[0][0][0]), float(proj_pt[0][0][1])]
             best = converge_target(screen, pipe, baseline, target_cam, init_proj,
                                     max_iter=18, label=label)
-            sx, sy = probe_scale(screen, pipe, baseline, best["proj_xy"],
-                                  best["cam_xy"])
-            print(f"   {label}: closed-loop err={best['err']:.1f}px scale=({sx:.3f},{sy:.3f})",
+            J = probe_jacobian(screen, pipe, baseline, best["proj_xy"],
+                                best["cam_xy"])
+            print(f"   {label}: closed-loop err={best['err']:.1f}px J=[[{J[0,0]:.3f},{J[0,1]:.3f}],[{J[1,0]:.3f},{J[1,1]:.3f}]]",
                   flush=True)
 
             # ITERATIVE RESIDUAL REFINEMENT
             # After closed-loop converges, the + lands within 6-15 px of target.
-            # Apply residual correction in projector space, project + again,
+            # Apply residual correction in projector space using the FULL
+            # 2x2 Jacobian (inverted via np.linalg.solve), project + again,
             # measure new residual, refine until <1 px or max 6 iters.
             current_proj = list(best["proj_xy"])
             current_cam = best["cam_xy"]
@@ -536,8 +610,8 @@ def main():
                     print(f"   {label}: residual converged at <1px (r_iter={r_iter})",
                           flush=True)
                     break
-                dx_proj = dx_cam / sx
-                dy_proj = dy_cam / sy
+                proj_delta = np.linalg.solve(J, np.array([dx_cam, dy_cam], dtype=float))
+                dx_proj, dy_proj = float(proj_delta[0]), float(proj_delta[1])
                 # gentle damping for stability
                 damp = 0.7
                 current_proj[0] += dx_proj * damp
@@ -570,7 +644,7 @@ def main():
             # final projector position (no further residual correction needed).
             winners.append(build_winner(target_cam, p["rot_size"], p["rot_angle_deg"],
                                           current_proj, current_cam,
-                                          sx, sy, final_err))
+                                          J, final_err))
             blit(screen, render_solid((0, 0, 0)))
             for _ in range(15):
                 for _ in pygame.event.get(): pass
@@ -622,8 +696,8 @@ def main():
                             best = converge_target(screen, pipe, baseline, new_target,
                                                     init_proj, max_iter=12, label=f"heal#{i+1}")
                             if best:
-                                sx, sy = probe_scale(screen, pipe, baseline,
-                                                      best["proj_xy"], best["cam_xy"])
+                                J = probe_jacobian(screen, pipe, baseline,
+                                                    best["proj_xy"], best["cam_xy"])
                                 # iterative residual refinement (same as initial)
                                 current_proj = list(best["proj_xy"])
                                 current_cam = best["cam_xy"]
@@ -632,8 +706,10 @@ def main():
                                     dy_cam = new_target[1] - current_cam[1]
                                     if math.hypot(dx_cam, dy_cam) < 1.0:
                                         break
-                                    current_proj[0] += dx_cam / sx * 0.7
-                                    current_proj[1] += dy_cam / sy * 0.7
+                                    proj_delta = np.linalg.solve(
+                                        J, np.array([dx_cam, dy_cam], dtype=float))
+                                    current_proj[0] += float(proj_delta[0]) * 0.7
+                                    current_proj[1] += float(proj_delta[1]) * 0.7
                                     blit(screen, render_one_plus(current_proj[0], current_proj[1]))
                                     for _ in range(6):
                                         for _ in pygame.event.get(): pass
@@ -650,7 +726,7 @@ def main():
                                 winners[i] = build_winner(new_target, new_p["rot_size"],
                                                             new_p["rot_angle_deg"],
                                                             current_proj, current_cam,
-                                                            sx, sy, final_err)
+                                                            J, final_err)
                                 rect_specs = winners_to_rect_specs(winners, content_fns)
                                 print(f"  heal #{i+1} -> err={best['err']:.1f}px",
                                       flush=True)
@@ -661,11 +737,13 @@ def main():
             # Normal render based on current mode.
             if render_mode == "plus":
                 # Render one + sign per target at its converged projector position.
+                # Target 1 = red, 2 = green, 3 = blue (matches web UI legend).
                 frame = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype=np.uint8)
-                for w in winners:
+                for idx, w in enumerate(winners):
                     px, py = w["proj_center"]
-                    # Add the per-target + on top of the canvas
-                    plus = render_one_plus(px, py, length=45, thick=14)
+                    color = PLUS_COLORS_BGR[idx % len(PLUS_COLORS_BGR)]
+                    plus = render_one_plus(px, py, length=45, thick=14,
+                                            color=color)
                     frame = np.maximum(frame, plus)
             else:
                 frame = render_animated_fills(rect_specs, t)
