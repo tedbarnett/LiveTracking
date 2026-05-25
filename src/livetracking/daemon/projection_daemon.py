@@ -30,8 +30,42 @@ STATE_DIR = r"D:\Github-D\LiveTracking\runtime"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 FRAME_FILE = os.path.join(STATE_DIR, "latest_frame.jpg")
 COMMAND_FILE = os.path.join(STATE_DIR, "command.txt")
+NUDGES_FILE = os.path.join(STATE_DIR, "nudges.json")
 LEGACY_CMD_FILE = r"D:\Github-D\LiveTracking\tmp\iv10_cmd.txt"
 os.makedirs(STATE_DIR, exist_ok=True)
+
+NUDGE_STEP_PX = 5  # projector pixels per nudge click
+
+
+def load_nudges():
+    """Load per-target [dx, dy] projector-space offsets from disk.
+
+    Returns {1: [dx, dy], 2: [dx, dy], 3: [dx, dy]} - keys are 1-indexed.
+    Defaults all to [0, 0].
+    """
+    nudges = {1: [0.0, 0.0], 2: [0.0, 0.0], 3: [0.0, 0.0]}
+    if os.path.exists(NUDGES_FILE):
+        try:
+            with open(NUDGES_FILE) as f:
+                loaded = json.load(f)
+            for k, v in loaded.items():
+                try:
+                    nudges[int(k)] = [float(v[0]), float(v[1])]
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"  nudges load err: {e}", flush=True)
+    return nudges
+
+
+def save_nudges(nudges):
+    try:
+        tmp = NUDGES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({str(k): v for k, v in nudges.items()}, f, indent=2)
+        os.replace(tmp, NUDGES_FILE)
+    except Exception as e:
+        print(f"  nudges save err: {e}", flush=True)
 
 DISPLAY_X = 5120
 DISPLAY_Y = 0
@@ -668,6 +702,8 @@ def main():
         running = True
         render_mode = "plus"  # default - clearer for diagnosing per-target placement  # "fill" or "plus"
         last_status = "ok"
+        nudges = load_nudges()  # {1: [dx, dy], 2: [dx, dy], 3: [dx, dy]} in projector px
+        print(f"[run] loaded nudges: {nudges}", flush=True)
         clock = pygame.time.Clock()
         while running and (time.time() - t0) < 12 * 3600:
             t = time.time() - t0
@@ -740,19 +776,31 @@ def main():
                 # actually keep t0 for continuous animation
                 continue
 
-            # Normal render based on current mode.
+            # Normal render based on current mode. Apply per-target nudges
+            # in projector space - manual user offsets via web UI that
+            # compensate for residual parallax / centroid bias.
             if render_mode == "plus":
                 # Render one + sign per target at its converged projector position.
                 # Target 1 = red, 2 = green, 3 = blue (matches web UI legend).
                 frame = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype=np.uint8)
                 for idx, w in enumerate(winners):
                     px, py = w["proj_center"]
+                    nudge = nudges.get(idx + 1, [0.0, 0.0])
+                    px += nudge[0]
+                    py += nudge[1]
                     color = PLUS_COLORS_BGR[idx % len(PLUS_COLORS_BGR)]
                     plus = render_one_plus(px, py, length=45, thick=14,
                                             color=color)
                     frame = np.maximum(frame, plus)
             else:
-                frame = render_animated_fills(rect_specs, t)
+                # Apply nudges to fill mode by translating the proj_quad per target.
+                nudged_specs = []
+                for idx, (proj_quad, content_fn) in enumerate(rect_specs):
+                    nudge = np.array(nudges.get(idx + 1, [0.0, 0.0]),
+                                       dtype=np.float32)
+                    nudged_quad = np.asarray(proj_quad, dtype=np.float32) + nudge
+                    nudged_specs.append((nudged_quad, content_fn))
+                frame = render_animated_fills(nudged_specs, t)
             blit(screen, frame)
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
@@ -793,6 +841,8 @@ def main():
                                               round(w["proj_center"][1], 1)],
                                 "err_px": round(w["err_px"], 2),
                                 "angle_deg": round(w["rot_angle_deg"], 1),
+                                "nudge": [round(nudges.get(i + 1, [0, 0])[0], 1),
+                                           round(nudges.get(i + 1, [0, 0])[1], 1)],
                             }
                             for i, w in enumerate(winners)
                         ],
@@ -833,6 +883,39 @@ def main():
                                          cam_now)
                             cv2.imwrite(FRAME_FILE, cam_now,
                                          [cv2.IMWRITE_JPEG_QUALITY, 70])
+                        elif cmd.startswith("nudge_"):
+                            # nudge_<idx>_<dir>  where dir is left/right/up/down/reset
+                            # also accepts nudge_<idx>_<dir>_<step> for finer steps
+                            parts = cmd.split("_")
+                            if len(parts) >= 3:
+                                try:
+                                    idx = int(parts[1])
+                                    direction = parts[2]
+                                    step = NUDGE_STEP_PX
+                                    if len(parts) >= 4:
+                                        try:
+                                            step = max(1, int(parts[3]))
+                                        except ValueError:
+                                            pass
+                                    if idx in nudges:
+                                        if direction == "left":
+                                            nudges[idx][0] -= step
+                                        elif direction == "right":
+                                            nudges[idx][0] += step
+                                        elif direction == "up":
+                                            nudges[idx][1] -= step
+                                        elif direction == "down":
+                                            nudges[idx][1] += step
+                                        elif direction == "reset":
+                                            nudges[idx] = [0.0, 0.0]
+                                        save_nudges(nudges)
+                                        last_status = f"nudge t{idx} {direction} -> {nudges[idx]}"
+                                except (ValueError, IndexError) as e:
+                                    print(f"  bad nudge cmd '{cmd}': {e}", flush=True)
+                        elif cmd == "reset_nudges":
+                            nudges = {1: [0.0, 0.0], 2: [0.0, 0.0], 3: [0.0, 0.0]}
+                            save_nudges(nudges)
+                            last_status = "nudges reset"
                     except Exception as e:
                         print(f"  command error: {e}", flush=True)
             clock.tick(25)

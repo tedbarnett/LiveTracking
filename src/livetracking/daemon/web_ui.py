@@ -14,6 +14,7 @@ Run:
 """
 import json
 import os
+import re
 import time
 
 from flask import Flask, jsonify, request, send_file, abort, send_from_directory, Response
@@ -25,7 +26,9 @@ FRAME_FILE = os.path.join(RUNTIME_DIR, "latest_frame.jpg")
 COMMAND_FILE = os.path.join(RUNTIME_DIR, "command.txt")
 
 ALLOWED_COMMANDS = {"restart", "recalibrate", "mode_plus", "mode_fill",
-                     "plus", "fill", "screenshot", "heal_now", "quit"}
+                     "plus", "fill", "screenshot", "heal_now", "quit",
+                     "reset_nudges"}
+NUDGE_RE = re.compile(r"^nudge_[123]_(left|right|up|down|reset)(?:_\d+)?$")
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
 
@@ -77,6 +80,18 @@ INDEX_HTML = """<!doctype html>
   tr.target-1 td:first-child,
   tr.target-2 td:first-child,
   tr.target-3 td:first-child { font-weight: 700; }
+  .nudge-grid { display: inline-grid;
+                grid-template-columns: 28px 28px 28px;
+                grid-template-rows: 22px 22px 22px;
+                gap: 2px; }
+  .nudge-grid button { padding: 0; font-size: 12px; line-height: 1;
+                       background: #2d4a8a; color: #eee; border: 1px solid #1a1a1a;
+                       border-radius: 3px; cursor: pointer; }
+  .nudge-grid button:hover { background: #3a5fb0; }
+  .nudge-grid .empty { visibility: hidden; }
+  .nudge-grid .nudge-reset { background: #555; font-size: 10px; }
+  .nudge-label { font-size: 11px; color: #888; margin-top: 2px;
+                 font-variant-numeric: tabular-nums; }
   .controls { display: flex; gap: 10px; margin: 16px 0; flex-wrap: wrap; }
   button { background: #2d4a8a; color: white; border: none; padding: 10px 18px;
            border-radius: 5px; cursor: pointer; font-size: 14px; }
@@ -119,7 +134,7 @@ INDEX_HTML = """<!doctype html>
       <h3 style=\"margin-top:0\">Tracked targets</h3>
       <table>
         <thead>
-          <tr><th>#</th><th>Cam (x, y)</th><th>Proj (x, y)</th><th>Err px</th><th>Angle</th></tr>
+          <tr><th>#</th><th>Cam (x, y)</th><th>Proj (x, y)</th><th>Err</th><th>Angle</th><th>Nudge</th></tr>
         </thead>
         <tbody id=\"targets\"></tbody>
       </table>
@@ -176,11 +191,27 @@ async function refresh() {
     (s.targets || []).forEach(t => {
       const tr = document.createElement('tr');
       tr.className = 'target-' + t.index;
+      const idx = t.index;
+      const nx = (t.nudge ? t.nudge[0] : 0);
+      const ny = (t.nudge ? t.nudge[1] : 0);
+      const grid = '<div class=\"nudge-grid\">' +
+        '<span class=\"empty\"></span>' +
+          '<button onclick=\"sendCmd(\\'nudge_' + idx + '_up\\')\">\u25b2</button>' +
+          '<span class=\"empty\"></span>' +
+        '<button onclick=\"sendCmd(\\'nudge_' + idx + '_left\\')\">\u25c0</button>' +
+          '<button class=\"nudge-reset\" onclick=\"sendCmd(\\'nudge_' + idx + '_reset\\')\">0</button>' +
+          '<button onclick=\"sendCmd(\\'nudge_' + idx + '_right\\')\">\u25b6</button>' +
+        '<span class=\"empty\"></span>' +
+          '<button onclick=\"sendCmd(\\'nudge_' + idx + '_down\\')\">\u25bc</button>' +
+          '<span class=\"empty\"></span>' +
+        '</div>' +
+        '<div class=\"nudge-label\">(' + nx + ', ' + ny + ')</div>';
       tr.innerHTML = '<td>' + t.index + '</td>' +
                       '<td>(' + t.cam_xy[0] + ', ' + t.cam_xy[1] + ')</td>' +
                       '<td>(' + t.proj_xy[0] + ', ' + t.proj_xy[1] + ')</td>' +
                       '<td>' + t.err_px + '</td>' +
-                      '<td>' + t.angle_deg + '\u00b0</td>';
+                      '<td>' + t.angle_deg + '\u00b0</td>' +
+                      '<td>' + grid + '</td>';
       tbody.appendChild(tr);
     });
   } catch (e) {
@@ -238,7 +269,7 @@ def api_frame():
 def api_command():
     data = request.get_json(silent=True) or {}
     cmd = (data.get("command") or "").strip().lower()
-    if cmd not in ALLOWED_COMMANDS:
+    if cmd not in ALLOWED_COMMANDS and not NUDGE_RE.match(cmd):
         return jsonify({"ok": False, "error": f"unknown command: {cmd}"}), 400
     try:
         with open(COMMAND_FILE, "w") as f:
