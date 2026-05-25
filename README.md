@@ -107,3 +107,47 @@ Large binary files (`.toe` project files, video recordings, particle textures ov
 ---
 
 *Repo created 2026-05-23 by Helm + Ted. Updated 2026-05-24 to reflect on-hold status pending new projector. Project doc: `docs/PLAN.md`.*
+
+## How-to (reusable recipe for projector-camera calibration)
+
+**Goal:** Drop a projector + camera in any room, point them at a wall with targets, and have the system auto-detect targets and paint content on them. Self-heals when things move.
+
+### Steps
+
+1. **Set up the rig**: projector on Windows extended display (note the offset, e.g. (5120, 0)); USB camera pointed at the same wall area; room lights stable.
+
+2. **Lock the camera exposure** (s.option.enable_auto_exposure=0, rs.option.exposure=150). Auto-exposure compensates for projector content shifts and breaks the differencing logic.
+
+3. **White-flood capture** the scene -> Otsu threshold finds the projection rectangle in camera coords -> Canny edges + contour filtering finds your targets inside it. For post-it-style rectangles: area 800-8000 px, 4-6 vertices, aspect < 1.6, solidity > 0.85.
+
+4. **For each detected target** (camera_xy + rotation from cv2.minAreaRect):
+   - Use the projection-quad-corners planar homography as the initial projector position estimate
+   - Closed-loop search: project a + sign, diff camera frame against baseline (	hreshold=30 on the diff!), find blob centroid restricted to 200 px around target, compute error, apply proportional correction with damping (alternate Y sign every 2 iterations to handle inverted projector mounting), iterate until error < 6 px
+   - Once converged, probe local scale by projecting at converged + (30, 0) and converged + (0, 30), measuring camera-pixel response. Gives scale_x and scale_y for that target.
+
+5. **Render content** at each target by computing the projector-space rectangle: `half_w_proj = (cam_w * 0.85 / 2) / scale_x`. Apply rotation from `minAreaRect.angle`. Use `cv2.warpPerspective` to map animated content onto the rotated destination corners.
+
+### Empirical tuning constants
+
+(Default values from the 2026-05-24 session; adjust per scene:)
+- `FILL_SHRINK = 0.85` (fills are 85% of detected target size)
+- `VERTICAL_OFFSET_FRAC = 0.10` (shift fills down by 10% of target height)
+- `THRESHOLD_DIFF = 30` (above noise floor of ~7 mean / 10 std)
+- `CONVERGENCE_THRESHOLD_PX = 6`, `MAX_ITERATIONS = 20`, `SEARCH_RADIUS = 200`
+
+### Self-healing
+
+A 30-60 sec watchdog re-runs detection in the background; if any target shifts > 20 px (camera bumped, post-its repositioned), it re-converges just that target.
+
+### The two non-obvious fixes that took hours to find
+
+1. **Threshold the diff at 30, not 15.** Lower threshold connects scene-wide noise into one giant fake blob via morphology, swamping the real marker.
+2. **Lock camera auto-exposure.** Auto-exposure breaks differencing by compensating for the projector's content changes.
+
+Without these, the algorithm oscillates and converges to false bright spots (lamps, reflections, the brightest blob in the camera image happens to be the projector itself rather than the small marker it's showing).
+
+### Reusable skill
+
+The Helm workspace has this codified as a reusable skill at `skills/projector-calibration/` with the full SKILL.md, working recipes (`closed_loop_postits.py`, `animated_fills.py`), and lessons learned.
+
+*Last updated by Helm — 2026-05-24 midnight, after 3/3 + animated fills working.*
