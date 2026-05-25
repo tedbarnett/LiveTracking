@@ -629,81 +629,14 @@ def main():
 
         print("[init] converging each target + ITERATIVE RESIDUAL", flush=True)
         winners = []
-
-        def predict_proj_from_peers(target_cam, peer_winners):
-            """Predict projector position for target_cam using already-converged peers.
-
-            With 2+ peers we fit a 2D affine (cam_xy -> proj_xy) from peer
-            correspondences and predict the new target's proj_xy from that.
-            Much more accurate than the global planar homography for targets
-            close to the peer cluster on a real wall.
-            """
-            if len(peer_winners) < 2:
-                return None
-            cam_pts = np.array([w["target_cam"] for w in peer_winners],
-                                 dtype=np.float32)
-            proj_pts = np.array([w["converged_proj"] for w in peer_winners],
-                                  dtype=np.float32)
-            if len(peer_winners) == 2:
-                # 2-point affine = translation + scale + rotation only,
-                # collinear so use partial Procrustes / linear extrapolation.
-                # Use the mean displacement vector in proj for the cam displacement.
-                dx_cam = target_cam[0] - cam_pts.mean(axis=0)[0]
-                dy_cam = target_cam[1] - cam_pts.mean(axis=0)[1]
-                # Estimate the local cam-to-proj scale from peer pair.
-                cam_span = cam_pts[1] - cam_pts[0]
-                proj_span = proj_pts[1] - proj_pts[0]
-                cam_len = float(np.linalg.norm(cam_span))
-                if cam_len < 1e-3:
-                    return None
-                # Local 2x2 transform: align cam_span to proj_span.
-                # R = proj_span dir, s = |proj_span| / |cam_span|.
-                proj_len = float(np.linalg.norm(proj_span))
-                s = proj_len / cam_len
-                # angle from cam_span to proj_span
-                ang_cam = math.atan2(cam_span[1], cam_span[0])
-                ang_proj = math.atan2(proj_span[1], proj_span[0])
-                dtheta = ang_proj - ang_cam
-                cos_t = math.cos(dtheta)
-                sin_t = math.sin(dtheta)
-                dx_p = s * (dx_cam * cos_t - dy_cam * sin_t)
-                dy_p = s * (dx_cam * sin_t + dy_cam * cos_t)
-                return [proj_pts.mean(axis=0)[0] + dx_p,
-                        proj_pts.mean(axis=0)[1] + dy_p]
-            # 3+ peers: full affine via least-squares.
-            A = np.hstack([cam_pts, np.ones((len(cam_pts), 1), dtype=np.float32)])
-            M, *_ = np.linalg.lstsq(A, proj_pts, rcond=None)
-            cam_h = np.array([target_cam[0], target_cam[1], 1.0], dtype=np.float32)
-            pred = cam_h @ M
-            return [float(pred[0]), float(pred[1])]
-
         for tgt_idx, p in enumerate(postits):
             label = f"#{tgt_idx+1}"
             target_cam = p["centroid_cam"]
-            # Init: prefer peer-affine prediction over global planar H.
-            peer_pred = predict_proj_from_peers(target_cam, winners)
-            if peer_pred is not None:
-                init_proj = peer_pred
-                print(f"   {label}: init from {len(winners)} peers -> ({init_proj[0]:.0f},{init_proj[1]:.0f})",
-                      flush=True)
-            else:
-                pt = np.array([[target_cam]], dtype=np.float32)
-                proj_pt = cv2.perspectiveTransform(pt, H_init)
-                init_proj = [float(proj_pt[0][0][0]), float(proj_pt[0][0][1])]
-                print(f"   {label}: init from planar H -> ({init_proj[0]:.0f},{init_proj[1]:.0f})",
-                      flush=True)
+            pt = np.array([[target_cam]], dtype=np.float32)
+            proj_pt = cv2.perspectiveTransform(pt, H_init)
+            init_proj = [float(proj_pt[0][0][0]), float(proj_pt[0][0][1])]
             best = converge_target(screen, pipe, baseline, target_cam, init_proj,
                                     max_iter=18, label=label)
-            # If convergence failed badly AND we have peers, retry with peer init.
-            if best is None or best.get("err", 9999) > 30.0:
-                if len(winners) >= 2 and peer_pred is None:
-                    # We tried planar first; retry with peers now that we have them.
-                    retry_init = predict_proj_from_peers(target_cam, winners)
-                    if retry_init is not None:
-                        print(f"   {label}: RETRY with peer-affine init {retry_init}",
-                              flush=True)
-                        best = converge_target(screen, pipe, baseline, target_cam,
-                                                retry_init, max_iter=18, label=label + "-retry")
             J = probe_jacobian(screen, pipe, baseline, best["proj_xy"],
                                 best["cam_xy"])
             print(f"   {label}: closed-loop err={best['err']:.1f}px J=[[{J[0,0]:.3f},{J[0,1]:.3f}],[{J[1,0]:.3f},{J[1,1]:.3f}]]",
@@ -768,74 +701,6 @@ def main():
                                           J, final_err))
             blit(screen, render_solid((0, 0, 0)))
             for _ in range(15):
-                for _ in pygame.event.get(): pass
-                pipe.wait_for_frames()
-
-        # SECOND PASS: retry any target that failed convergence (err > 10 px)
-        # using peer-affine init from the targets that DID converge.
-        # This catches the case where T1 fails with planar-H init but T2/T3
-        # succeed, giving us enough peer data to predict T1's proj position
-        # accurately.
-        FAIL_ERR_THRESHOLD = 10.0
-        for retry_round in range(2):
-            failed = [i for i, w in enumerate(winners)
-                      if w["err_px"] > FAIL_ERR_THRESHOLD]
-            good = [w for w in winners if w["err_px"] <= FAIL_ERR_THRESHOLD]
-            if not failed or len(good) < 2:
-                break
-            print(f"[retry round {retry_round+1}] {len(failed)} target(s) failed, retrying with peer init",
-                  flush=True)
-            for i in failed:
-                p = postits[i]
-                label = f"#{i+1}-retry{retry_round+1}"
-                target_cam = p["centroid_cam"]
-                retry_init = predict_proj_from_peers(target_cam, good)
-                if retry_init is None:
-                    continue
-                print(f"   {label}: peer-affine init -> ({retry_init[0]:.0f},{retry_init[1]:.0f})",
-                      flush=True)
-                best = converge_target(screen, pipe, baseline, target_cam,
-                                        retry_init, max_iter=18, label=label)
-                if best is None:
-                    print(f"   {label}: still failed", flush=True)
-                    continue
-                J = probe_jacobian(screen, pipe, baseline, best["proj_xy"],
-                                    best["cam_xy"])
-                # iterative residual refinement (same as initial)
-                current_proj = list(best["proj_xy"])
-                current_cam = best["cam_xy"]
-                for r_iter in range(8):
-                    dx_cam = target_cam[0] - current_cam[0]
-                    dy_cam = target_cam[1] - current_cam[1]
-                    if math.hypot(dx_cam, dy_cam) < 1.0:
-                        break
-                    proj_delta = np.linalg.solve(
-                        J, np.array([dx_cam, dy_cam], dtype=float))
-                    current_proj[0] += float(proj_delta[0]) * 0.7
-                    current_proj[1] += float(proj_delta[1]) * 0.7
-                    current_proj[0] = max(0, min(DISPLAY_W - 1, current_proj[0]))
-                    current_proj[1] = max(0, min(DISPLAY_H - 1, current_proj[1]))
-                    blit(screen, render_one_plus(current_proj[0], current_proj[1]))
-                    for _ in range(6):
-                        for _ in pygame.event.get(): pass
-                        pipe.wait_for_frames()
-                    f = pipe.wait_for_frames()
-                    wp = np.asanyarray(f.get_color_frame().get_data())
-                    blob = find_plus_blob(baseline, wp,
-                                           target_cam=target_cam, search_r=200)
-                    if blob is None:
-                        break
-                    current_cam = (blob[0], blob[1])
-                final_err = math.hypot(current_cam[0] - target_cam[0],
-                                        current_cam[1] - target_cam[1])
-                print(f"   {label}: FINAL err={final_err:.1f}px", flush=True)
-                if final_err < winners[i]["err_px"]:
-                    winners[i] = build_winner(target_cam, p["rot_size"],
-                                                p["rot_angle_deg"],
-                                                current_proj, current_cam,
-                                                J, final_err)
-            blit(screen, render_solid((0, 0, 0)))
-            for _ in range(10):
                 for _ in pygame.event.get(): pass
                 pipe.wait_for_frames()
 
