@@ -55,15 +55,35 @@ Calibration improvements landed 2026-05-25 morning:
 - Greedy nearest-neighbor data association in self-heal (was sort-by-x which paired the wrong winner with the wrong post-it when targets moved across each other in x)
 - Clamp `current_proj` and `corrected_proj` to projector frame bounds so failed convergence still keeps the + visible (stuck at edge) instead of rendering off-screen
 
-## Known issue (parked 2026-05-25)
+## Learning system
 
-Closed-loop convergence sometimes **diverges to a frame-edge clamp** for one or more targets, especially after a post-it is moved to a new cam_y range. Diagnostic signature: `err_px > 10`, `proj_xy` at (0/W, 0/H) edge.
+Manual nudges via the web UI compensate for parallax and other per-position bias. They are also **recorded persistently** to `runtime/learned_offsets.jsonl`, keyed by the target's cam_xy at nudge time.
 
-**Workaround:** manual nudge controls in the web UI. Tap the arrow buttons until the + sign lands on the post-it. Nudges persist across daemon restarts (`runtime/nudges.json`).
+On future restarts, when a target is detected anywhere within `LOOKUP_RADIUS_PX` (default 50 px) of a stored entry, that entry's offset is auto-applied as the initial session nudge. Newer entries override older for the same cam region.
 
-**Real fix (parked for v2):** init the closed-loop search using **already-converged peer targets' (cam_xy → proj_xy) mapping** instead of the global planar homography. Predicts T1's projector position from T2 + T3's converged positions via 2-point Procrustes or N-point affine. Combined with a "failed-target retry pass" after initial convergence, this should eliminate the divergence-to-edge symptom.
+Result: nudge T1 once, restart, T1 lands automatically. Move T1 to a new position, no learned offset there (radius mismatch), you nudge again — and that new offset is also remembered.
 
-Attempted 2026-05-25 (commit `ef52197`) but the daemon hung in the new retry path — reverted to `a3cb9a6`. Will retry properly in a fresh subagent session with offline tests before live-deploying, or just rebuild around image-registration / structured-light when the JMGO arrives.
+Implementation: [`src/livetracking/calib_v1/nudge_memory.py`](src/livetracking/calib_v1/nudge_memory.py) (10 unit tests, no opencv/pygame deps).
+
+## Known issue (parked 2026-05-25 morning)
+
+Closed-loop convergence is **unreliable on weak hardware** (Kodak Pocket Projector). Across consecutive restarts of the same scene:
+- Sometimes all 3 targets converge sub-pixel cleanly
+- Sometimes one or two diverge to a frame-edge clamp (`err_px > 10`, `proj_xy` at (0/W, 0/H))
+- Which targets fail varies run-to-run, suggesting per-iteration noise around a marginal convergence basin
+
+Mitigations shipped 2026-05-25:
+1. **Full 2x2 Jacobian** instead of diagonal sx/sy (commit `abf7a70`, Claude Code) — fixes systematic bias on rotated targets.
+2. **minAreaRect bbox center** instead of brightness centroid (commit `92a173e`) — reduces detection bias on irregular post-it brightness.
+3. **Frame-bound clamps** on residual iterations and `build_winner` (`1703bc6`, `d0d95de`) — keeps `+` visible at edge instead of off-screen when convergence fails.
+4. **Peer-affine retry** for failed targets (`1e979be`) — once two targets converge, the third can retry with their (cam,proj) mapping as a better initial guess.
+5. **Learn-from-nudges** (`4a38fec`) — manual corrections persist and auto-apply on future restarts.
+
+**What still doesn't work:** when multiple targets fail convergence simultaneously, the peer-affine retry has no good peers to learn from, and the system falls back to clamping at frame edges. The learned-offset memory still applies but its base position assumption is wrong, so the final render isn't useful.
+
+**Real fix (post-JMGO):** replace closed-loop convergence with one-shot structured-light calibration (project a known pattern, decode it in the camera, solve a 2D homography across the whole projector frame). Eliminates per-target iteration entirely. See `docs/CALIBRATION-MATH.md` and `docs/PRODUCT-VISION.md` for the cobblestone-pattern approach. With the JMGO N3 Ultimate's 5800 lumens, ArUco / checkerboard / image-registration all become viable (they failed on the Kodak's contrast 2026-05-25 morning, commits `iter_v11`-`iter_v14` shelved).
+
+The learning system stays in place across that rebuild and continues to accumulate parallax data.
 
 Architecture:
 - [`projection_daemon.py`](src/livetracking/daemon/projection_daemon.py) —
