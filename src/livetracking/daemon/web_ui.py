@@ -16,9 +16,10 @@ import json
 import os
 import time
 
-from flask import Flask, jsonify, request, send_file, abort
+from flask import Flask, jsonify, request, send_file, abort, send_from_directory, Response
 
 RUNTIME_DIR = r"D:\Github-D\LiveTracking\runtime"
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 STATE_FILE = os.path.join(RUNTIME_DIR, "state.json")
 FRAME_FILE = os.path.join(RUNTIME_DIR, "latest_frame.jpg")
 COMMAND_FILE = os.path.join(RUNTIME_DIR, "command.txt")
@@ -26,7 +27,24 @@ COMMAND_FILE = os.path.join(RUNTIME_DIR, "command.txt")
 ALLOWED_COMMANDS = {"restart", "recalibrate", "mode_plus", "mode_fill",
                      "plus", "fill", "screenshot", "heal_now", "quit"}
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
+
+
+WEBMANIFEST = {
+    "name": "LiveTracking",
+    "short_name": "LiveTrack",
+    "description": "Self-calibrating projection mapping (Cobblestone Labs).",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#111111",
+    "theme_color": "#111111",
+    "icons": [
+        {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
+        {"src": "/static/icon-256.png", "sizes": "256x256", "type": "image/png"},
+        {"src": "/static/icon-384.png", "sizes": "384x384", "type": "image/png"},
+        {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"},
+    ],
+}
 
 
 INDEX_HTML = """<!doctype html>
@@ -34,6 +52,12 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset=\"utf-8\">
 <title>LiveTracking</title>
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<meta name=\"theme-color\" content=\"#111111\">
+<link rel=\"icon\" type=\"image/x-icon\" href=\"/static/favicon.ico\">
+<link rel=\"icon\" type=\"image/png\" sizes=\"32x32\" href=\"/static/favicon-32.png\">
+<link rel=\"apple-touch-icon\" sizes=\"180x180\" href=\"/static/icon-180.png\">
+<link rel=\"manifest\" href=\"/manifest.webmanifest\">
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, sans-serif;
          background: #111; color: #eee; margin: 0; padding: 20px; }
@@ -46,6 +70,13 @@ INDEX_HTML = """<!doctype html>
   th, td { padding: 6px 10px; border-bottom: 1px solid #333; text-align: left;
            font-variant-numeric: tabular-nums; }
   th { background: #1c1c1c; color: #9cf; font-weight: 500; }
+  /* Per-target row colors match the projected + signs: 1=red, 2=green, 3=blue. */
+  tr.target-1 td { color: #ff7070; }
+  tr.target-2 td { color: #70ff70; }
+  tr.target-3 td { color: #80a0ff; }
+  tr.target-1 td:first-child,
+  tr.target-2 td:first-child,
+  tr.target-3 td:first-child { font-weight: 700; }
   .controls { display: flex; gap: 10px; margin: 16px 0; flex-wrap: wrap; }
   button { background: #2d4a8a; color: white; border: none; padding: 10px 18px;
            border-radius: 5px; cursor: pointer; font-size: 14px; }
@@ -144,6 +175,7 @@ async function refresh() {
     tbody.innerHTML = '';
     (s.targets || []).forEach(t => {
       const tr = document.createElement('tr');
+      tr.className = 'target-' + t.index;
       tr.innerHTML = '<td>' + t.index + '</td>' +
                       '<td>(' + t.cam_xy[0] + ', ' + t.cam_xy[1] + ')</td>' +
                       '<td>(' + t.proj_xy[0] + ', ' + t.proj_xy[1] + ')</td>' +
@@ -170,6 +202,17 @@ refresh();
 @app.route("/")
 def index():
     return INDEX_HTML
+
+
+@app.route("/manifest.webmanifest")
+def manifest():
+    return Response(json.dumps(WEBMANIFEST), mimetype="application/manifest+json")
+
+
+@app.route("/favicon.ico")
+def favicon_root():
+    return send_from_directory(STATIC_DIR, "favicon.ico",
+                                  mimetype="image/x-icon")
 
 
 @app.route("/api/state")
