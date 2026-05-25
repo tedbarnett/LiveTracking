@@ -29,7 +29,42 @@ The right v2 architecture (Ted's idea, 2026-05-25): project the camera frame bac
 
 **Design language:** the calibration pattern is an animated **cobblestone field** — doubles as branding (Cobblestone Labs, TimeWalk 1664 Manhattan) and as a strong structured-light feature pattern. Stones encode position via color; layout follows a hidden 8×6 grid for fast decoding.
 
-*Last updated by Helm — 2026-05-25 morning, after the diff-detect ship + ArUco/checkerboard shelving.*
+## Web UI
+
+The projection daemon publishes its state to a Flask web app for monitoring
+and control:
+
+- **Public:** `https://livetracking.barnettlabs.tech` (Cloudflare tunnel)
+- **Local:** `http://192.168.1.197:5070` (PC-5090 on the home LAN)
+
+Features:
+- Live RealSense RGB camera frame (refreshes ~1×/sec)
+- Tracked-targets table: cam coords, projector coords, sub-pixel error, rotation angle
+- Mode toggle: render `+` signs or animated colored fills per target
+- Restart / Recalibrate button (daemon exits 42, supervisor relaunches, fresh detection)
+- Screenshot button (forces a fresh camera capture)
+- Status: uptime, heal-cycle count, current mode
+
+Architecture:
+- [`projection_daemon.py`](src/livetracking/daemon/projection_daemon.py) —
+  long-running pygame + RealSense process. Owns the projector window and the
+  camera pipeline. Publishes `runtime/state.json` + `runtime/latest_frame.jpg`
+  every ~500ms. Reads `runtime/command.txt` to handle web UI commands.
+  Exit code 42 = restart-requested.
+- [`supervisor.py`](src/livetracking/daemon/supervisor.py) — relaunches
+  daemon on exit 42, waits 5s + relaunches on crash, exits cleanly on 0.
+- [`web_ui.py`](src/livetracking/daemon/web_ui.py) — Flask app on port 5070.
+  All daemon↔UI communication via filesystem so each can restart
+  independently.
+
+Run:
+```powershell
+cd D:\Github-D\LiveTracking
+python src\livetracking\daemon\supervisor.py   # in one terminal
+python src\livetracking\daemon\web_ui.py      # in another
+```
+
+*Last updated by Helm — 2026-05-25, after the web UI ship + Cloudflare route.*
 
 ## Hardware
 
