@@ -1,7 +1,6 @@
 # TouchDesigner project files are binary, large, and change every save
 *.toe filter=lfs diff=lfs merge=lfs -text
 *.tox filter=lfs diff=lfs merge=lfs -text
-
 # Video / image assets
 *.mp4 filter=lfs diff=lfs merge=lfs -text
 *.mov filter=lfs diff=lfs merge=lfs -text
@@ -11,7 +10,6 @@
 *.jpeg filter=lfs diff=lfs merge=lfs -text
 *.exr filter=lfs diff=lfs merge=lfs -text
 *.hdr filter=lfs diff=lfs merge=lfs -text
-
 # Particle / 3D
 *.glb filter=lfs diff=lfs merge=lfs -text
 *.fbx filter=lfs diff=lfs merge=lfs -text
