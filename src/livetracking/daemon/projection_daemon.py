@@ -205,12 +205,18 @@ def find_postits_diff(cam_black, cam_white):
         bh_ = stats2[i, cv2.CC_STAT_HEIGHT]
         if max(bw_, bh_) / max(1, min(bw_, bh_)) > 3.0:
             continue
-        cx, cy = float(cents2[i][0]), float(cents2[i][1])
+        # Switched 2026-05-25: use minAreaRect center, NOT the brightness centroid.
+        # The brightness centroid biases toward whichever side of the post-it
+        # reflects more projector light - on the 45-rotated diamond this pulls
+        # the detected center systematically downward by ~10px, which the
+        # daemon then converges sub-pixel onto. The minAreaRect center is the
+        # geometric center of the post-it's oriented bbox, unbiased by
+        # intra-blob brightness variation.
         ys, xs = np.where(lab2 == i)
         pts = np.stack([xs, ys], axis=1).astype(np.float32)
         (rcx, rcy), (rw, rh), rangle = cv2.minAreaRect(pts)
         cands.append({
-            "centroid_cam": (cx, cy),
+            "centroid_cam": (float(rcx), float(rcy)),
             "rot_size": [float(rw), float(rh)],
             "rot_angle_deg": float(rangle),
             "area": float(a),
