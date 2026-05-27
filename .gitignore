@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Project runtime + scratch (machine-specific, do not commit)
+runtime/
+tmp/
+scripts/out/
+
+# Plans (local working notes)
+.hermes/

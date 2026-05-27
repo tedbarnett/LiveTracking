@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LiveTracking — Perception</title>
+<style>
+  body { background: #111; color: #eee; font-family: -apple-system, Segoe UI, Helvetica, sans-serif; margin: 0; }
+  header { padding: 12px 18px; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .meta { font-size: 12px; color: #888; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 12px; padding: 12px; height: calc(100vh - 60px); box-sizing: border-box; }
+  #stream-wrap { background: #000; border-radius: 6px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  #stream { max-width: 100%; max-height: 100%; }
+  #side { background: #1a1a1a; border-radius: 6px; padding: 12px; overflow-y: auto; }
+  #side h2 { margin: 0 0 8px 0; font-size: 14px; font-weight: 600; color: #bbb; text-transform: uppercase; letter-spacing: 0.05em; }
+  #help { font-size: 11px; color: #666; margin-bottom: 12px; }
+  .obj { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 4px; margin-bottom: 4px; cursor: pointer; transition: background 0.1s; }
+  .obj:hover { background: #2a2a2a; }
+  .obj.hovered { background: #333; outline: 1px solid #555; }
+  .swatch { width: 16px; height: 16px; border-radius: 4px; flex-shrink: 0; }
+  .num { width: 22px; text-align: right; color: #888; font-variant-numeric: tabular-nums; font-size: 13px; }
+  .name { flex: 1; min-width: 0; }
+  .name input { background: transparent; border: 1px solid transparent; color: #eee; font-size: 14px; padding: 2px 4px; border-radius: 3px; width: 100%; box-sizing: border-box; }
+  .name input:hover { border-color: #444; }
+  .name input:focus { border-color: #888; outline: none; background: #111; }
+  .meta-line { font-size: 10px; color: #666; margin-top: 1px; }
+  #status { font-size: 11px; color: #555; margin-top: 12px; padding-top: 12px; border-top: 1px solid #222; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LiveTracking — perception</h1>
+  <div class="meta"><span id="frameTimings">…</span></div>
+</header>
+<main>
+  <div id="stream-wrap">
+    <img id="stream" src="/stream.mjpg" alt="live camera">
+  </div>
+  <aside id="side">
+    <h2>Objects</h2>
+    <div id="help">Hover an item to illuminate it on the wall. Click a name to rename.</div>
+    <div id="objList"></div>
+    <div id="status">connecting…</div>
+  </aside>
+</main>
+<script>
+const objList = document.getElementById('objList');
+const statusEl = document.getElementById('status');
+const timingsEl = document.getElementById('frameTimings');
+let lastHovered = null;
+let editing = new Set();   // ids whose <input> currently has focus — don't overwrite
+
+function rgb(a) { return `rgb(${a[0]}, ${a[1]}, ${a[2]})`; }
+
+function render(payload) {
+  const objs = payload.objects || [];
+  statusEl.textContent = `${objs.length} object${objs.length === 1 ? '' : 's'}, ${new Date(payload.t * 1000).toLocaleTimeString()}`;
+  if (payload.timings_ms) {
+    const t = payload.timings_ms;
+    timingsEl.textContent = `${t.total_ms.toFixed(0)} ms/frame · DINO ${t.n_dino_raw}→${t.n_dino_kept} · ${objs.length} objects`;
+  }
+  const existingIds = new Set(Array.from(objList.children).map(c => Number(c.dataset.id)));
+  const newIds = new Set(objs.map(o => o.id));
+
+  // Remove dead rows
+  Array.from(objList.children).forEach(c => {
+    if (!newIds.has(Number(c.dataset.id))) c.remove();
+  });
+
+  // Add / update rows
+  objs.sort((a, b) => a.id - b.id);
+  objs.forEach(o => {
+    let row = objList.querySelector(`[data-id="${o.id}"]`);
+    if (!row) {
+      row = document.createElement('div');
+      row.className = 'obj';
+      row.dataset.id = o.id;
+      row.innerHTML = `
+        <div class="num"></div>
+        <div class="swatch"></div>
+        <div class="name">
+          <input type="text" />
+          <div class="meta-line"></div>
+        </div>`;
+      const inp = row.querySelector('input');
+      inp.addEventListener('focus', () => editing.add(o.id));
+      inp.addEventListener('blur', () => {
+        editing.delete(o.id);
+        const newName = inp.value.trim();
+        if (newName) {
+          fetch('/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: o.id, name: newName }) });
+        }
+      });
+      inp.addEventListener('keydown', e => { if (e.key === 'Enter') inp.blur(); });
+      row.addEventListener('mouseenter', () => {
+        row.classList.add('hovered');
+        lastHovered = o.id;
+        fetch('/highlight', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: o.id }) });
+      });
+      row.addEventListener('mouseleave', () => {
+        row.classList.remove('hovered');
+        if (lastHovered === o.id) lastHovered = null;
+        fetch('/clear', { method: 'POST' });
+      });
+      objList.appendChild(row);
+    }
+    row.querySelector('.num').textContent = `#${o.id}`;
+    row.querySelector('.swatch').style.background = rgb(o.color);
+    if (!editing.has(o.id)) {
+      row.querySelector('input').value = o.name;
+    }
+    row.querySelector('.meta-line').textContent =
+      `${(o.score * 100).toFixed(0)}% · ${o.depth_m.toFixed(2)} m` +
+      (o.has_proj_mask ? '' : ' · ⚠ no proj mask');
+  });
+}
+
+const es = new EventSource('/objects');
+es.addEventListener('update', e => {
+  try { render(JSON.parse(e.data)); } catch (err) { console.error(err); }
+});
+es.onerror = () => { statusEl.textContent = 'disconnected — retrying'; };
+</script>
+</body>
+</html>
