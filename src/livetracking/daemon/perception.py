@@ -25,7 +25,7 @@ import signal
 import sys
 import threading
 import time
-from typing import List
+from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -125,6 +125,8 @@ class PerceptionDaemon:
         self._ctrl_lock = threading.Lock()
 
         self.running = True
+        self.paused = False
+        self._pinned_id: Optional[int] = None
         self.frame_idx = 0
         signal.signal(signal.SIGINT, self._stop)
         signal.signal(signal.SIGTERM, self._stop)
@@ -175,8 +177,71 @@ class PerceptionDaemon:
             })
             return {"ok": True}
         if cmd == "clear":
+            # Don't clear if something is pinned.
+            if self._pinned_id is not None:
+                return {"ok": True, "ignored": "pinned"}
             self.proj_push.send_json({"type": "clear"})
             return {"ok": True}
+        if cmd == "cycle_color":
+            new = self.pipeline.tracker.cycle_color(int(msg["id"]))
+            if new is None:
+                return {"ok": False, "reason": "no such object"}
+            return {"ok": True, "color": list(new)}
+        if cmd == "pin":
+            # Like highlight but doesn't auto-clear on mouseleave.
+            obj_id = int(msg["id"])
+            tracked = self.pipeline.tracker.active()
+            target = next((o for o in tracked if o.object_id == obj_id), None)
+            if target is None or target.proj_mask is None:
+                return {"ok": False, "reason": "no such object / no proj_mask"}
+            self.proj_push.send_json({
+                "type": "highlight",
+                "id": obj_id,
+                "color": list(target.color_rgb),
+                "proj_centroid": (list(target.centroid_proj)
+                                  if target.centroid_proj else None),
+                "mask_path": _save_mask_png(target),
+                "pinned": True,
+            })
+            self._pinned_id = obj_id
+            return {"ok": True}
+        if cmd == "unpin":
+            self._pinned_id = None
+            self.proj_push.send_json({"type": "clear"})
+            return {"ok": True}
+        if cmd == "intensity":
+            try:
+                v = float(msg.get("value", 0.78))
+            except Exception:
+                return {"ok": False, "reason": "bad intensity"}
+            v = max(0.0, min(1.0, v))
+            self.proj_push.send_json({"type": "set_intensity", "value": v})
+            return {"ok": True, "value": v}
+        if cmd == "highlight_all":
+            tracked = self.pipeline.tracker.active()
+            self.proj_push.send_json({
+                "type": "highlight_all",
+                "objects": [
+                    {
+                        "id": o.object_id,
+                        "color": list(o.color_rgb),
+                        "proj_centroid": (list(o.centroid_proj)
+                                          if o.centroid_proj else None),
+                        "mask_path": _save_mask_png(o),
+                    }
+                    for o in tracked if o.proj_mask is not None
+                ],
+            })
+            return {"ok": True, "count": sum(1 for o in tracked if o.proj_mask is not None)}
+        if cmd == "pause":
+            self.paused = True
+            self.proj_push.send_json({"type": "clear"})
+            return {"ok": True, "paused": True}
+        if cmd == "run":
+            self.paused = False
+            return {"ok": True, "paused": False}
+        if cmd == "state":
+            return {"ok": True, "paused": self.paused}
         if cmd == "list":
             return {"ok": True, "objects": _objects_to_payload(
                 self.pipeline.tracker.active(), self.pipeline.last_timings_ms
@@ -188,9 +253,39 @@ class PerceptionDaemon:
         last_print = 0.0
         while self.running:
             frame = self.cap.read()
+            if self.paused:
+                # Tell the projector to stay black and publish an empty
+                # "paused" payload so the UI knows.
+                self.proj_push.send_json({"type": "clear"})
+                payload = {
+                    "t": time.time(),
+                    "paused": True,
+                    "timings_ms": {"total_ms": 0, "stage1_ms": 0, "dino_ms": 0,
+                                   "sam_ms": 0, "merge_ms": 0,
+                                   "n_dino_raw": 0, "n_dino_kept": 0,
+                                   "n_objects": 0},
+                    "objects": [],
+                }
+                self.objects_pub.send_multipart([
+                    b"objects", json.dumps(payload).encode("utf-8"),
+                ])
+                # Paint a dim "PAUSED" frame so the MJPEG isn't stale.
+                dim = (frame.color * 0.35).astype(np.uint8)
+                cv2.putText(dim, "PAUSED", (24, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                            2.5, (255, 255, 255), 4)
+                ok, jpeg = cv2.imencode(".jpg", dim,
+                                        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                if ok:
+                    self.objects_pub.send_multipart([b"frame", jpeg.tobytes()])
+                # Idle the loop — don't burn the GPU while paused.
+                time.sleep(0.2)
+                self.frame_idx += 1
+                continue
+
             with self._ctrl_lock:
                 objects = self.pipeline.step(frame.color, frame.depth_m)
             payload = _objects_to_payload(objects, self.pipeline.last_timings_ms)
+            payload["paused"] = False
             self.objects_pub.send_multipart([
                 b"objects", json.dumps(payload).encode("utf-8"),
             ])

@@ -147,8 +147,15 @@ class Pipeline:
         t_sam = time.perf_counter()
 
         # ---- Build FreshDetections (mask ∩ footprint, then geometric-overlap gate) ----
+        # Estimate the calibration plane depth at each pixel for parallax
+        # correction. From the Stage-1 RANSAC plane:
+        #   ray (u, v, 1) hits plane at z_plane(u,v) = -d / (a*u + b*v + c)
+        plane = dbg.get("plane", [0, 0, -1, 3.0])
+        fx, fy, cx, cy = self.cfg.intrinsics
+        a, b, c, d_plane = plane
+
         fresh: List[FreshDetection] = []
-        for d, (sam_mask, sam_score) in zip(dino_filt, sam_results):
+        for det, (sam_mask, sam_score) in zip(dino_filt, sam_results):
             cam_mask = cv2.bitwise_and(sam_mask, self.footprint * 255)
             area = int((cam_mask > 0).sum())
             if area < self.cfg.min_obj_area_px:
@@ -160,9 +167,38 @@ class Pipeline:
             # Median depth on the cam_mask
             z = depth_m[(cam_mask > 0) & (depth_m > 0)]
             med_z = float(np.median(z)) if z.size else 0.0
-            # Warp into projector space
+
+            # ---- Parallax correction (B) -----------------------------------
+            # The H was calibrated against the wall plane. An object at depth
+            # z_obj < z_wall reprojects from the camera through the wall plane
+            # at a different (u, v). We approximate this by shifting the
+            # entire cam_mask by the centroid's parallax offset before warping.
+            ys_m, xs_m = np.where(cam_mask > 0)
+            cam_mask_for_warp = cam_mask
+            if med_z > 0.1 and ys_m.size:
+                cx_m = float(xs_m.mean()); cy_m = float(ys_m.mean())
+                u = (cx_m - cx) / fx
+                v = (cy_m - cy) / fy
+                denom = a * u + b * v + c
+                z_wall_at_centroid = (-d_plane / denom) if abs(denom) > 1e-6 else 0.0
+                if z_wall_at_centroid > 0.1:
+                    # Pixel shift along the camera-to-centroid ray. Sign:
+                    # if z_obj < z_wall the object's wall projection is OUTWARD
+                    # from the principal point.
+                    scale = (z_wall_at_centroid - med_z) / z_wall_at_centroid
+                    shift_x = (cx_m - cx) * scale
+                    shift_y = (cy_m - cy) * scale
+                    if abs(shift_x) > 0.5 or abs(shift_y) > 0.5:
+                        M = np.array([[1.0, 0.0, shift_x],
+                                      [0.0, 1.0, shift_y]], dtype=np.float32)
+                        cam_mask_for_warp = cv2.warpAffine(
+                            cam_mask, M, (self.cam_w, self.cam_h),
+                            flags=cv2.INTER_NEAREST, borderValue=0,
+                        )
+
+            # Warp into projector space (the wall-calibrated H)
             proj_mask = cv2.warpPerspective(
-                cam_mask, self.H, (self.cfg.proj_w, self.cfg.proj_h),
+                cam_mask_for_warp, self.H, (self.cfg.proj_w, self.cfg.proj_h),
                 flags=cv2.INTER_NEAREST,
             )
             proj_cy, proj_cx = np.where(proj_mask > 0)
@@ -172,8 +208,8 @@ class Pipeline:
                 proj_centroid = None
             fresh.append(FreshDetection(
                 cam_mask=cam_mask,
-                label=d["label"],
-                label_score=float(d["score"] * sam_score),
+                label=det["label"],
+                label_score=float(det["score"] * sam_score),
                 median_depth_m=med_z,
                 proj_mask=proj_mask if proj_mask.any() else None,
                 proj_centroid=proj_centroid,

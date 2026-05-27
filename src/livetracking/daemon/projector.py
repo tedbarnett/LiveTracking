@@ -48,7 +48,9 @@ class ProjectorDaemon:
         self.font_lbl = pygame.font.SysFont(None, 160)
 
         self.state_lock = threading.Lock()
-        self.current = None  # dict | None: {id, color, proj_centroid, mask_path}
+        self.current = None        # single highlight
+        self.current_many = None   # highlight_all payload
+        self.intensity = 0.78      # alpha multiplier (0..1)
 
         ctx = zmq.Context.instance()
         self.pull = ctx.socket(zmq.PULL)
@@ -69,44 +71,58 @@ class ProjectorDaemon:
             except Exception:
                 break
             with self.state_lock:
-                if msg.get("type") == "clear":
+                t = msg.get("type")
+                if t == "clear":
                     self.current = None
-                elif msg.get("type") == "highlight":
+                    self.current_many = None
+                elif t == "highlight":
                     self.current = msg
+                    self.current_many = None
+                elif t == "highlight_all":
+                    self.current = None
+                    self.current_many = msg
+                elif t == "set_intensity":
+                    self.intensity = float(msg.get("value", 0.78))
             time.sleep(0)
+
+    def _paint_one(self, cur: dict):
+        mask_path = cur.get("mask_path")
+        color = tuple(cur.get("color", (255, 200, 0)))
+        mask = None
+        if mask_path and os.path.exists(mask_path):
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is not None and mask.shape == (self.PH, self.PW):
+            alpha_val = int(255 * max(0.0, min(1.0, self.intensity)))
+            tint = np.zeros((self.PH, self.PW, 4), dtype=np.uint8)
+            tint[..., 0] = color[0]
+            tint[..., 1] = color[1]
+            tint[..., 2] = color[2]
+            tint[..., 3] = (mask > 0).astype(np.uint8) * alpha_val
+            surf = self.pygame.image.frombuffer(
+                tint.tobytes(), (self.PW, self.PH), "RGBA"
+            )
+            self.screen.blit(surf, (0, 0))
+        pc = cur.get("proj_centroid")
+        if pc is not None:
+            num_str = str(cur.get("id", "?"))
+            txt = self.font_big.render(num_str, True, (255, 255, 255))
+            tw, th = txt.get_size()
+            shadow = self.font_big.render(num_str, True, (0, 0, 0))
+            self.screen.blit(shadow, (int(pc[0]) - tw // 2 + 6,
+                                      int(pc[1]) - th // 2 + 6))
+            self.screen.blit(txt, (int(pc[0]) - tw // 2,
+                                   int(pc[1]) - th // 2))
 
     def _render(self):
         with self.state_lock:
             cur = self.current
+            many = self.current_many
         self.screen.fill((0, 0, 0))
-        if cur is not None:
-            mask_path = cur.get("mask_path")
-            color = tuple(cur.get("color", (255, 200, 0)))
-            mask = None
-            if mask_path and os.path.exists(mask_path):
-                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            if mask is not None and mask.shape == (self.PH, self.PW):
-                # Build a 4-channel RGBA surface with the mask as alpha
-                tint = np.zeros((self.PH, self.PW, 4), dtype=np.uint8)
-                tint[..., 0] = color[0]
-                tint[..., 1] = color[1]
-                tint[..., 2] = color[2]
-                tint[..., 3] = (mask > 0).astype(np.uint8) * 200
-                surf = self.pygame.image.frombuffer(
-                    tint.tobytes(), (self.PW, self.PH), "RGBA"
-                )
-                self.screen.blit(surf, (0, 0))
-            # number at centroid
-            pc = cur.get("proj_centroid")
-            if pc is not None:
-                num_str = str(cur.get("id", "?"))
-                txt = self.font_big.render(num_str, True, (255, 255, 255))
-                tw, th = txt.get_size()
-                shadow = self.font_big.render(num_str, True, (0, 0, 0))
-                self.screen.blit(shadow, (int(pc[0]) - tw // 2 + 6,
-                                          int(pc[1]) - th // 2 + 6))
-                self.screen.blit(txt, (int(pc[0]) - tw // 2,
-                                       int(pc[1]) - th // 2))
+        if many is not None:
+            for obj in many.get("objects", []):
+                self._paint_one(obj)
+        elif cur is not None:
+            self._paint_one(cur)
         self.pygame.display.flip()
         for _ in self.pygame.event.get():
             pass

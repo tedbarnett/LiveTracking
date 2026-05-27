@@ -5,41 +5,72 @@
 <title>LiveTracking — Perception</title>
 <style>
   body { background: #111; color: #eee; font-family: -apple-system, Segoe UI, Helvetica, sans-serif; margin: 0; }
-  header { padding: 12px 18px; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
+  header { padding: 12px 18px; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; gap: 16px; }
   header h1 { margin: 0; font-size: 18px; font-weight: 600; }
-  header .meta { font-size: 12px; color: #888; }
-  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 12px; padding: 12px; height: calc(100vh - 60px); box-sizing: border-box; }
-  #stream-wrap { background: #000; border-radius: 6px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  header .meta { font-size: 12px; color: #888; flex: 1; text-align: right; }
+  header .controls { display: flex; gap: 8px; align-items: center; }
+  button { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #3a3a3a; }
+  button.primary { background: #2d5a2d; border-color: #4a8a4a; }
+  button.primary:hover { background: #3d6a3d; }
+  button.warn    { background: #5a2d2d; border-color: #8a4a4a; }
+  button.warn:hover    { background: #6a3d3d; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 12px; padding: 12px; height: calc(100vh - 64px); box-sizing: border-box; }
+  #stream-wrap { background: #000; border-radius: 6px; overflow: hidden; display: flex; align-items: center; justify-content: center; position: relative; }
   #stream { max-width: 100%; max-height: 100%; }
-  #side { background: #1a1a1a; border-radius: 6px; padding: 12px; overflow-y: auto; }
-  #side h2 { margin: 0 0 8px 0; font-size: 14px; font-weight: 600; color: #bbb; text-transform: uppercase; letter-spacing: 0.05em; }
-  #help { font-size: 11px; color: #666; margin-bottom: 12px; }
+  #paused-overlay { position: absolute; top: 12px; right: 12px; background: #5a2d2d; color: #fff; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; display: none; }
+  #paused-overlay.on { display: block; }
+  #side { background: #1a1a1a; border-radius: 6px; padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+  .panel { display: flex; flex-direction: column; gap: 6px; }
+  .panel h2 { margin: 0 0 4px 0; font-size: 12px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.05em; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  #help { font-size: 11px; color: #666; }
   .obj { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 4px; margin-bottom: 4px; cursor: pointer; transition: background 0.1s; }
   .obj:hover { background: #2a2a2a; }
   .obj.hovered { background: #333; outline: 1px solid #555; }
-  .swatch { width: 16px; height: 16px; border-radius: 4px; flex-shrink: 0; }
-  .num { width: 22px; text-align: right; color: #888; font-variant-numeric: tabular-nums; font-size: 13px; }
+  .obj.pinned  { background: #2b2b3a; outline: 2px solid #88a; }
+  .swatch { width: 18px; height: 18px; border-radius: 4px; flex-shrink: 0; border: 1px solid #000; box-shadow: 0 0 0 1px #444; }
+  .num { width: 24px; text-align: right; color: #888; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; }
   .name { flex: 1; min-width: 0; }
   .name input { background: transparent; border: 1px solid transparent; color: #eee; font-size: 14px; padding: 2px 4px; border-radius: 3px; width: 100%; box-sizing: border-box; }
   .name input:hover { border-color: #444; }
   .name input:focus { border-color: #888; outline: none; background: #111; }
   .meta-line { font-size: 10px; color: #666; margin-top: 1px; }
-  #status { font-size: 11px; color: #555; margin-top: 12px; padding-top: 12px; border-top: 1px solid #222; }
+  #status { font-size: 11px; color: #555; padding-top: 8px; border-top: 1px solid #222; }
+  .slider-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .slider-row input[type=range] { flex: 1; }
 </style>
 </head>
 <body>
 <header>
   <h1>LiveTracking — perception</h1>
+  <div class="controls">
+    <button id="btnPause" class="primary">⏸ Pause</button>
+    <button id="btnAll">Highlight all</button>
+    <button id="btnClear">Clear</button>
+  </div>
   <div class="meta"><span id="frameTimings">…</span></div>
 </header>
 <main>
   <div id="stream-wrap">
     <img id="stream" src="/stream.mjpg" alt="live camera">
+    <div id="paused-overlay">PAUSED</div>
   </div>
   <aside id="side">
-    <h2>Objects</h2>
-    <div id="help">Hover an item to illuminate it on the wall. Click a name to rename.</div>
-    <div id="objList"></div>
+    <div class="panel">
+      <h2>Objects</h2>
+      <div id="help">Hover an item to illuminate it on the wall. Click name to rename.</div>
+      <div id="objList"></div>
+    </div>
+    <div class="panel">
+      <h2>Projector intensity</h2>
+      <div class="slider-row">
+        <span>dim</span>
+        <input id="intensitySlider" type="range" min="0" max="100" value="78">
+        <span>bright</span>
+        <span id="intensityVal">78</span>
+      </div>
+    </div>
     <div id="status">connecting…</div>
   </aside>
 </main>
@@ -47,27 +78,64 @@
 const objList = document.getElementById('objList');
 const statusEl = document.getElementById('status');
 const timingsEl = document.getElementById('frameTimings');
+const pausedOverlay = document.getElementById('paused-overlay');
+const btnPause = document.getElementById('btnPause');
+const btnAll = document.getElementById('btnAll');
+const btnClear = document.getElementById('btnClear');
+const intensitySlider = document.getElementById('intensitySlider');
+const intensityVal = document.getElementById('intensityVal');
+
 let lastHovered = null;
-let editing = new Set();   // ids whose <input> currently has focus — don't overwrite
+let editing = new Set();
+let isPaused = false;
 
 function rgb(a) { return `rgb(${a[0]}, ${a[1]}, ${a[2]})`; }
 
+function setPaused(p) {
+  isPaused = !!p;
+  pausedOverlay.classList.toggle('on', isPaused);
+  btnPause.textContent = isPaused ? '▶ Run' : '⏸ Pause';
+  btnPause.classList.toggle('primary', !isPaused);
+  btnPause.classList.toggle('warn', isPaused);
+}
+
+btnPause.addEventListener('click', async () => {
+  const r = await fetch(isPaused ? '/run' : '/pause', { method: 'POST' });
+  const j = await r.json();
+  if ('paused' in j) setPaused(j.paused);
+});
+btnAll.addEventListener('click', () => {
+  fetch('/highlight_all', { method: 'POST' });
+});
+btnClear.addEventListener('click', () => {
+  fetch('/clear', { method: 'POST' });
+});
+
+intensitySlider.addEventListener('input', () => {
+  intensityVal.textContent = intensitySlider.value;
+});
+intensitySlider.addEventListener('change', () => {
+  fetch('/intensity', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value: intensitySlider.value / 100 })
+  });
+});
+
 function render(payload) {
   const objs = payload.objects || [];
+  setPaused(payload.paused === true);
   statusEl.textContent = `${objs.length} object${objs.length === 1 ? '' : 's'}, ${new Date(payload.t * 1000).toLocaleTimeString()}`;
   if (payload.timings_ms) {
     const t = payload.timings_ms;
-    timingsEl.textContent = `${t.total_ms.toFixed(0)} ms/frame · DINO ${t.n_dino_raw}→${t.n_dino_kept} · ${objs.length} objects`;
+    timingsEl.textContent = isPaused
+      ? 'paused'
+      : `${t.total_ms.toFixed(0)} ms/frame · DINO ${t.n_dino_raw}→${t.n_dino_kept} · ${objs.length} obj`;
   }
-  const existingIds = new Set(Array.from(objList.children).map(c => Number(c.dataset.id)));
   const newIds = new Set(objs.map(o => o.id));
-
-  // Remove dead rows
   Array.from(objList.children).forEach(c => {
     if (!newIds.has(Number(c.dataset.id))) c.remove();
   });
-
-  // Add / update rows
   objs.sort((a, b) => a.id - b.id);
   objs.forEach(o => {
     let row = objList.querySelector(`[data-id="${o.id}"]`);
@@ -77,12 +145,38 @@ function render(payload) {
       row.dataset.id = o.id;
       row.innerHTML = `
         <div class="num"></div>
-        <div class="swatch"></div>
+        <div class="swatch" title="click: cycle color · double-click: pin/unpin"></div>
         <div class="name">
           <input type="text" />
           <div class="meta-line"></div>
         </div>`;
       const inp = row.querySelector('input');
+      const swatch = row.querySelector('.swatch');
+      let clickTimer = null;
+      swatch.addEventListener('click', e => {
+        e.stopPropagation();
+        if (clickTimer) return;
+        clickTimer = setTimeout(() => {
+          clickTimer = null;
+          fetch('/cycle_color', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: o.id }) });
+        }, 220);
+      });
+      swatch.addEventListener('dblclick', e => {
+        e.stopPropagation();
+        if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
+        const wasPinned = row.classList.toggle('pinned');
+        if (wasPinned) {
+          // unpin any prior pinned row
+          objList.querySelectorAll('.obj.pinned').forEach(r => {
+            if (r !== row) r.classList.remove('pinned');
+          });
+          fetch('/pin', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: o.id }) });
+        } else {
+          fetch('/unpin', { method: 'POST' });
+        }
+      });
       inp.addEventListener('focus', () => editing.add(o.id));
       inp.addEventListener('blur', () => {
         editing.delete(o.id);
@@ -116,6 +210,9 @@ function render(payload) {
       (o.has_proj_mask ? '' : ' · ⚠ no proj mask');
   });
 }
+
+// Initial state sync
+fetch('/state').then(r => r.json()).then(j => { if ('paused' in j) setPaused(j.paused); });
 
 const es = new EventSource('/objects');
 es.addEventListener('update', e => {

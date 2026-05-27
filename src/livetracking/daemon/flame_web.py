@@ -198,6 +198,41 @@ def create_app() -> Flask:
     def clear():
         return jsonify(_send_ctrl({"cmd": "clear"}))
 
+    @app.route("/pause", methods=["POST"])
+    def pause():
+        return jsonify(_send_ctrl({"cmd": "pause"}))
+
+    @app.route("/run", methods=["POST"])
+    def runcmd():
+        return jsonify(_send_ctrl({"cmd": "run"}))
+
+    @app.route("/state")
+    def state():
+        return jsonify(_send_ctrl({"cmd": "state"}))
+
+    @app.route("/highlight_all", methods=["POST"])
+    def highlight_all():
+        return jsonify(_send_ctrl({"cmd": "highlight_all"}))
+
+    @app.route("/cycle_color", methods=["POST"])
+    def cycle_color():
+        data = request.get_json(silent=True) or {}
+        return jsonify(_send_ctrl({"cmd": "cycle_color", "id": int(data["id"])}))
+
+    @app.route("/pin", methods=["POST"])
+    def pin():
+        data = request.get_json(silent=True) or {}
+        return jsonify(_send_ctrl({"cmd": "pin", "id": int(data["id"])}))
+
+    @app.route("/unpin", methods=["POST"])
+    def unpin():
+        return jsonify(_send_ctrl({"cmd": "unpin"}))
+
+    @app.route("/intensity", methods=["POST"])
+    def intensity():
+        data = request.get_json(silent=True) or {}
+        return jsonify(_send_ctrl({"cmd": "intensity", "value": float(data.get("value", 0.78))}))
+
     @app.route("/healthz")
     def healthz():
         return jsonify({

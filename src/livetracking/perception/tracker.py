@@ -150,6 +150,21 @@ class ObjectTracker:
         self._save_names()
         return True
 
+    def cycle_color(self, object_id: int) -> Optional[Tuple[int, int, int]]:
+        """Advance the object's color to the next palette entry. Returns the
+        new color, or None if no such object."""
+        track = self._tracks.get(object_id)
+        if track is None:
+            return None
+        cur = tuple(track.obj.color_rgb)
+        try:
+            idx = PALETTE.index(cur)
+        except ValueError:
+            idx = -1
+        new = PALETTE[(idx + 1) % len(PALETTE)]
+        track.obj.color_rgb = new
+        return new
+
     # ---- per-frame update ----
     def update(self, fresh: List[FreshDetection]) -> List[DetectedObject]:
         now = time.time()
