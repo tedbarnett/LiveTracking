@@ -19,6 +19,35 @@ Real-time projection mapping. Track a hand-held object with an Intel RealSense d
 
 The right v2 architecture (Ted's idea, 2026-05-25): project the camera frame back onto the wall, gradient-descend the projector↔camera homography to minimize image-registration error. Continuous calibration, no per-target detection. Build on JMGO.
 
+## Laptop deployment + session learnings (2026-05-26/27)
+
+First run on the **laptop** (`laptop` branch) with the **JMGO N3 Ultimate** on HDMI and the **D455** on USB-C. Goal of the session: project a **blue flame onto a white guitar** lying on a red sofa, and from that build an **accurate guitar mask**. Standalone tooling lives in [`scripts/`](scripts/) (not the daemon — `projection_daemon.py` still hardcodes `D:\Github-D\LiveTracking` paths and `DISPLAY_X=5120`, which must be parameterized before it runs here).
+
+**Environment**
+- **Python 3.11 is required.** The pinned deps (`numpy==1.26.4`, `opencv 4.10`, `pyrealsense2==2.55`) have no Python 3.14 wheels, and `pyrealsense2` tops out ~3.11. Install 3.11, `python -m venv .venv`, `pip install -e .`.
+- **Projector window:** pick the projector by **pygame display index** with a borderless `NOFRAME` window (`set_mode(size, pygame.NOFRAME, display=idx)`). `pygame.FULLSCREEN` + `display=` grabbed the wrong monitor (laptop went black-fullscreen, projector stayed dark). JMGO enumerates as the largest desktop (3840×2160 at 100% scaling).
+
+**D455 quirks found here**
+- **Dual color+depth delivered ZERO frames** until a `device.hardware_reset()` at startup — each stream worked alone, but enabling both together hung `wait_for_frames`. Reset-on-startup fixes it reliably. (Not bandwidth: USB negotiated 3.2 and even 640×480@15 failed pre-reset.)
+- Only one process can hold the camera — close the Intel RealSense Viewer / Windows Camera app first.
+
+**Exposure (lit room ≠ dark room)**
+- The dark-room `exposure=150` is far too dark here. **Lock exposure ~700–1200** for this room.
+- **Auto-exposure breaks everything**: for black/white differencing it makes the white frame *darker* on average (camera compensates), and for detection it blows out the window → giant false white blobs. Lock exposure for both calibration and detection.
+
+**Calibration: what worked**
+- White-flood diff-rectangle **under-counts on dark surfaces** (the red sofa reflects little), so the homography from it is wrong and only covers the bright wall.
+- **Dot calibration works** ([`scripts/calibrate_dots.py`](scripts/calibrate_dots.py)): project bright dots at known projector coords, find each in the camera by diff (bright dots are detectable even on the dark sofa), solve the homography. **Verified ~9 px**: a marker projected at the guitar's computed position landed on the guitar. This is the recommended calibration here.
+- **Image-registration v2** ([`scripts/registration_calib.py`](scripts/registration_calib.py)): built the gradient-descent (coordinate-descent on the 4 projector-corner positions, edge-overlap objective). It **stalls in local minima** — a cluttered room has edges everywhere, so a misaligned projection still scores "okay," and single-frame capture is noisy. To make it usable it needs **seeding from the dot calibration** + multi-frame averaging. Also, a single homography only aligns one plane; the guitar sits ~0.5 m off the wall, so **parallax** means wall-alignment ≠ guitar-alignment — the real fix is **depth-based 3D mapping** (we have per-pixel depth; see `docs/CALIBRATION-MATH.md`).
+
+**Accurate guitar mask** ([`scripts/guitar_mask.py`](scripts/guitar_mask.py))
+- Robust recipe: **locked exposure** + white (low-S, high-V) + near-depth + ignore the wall region, then among candidate blobs **pick the one ringed by red sofa** (the guitar is a white island in the red sofa). Plain "largest blob" is unstable — it flips between the guitar and the similarly-sized right-side window/table region. Red-surround is the discriminator that reliably locks onto the guitar.
+- Full body boundary: the depth-clean seed only covers the lower body, so dilate it and take the **white pixels in that neighborhood, largest external contour filled** (color gives a clean edge because the cushion isn't white). GrabCut was discarded — it grabbed the cushion. Result hugs the guitar **body** cleanly; the dark **neck** isn't captured by color (depth/raised-object would be needed for it).
+
+**Flame** ([`scripts/flame_v2.py`](scripts/flame_v2.py)): warps a procedural blue-flame texture onto the guitar via the dot-calibration homography. Landed on the guitar (blueness B−R ≈ 96, ~72% coverage).
+
+**Test-cycle pattern:** because no human can watch the wall while iterating, every script is a closed loop — project, capture through the RealSense, save a montage + metrics, inspect, tune, re-run. This is the core dev workflow on this branch.
+
 **Full product spec:** see [`docs/SPEC.md`](docs/SPEC.md).
 
 **Calibration math:** see [`docs/CALIBRATION-MATH.md`](docs/CALIBRATION-MATH.md) for how we handle camera/projector parallax with full 3D calibration.

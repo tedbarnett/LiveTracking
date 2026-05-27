@@ -34,6 +34,7 @@ media/raw/
 media/captures/
 scratch/
 tmp/
+scripts/out/
 
 # Secrets (just in case)
 .env
