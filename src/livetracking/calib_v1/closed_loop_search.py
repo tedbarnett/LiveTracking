@@ -8,10 +8,16 @@ import os, sys, time, math, json
 import numpy as np, cv2, pygame
 import pyrealsense2 as rs
 
-DISPLAY_X = 5120
-DISPLAY_Y = 0
-DISPLAY_W = 1280
-DISPLAY_H = 720
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.path.normpath(os.path.join(_HERE, "..", ".."))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+from livetracking import paths as P
+
+DISPLAY_X = P.DISPLAY_X
+DISPLAY_Y = P.DISPLAY_Y
+DISPLAY_W = P.DISPLAY_W
+DISPLAY_H = P.DISPLAY_H
 
 POSTIT_TARGETS_CAM = [
     (561, 100),
@@ -121,7 +127,7 @@ def main():
             pipe.wait_for_frames()
         f = pipe.wait_for_frames()
         baseline = np.asanyarray(f.get_color_frame().get_data())
-        cv2.imwrite(r"D:\Github-D\LiveTracking\tmp\iv2_baseline.png", baseline)
+        cv2.imwrite(os.path.join(P.TMP_DIR, "iv2_baseline.png"), baseline)
 
         # Build initial H from projection quad
         quad_cam = np.array([
@@ -213,7 +219,7 @@ def main():
                 print(f"[{label}] NEVER FOUND BLOB", flush=True)
 
         # Save
-        with open(r"D:\Github-D\LiveTracking\tmp\iv2_result.json", "w") as f:
+        with open(os.path.join(P.TMP_DIR, "iv2_result.json"), "w") as f:
             json.dump({"winners": winners}, f, indent=2)
         print("\n[final winners]", flush=True)
         for w in winners:
@@ -228,7 +234,7 @@ def main():
                 pipe.wait_for_frames()
             f = pipe.wait_for_frames()
             cam_final = np.asanyarray(f.get_color_frame().get_data())
-            cv2.imwrite(r"D:\Github-D\LiveTracking\tmp\iv2_final.png", cam_final)
+            cv2.imwrite(os.path.join(P.TMP_DIR, "iv2_final.png"), cam_final)
             print("\nscreenshot tmp/iv2_final.png", flush=True)
 
             # Hold

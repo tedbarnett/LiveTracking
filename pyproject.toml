@@ -15,14 +15,24 @@ dependencies = [
     "pygame==2.6.1",
     "moderngl==5.10.0",
     "PyQt6==6.7.1",
+    "flask>=3.0",
     "pyrealsense2==2.55.1.6486; platform_system == 'Windows'",
 ]
 
 [project.scripts]
 livetracking = "livetracking.__main__:main"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

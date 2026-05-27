@@ -20,11 +20,17 @@ import cv2
 import pygame
 import pyrealsense2 as rs
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.path.normpath(os.path.join(_HERE, "..", ".."))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+from livetracking import paths as P
 
-DISPLAY_X = 5120
-DISPLAY_Y = 0
-DISPLAY_W = 1280
-DISPLAY_H = 720
+
+DISPLAY_X = P.DISPLAY_X
+DISPLAY_Y = P.DISPLAY_Y
+DISPLAY_W = P.DISPLAY_W
+DISPLAY_H = P.DISPLAY_H
 
 
 def capture_under_white_flood():
@@ -184,7 +190,7 @@ def find_postits_inside(cam_img, projection_mask):
 def main():
     print("capturing under white flood...", flush=True)
     cam_img, screen = capture_under_white_flood()
-    cv2.imwrite(r"D:\Github-D\LiveTracking\tmp\edge_capture.png", cam_img)
+    cv2.imwrite(os.path.join(P.TMP_DIR, "edge_capture.png"), cam_img)
 
     print("finding projection quadrilateral...", flush=True)
     quad, proj_mask = find_projection_quad(cam_img)
@@ -193,7 +199,7 @@ def main():
     else:
         print(f"projection quad corners: {quad.tolist()}", flush=True)
 
-    cv2.imwrite(r"D:\Github-D\LiveTracking\tmp\edge_proj_mask.png", proj_mask)
+    cv2.imwrite(os.path.join(P.TMP_DIR, "edge_proj_mask.png"), proj_mask)
 
     if proj_mask is None or quad is None:
         pygame.quit()
@@ -224,7 +230,7 @@ def main():
         cv2.rectangle(out, (x, y), (x + w, y + h), (0, 0, 255), 3)
         cv2.putText(out, f"#{i+1} {p['size_px']}px {p.get('estimated_depth_mm', 0):.0f}mm",
                     (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-    cv2.imwrite(r"D:\Github-D\LiveTracking\tmp\edge_annotated.png", out)
+    cv2.imwrite(os.path.join(P.TMP_DIR, "edge_annotated.png"), out)
     print("annotated image saved to tmp/edge_annotated.png", flush=True)
 
     # Dump JSON
@@ -237,7 +243,7 @@ def main():
         "fx_px": FX,
         "postit_size_mm": POSTIT_MM,
     }
-    with open(r"D:\Github-D\LiveTracking\tmp\edge_result.json", "w") as f:
+    with open(os.path.join(P.TMP_DIR, "edge_result.json"), "w") as f:
         json.dump(result, f, indent=2)
 
     # Hold the white flood so it stays consistent

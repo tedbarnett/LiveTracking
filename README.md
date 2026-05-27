@@ -99,9 +99,25 @@ Architecture:
 
 Run:
 ```powershell
-cd D:\Github-D\LiveTracking
+# Optional environment knobs (defaults work for the PC-5090 desktop layout).
+# Override these per-host instead of editing source:
+#   $env:LIVETRACKING_DISPLAY_INDEX = "2"      # pygame display index of the projector
+#   $env:LIVETRACKING_DISPLAY_W     = "1280"
+#   $env:LIVETRACKING_DISPLAY_H     = "720"
+#   $env:LIVETRACKING_RUNTIME_DIR   = "C:\path\to\runtime"  # default: <repo>\runtime
 python src\livetracking\daemon\supervisor.py   # in one terminal
-python src\livetracking\daemon\web_ui.py      # in another
+python src\livetracking\daemon\web_ui.py       # in another
+```
+
+On the laptop, set `LIVETRACKING_DISPLAY_INDEX` to the JMGO's pygame display
+index — that path uses `pygame.display.set_mode(..., display=idx)` which the
+2026-05-26 laptop bring-up notes found reliable, vs. the legacy
+`SDL_VIDEO_WINDOW_POS` approach that grabbed the wrong monitor on fullscreen.
+
+Tests:
+```powershell
+pip install -e .[dev]
+pytest
 ```
 
 *Last updated by Helm — 2026-05-25, after the web UI ship + Cloudflare route.*

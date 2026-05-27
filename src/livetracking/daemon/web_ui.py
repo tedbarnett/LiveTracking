@@ -15,15 +15,23 @@ Run:
 import json
 import os
 import re
+import sys
 import time
 
 from flask import Flask, jsonify, request, send_file, abort, send_from_directory, Response
 
-RUNTIME_DIR = r"D:\Github-D\LiveTracking\runtime"
+# Make src/ importable when run as a script.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.path.normpath(os.path.join(_HERE, "..", ".."))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+from livetracking import paths as P
+
+RUNTIME_DIR = P.RUNTIME_DIR
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-STATE_FILE = os.path.join(RUNTIME_DIR, "state.json")
-FRAME_FILE = os.path.join(RUNTIME_DIR, "latest_frame.jpg")
-COMMAND_FILE = os.path.join(RUNTIME_DIR, "command.txt")
+STATE_FILE = P.STATE_FILE
+FRAME_FILE = P.FRAME_FILE
+COMMAND_FILE = P.COMMAND_FILE
 
 ALLOWED_COMMANDS = {"restart", "recalibrate", "mode_plus", "mode_fill",
                      "plus", "fill", "screenshot", "heal_now", "quit",
@@ -280,8 +288,8 @@ def api_command():
 
 
 if __name__ == "__main__":
-    print(f"LiveTracking web UI on http://localhost:5070")
+    print(f"LiveTracking web UI on http://localhost:{P.WEB_UI_PORT}")
     print(f"  state: {STATE_FILE}")
     print(f"  frame: {FRAME_FILE}")
     print(f"  cmd:   {COMMAND_FILE}")
-    app.run(host="0.0.0.0", port=5070, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=P.WEB_UI_PORT, debug=False, threaded=True)

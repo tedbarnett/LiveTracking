@@ -33,15 +33,15 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 from livetracking.calib_v1.peer_init import predict_proj_from_peers
 from livetracking.calib_v1.nudge_memory import NudgeMemory
+from livetracking import paths as P
 
-STATE_DIR = r"D:\Github-D\LiveTracking\runtime"
-STATE_FILE = os.path.join(STATE_DIR, "state.json")
-FRAME_FILE = os.path.join(STATE_DIR, "latest_frame.jpg")
-COMMAND_FILE = os.path.join(STATE_DIR, "command.txt")
-NUDGES_FILE = os.path.join(STATE_DIR, "nudges.json")
-LEARNED_OFFSETS_FILE = os.path.join(STATE_DIR, "learned_offsets.jsonl")
-LEGACY_CMD_FILE = r"D:\Github-D\LiveTracking\tmp\iv10_cmd.txt"
-os.makedirs(STATE_DIR, exist_ok=True)
+STATE_DIR = P.RUNTIME_DIR
+STATE_FILE = P.STATE_FILE
+FRAME_FILE = P.FRAME_FILE
+COMMAND_FILE = P.COMMAND_FILE
+NUDGES_FILE = P.NUDGES_FILE
+LEARNED_OFFSETS_FILE = P.LEARNED_OFFSETS_FILE
+LEGACY_CMD_FILE = os.path.join(P.TMP_DIR, "iv10_cmd.txt")
 
 NUDGE_STEP_PX = 5  # projector pixels per nudge click
 
@@ -76,10 +76,11 @@ def save_nudges(nudges):
     except Exception as e:
         print(f"  nudges save err: {e}", flush=True)
 
-DISPLAY_X = 5120
-DISPLAY_Y = 0
-DISPLAY_W = 1280
-DISPLAY_H = 720
+DISPLAY_X = P.DISPLAY_X
+DISPLAY_Y = P.DISPLAY_Y
+DISPLAY_W = P.DISPLAY_W
+DISPLAY_H = P.DISPLAY_H
+DISPLAY_INDEX = P.DISPLAY_INDEX
 
 FILL_SHRINK = 0.85
 VERTICAL_OFFSET_FRAC = 0.10
@@ -292,83 +293,6 @@ def find_postits_diff(cam_black, cam_white):
     return None
 
 
-def find_postits(cam_img):
-    gray = cv2.cvtColor(cam_img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, k, iterations=2)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k, iterations=2)
-    num, lab, stats, _ = cv2.connectedComponentsWithStats(bw, 8)
-    if num <= 1:
-        return None, None
-    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    proj_mask = ((lab == biggest).astype(np.uint8)) * 255
-    roi = cv2.bitwise_and(cam_img, cam_img, mask=proj_mask)
-    g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.GaussianBlur(g, (5, 5), 0), 35, 110)
-    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-                        iterations=1)
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    cands = []
-    for c in contours:
-        a = cv2.contourArea(c)
-        if a < 800 or a > 8000:
-            continue
-        peri = cv2.arcLength(c, True)
-        if peri < 50:
-            continue
-        approx = cv2.approxPolyDP(c, 0.04 * peri, True)
-        if len(approx) < 4 or len(approx) > 6:
-            continue
-        rect = cv2.minAreaRect(c)
-        (rcx, rcy), (rw, rh), rangle = rect
-        if min(rw, rh) < 12:
-            continue
-        if max(rw, rh) / max(1, min(rw, rh)) > 2.0:
-            continue
-        M = cv2.moments(c)
-        if M["m00"] == 0:
-            continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-        if proj_mask[cy, cx] == 0:
-            continue
-        hull = cv2.convexHull(c)
-        ha = cv2.contourArea(hull) or 1
-        if a / ha < 0.85:
-            continue
-        cands.append({
-            "centroid_cam": (cx, cy),
-            "rot_size": [float(rw), float(rh)],
-            "rot_angle_deg": float(rangle),
-            "area": float(a),
-        })
-    deduped = []
-    used = set()
-    for i, p in enumerate(cands):
-        if i in used: continue
-        cluster = [p]
-        for j in range(i + 1, len(cands)):
-            if j in used: continue
-            q = cands[j]
-            dx = p["centroid_cam"][0] - q["centroid_cam"][0]
-            dy = p["centroid_cam"][1] - q["centroid_cam"][1]
-            if dx * dx + dy * dy < 35 * 35:
-                cluster.append(q)
-                used.add(j)
-        used.add(i)
-        cluster.sort(key=lambda x: -x["area"])
-        deduped.append(cluster[0])
-    if len(deduped) > 3:
-        centroids = np.array([p["centroid_cam"] for p in deduped], dtype=np.float32)
-        median = np.median(centroids, axis=0)
-        deduped = [p for p, c in zip(deduped, centroids)
-                   if np.linalg.norm(c - median) < 200]
-    deduped.sort(key=lambda x: x["centroid_cam"][0])
-    return deduped[:3], proj_mask
-
-
 def find_plus_blob(baseline, with_plus, target_cam=None, search_r=200):
     b = cv2.cvtColor(baseline, cv2.COLOR_BGR2GRAY).astype(np.int16)
     w = cv2.cvtColor(with_plus, cv2.COLOR_BGR2GRAY).astype(np.int16)
@@ -415,6 +339,12 @@ def converge_target(screen, pipe, baseline, target_cam, initial_proj_xy,
         oy = cy - target_cam[1]
         damping = max(0.25, 0.7 - 0.04 * it)
         proj_xy[0] -= ox * 1.75 * damping
+        # Coarse cold-start: we don't yet have a measured Jacobian for this
+        # target (probe_jacobian only runs after this loop converges roughly),
+        # so the y-axis sign is unknown. Alternate signs every-other pair of
+        # iterations; whichever direction reduced error gets remembered via
+        # `best`. Once converged here, probe_jacobian + residual refinement
+        # below (which uses the proper J) takes over for sub-pixel accuracy.
         if (it // 2) % 2 == 0:
             proj_xy[1] -= oy * 1.0 * damping
         else:
@@ -565,9 +495,21 @@ def winners_to_rect_specs(winners, content_fns):
 
 def main():
     restart_requested = False  # hoist so finally + return path can see it
-    os.environ["SDL_VIDEO_WINDOW_POS"] = f"{DISPLAY_X},{DISPLAY_Y}"
+    print(f"[init] {P.describe()}", flush=True)
+    # Prefer pygame display index (laptop README finding: SDL_VIDEO_WINDOW_POS
+    # on a fullscreen mode grabbed the wrong monitor). Fall back to legacy
+    # SDL window position when no index configured (PC-5090 desktop layout).
+    if DISPLAY_INDEX is None:
+        os.environ["SDL_VIDEO_WINDOW_POS"] = f"{DISPLAY_X},{DISPLAY_Y}"
     pygame.init()
-    screen = pygame.display.set_mode((DISPLAY_W, DISPLAY_H), pygame.NOFRAME)
+    if DISPLAY_INDEX is not None:
+        screen = pygame.display.set_mode(
+            (DISPLAY_W, DISPLAY_H), pygame.NOFRAME, display=DISPLAY_INDEX
+        )
+        print(f"[init] pygame window on display index {DISPLAY_INDEX}", flush=True)
+    else:
+        screen = pygame.display.set_mode((DISPLAY_W, DISPLAY_H), pygame.NOFRAME)
+        print(f"[init] pygame window at ({DISPLAY_X},{DISPLAY_Y})", flush=True)
     pipe = rs.pipeline()
     cfg = rs.config()
     cfg.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
@@ -608,8 +550,8 @@ def main():
                 pipe.wait_for_frames()
             f = pipe.wait_for_frames()
             cam_white = np.asanyarray(f.get_color_frame().get_data())
-            cv2.imwrite(r"D:\Github-D\Helm\openclaw-workspace\tmp\diag_v10_black.png", cam_black)
-            cv2.imwrite(r"D:\Github-D\Helm\openclaw-workspace\tmp\diag_v10_white.png", cam_white)
+            cv2.imwrite(P.DIAG_BLACK_FILE, cam_black)
+            cv2.imwrite(P.DIAG_WHITE_FILE, cam_white)
             postits = find_postits_diff(cam_black, cam_white)
             if postits and len(postits) >= 3:
                 print(f"   diff-detect: found {len(postits)} post-its", flush=True)
@@ -981,8 +923,7 @@ def main():
                                  [cv2.IMWRITE_JPEG_QUALITY, 70])
                     # Also overwrite legacy path for any older consumers.
                     if not screenshot_taken and t > 3.0:
-                        cv2.imwrite(r"D:\Github-D\LiveTracking\tmp\iv10_final.png",
-                                     cam_now)
+                        cv2.imwrite(P.FINAL_SCREENSHOT_FILE, cam_now)
                         screenshot_taken = True
                 except Exception as e:
                     print(f"  publish frame error: {e}", flush=True)
@@ -1041,8 +982,7 @@ def main():
                         elif cmd == "screenshot":
                             f = pipe.wait_for_frames()
                             cam_now = np.asanyarray(f.get_color_frame().get_data())
-                            cv2.imwrite(r"D:\Github-D\LiveTracking\tmp\iv10_final.png",
-                                         cam_now)
+                            cv2.imwrite(P.FINAL_SCREENSHOT_FILE, cam_now)
                             cv2.imwrite(FRAME_FILE, cam_now,
                                          [cv2.IMWRITE_JPEG_QUALITY, 70])
                         elif cmd.startswith("nudge_"):

@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+    branches: [main, hermes]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install (test-only deps; skip Windows-pinned realsense + GUI stack)
+        run: |
+          python -m pip install --upgrade pip
+          # Install only the deps that the pure-Python tests touch (numpy, pytest).
+          # The full project depends on pygame / pyrealsense2 / PyQt6 which are
+          # heavy and Windows-only; tests don't import them.
+          pip install numpy==1.26.4 pytest
+      - name: Run tests
+        env:
+          PYTHONPATH: src
+        run: pytest -v
