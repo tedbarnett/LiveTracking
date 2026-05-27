@@ -65,11 +65,25 @@ class RealSenseCapture:
         self._depth_scale = float(depth_sensor.get_depth_scale())
         self._align = rs.align(rs.stream.color)
 
-        # Manual exposure on the color sensor (sensors[1] is RGB on D455).
+        # Manual exposure + WB on the color sensor (sensors[1] is RGB on D455).
+        # WB lock is non-negotiable for projection-mapping: when the projector
+        # bathes the scene in colored light, auto-WB shifts the WHOLE frame's
+        # color balance to compensate, breaking every chroma-based detector
+        # and confusing DINO/SAM between frames.
         try:
             sensor = profile.get_device().query_sensors()[1]
             sensor.set_option(rs.option.enable_auto_exposure, 0)
             sensor.set_option(rs.option.exposure, exposure)
+            try:
+                sensor.set_option(rs.option.enable_auto_white_balance, 0)
+                sensor.set_option(rs.option.white_balance, 4600)  # ~daylight
+            except Exception as e:
+                print(f"[capture] WB lock not supported (continuing): {e}")
+            # Disable backlight compensation (auto-tone-curve) if present
+            try:
+                sensor.set_option(rs.option.backlight_compensation, 0)
+            except Exception:
+                pass
         except Exception as e:
             print(f"[capture] exposure lock failed (continuing): {e}")
 

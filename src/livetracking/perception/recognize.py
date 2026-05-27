@@ -25,9 +25,12 @@ from .types import Blob
 
 
 DEFAULT_DINO_PROMPT = (
-    "guitar. drum. cushion. pillow. sofa. couch. chair. picture frame. "
-    "painting. lamp. plant. book. mug. bottle. hand. person. box. "
-    "object. instrument."
+    "guitar. acoustic guitar. electric guitar. drum. drum head. snare drum. "
+    "tambourine. cymbal. piano. keyboard. microphone. cushion. throw pillow. "
+    "sofa. couch. armchair. chair. ottoman. picture frame. painting. map. "
+    "poster. mirror. lamp. plant. book. mug. cup. bottle. can. plate. bowl. "
+    "remote. phone. laptop. notebook. hand. arm. person. face. box. bag. hat. "
+    "ball. toy. blanket. towel. shoe. object."
 )
 
 

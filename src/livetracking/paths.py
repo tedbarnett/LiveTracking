@@ -75,6 +75,7 @@ DISPLAY_INDEX: int | None = _env_int_or_none("LIVETRACKING_DISPLAY_INDEX")
 
 # RealSense exposure (manual lock; see projection-mapping skill)
 RS_EXPOSURE: int = _env_int("LIVETRACKING_RS_EXPOSURE", 700)
+RS_WHITE_BALANCE: int = _env_int("LIVETRACKING_RS_WB", 4600)
 RS_WIDTH: int = _env_int("LIVETRACKING_RS_WIDTH", 848)
 RS_HEIGHT: int = _env_int("LIVETRACKING_RS_HEIGHT", 480)
 RS_FPS: int = _env_int("LIVETRACKING_RS_FPS", 30)

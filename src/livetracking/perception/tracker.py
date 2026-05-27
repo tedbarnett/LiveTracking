@@ -50,6 +50,23 @@ class _Track:
     misses: int = 0
 
 
+@dataclass
+class _Candidate:
+    """A would-be-new track that isn't promoted to a real id until it survives
+    ``promote_after_frames`` consecutive frames. Suppresses single-frame
+    DINO/SAM hallucinations from churning the id space."""
+    last_cam_mask: np.ndarray
+    last_centroid: Tuple[float, float]
+    last_label: str
+    last_label_score: float
+    last_depth_m: float
+    last_proj_mask: Optional[np.ndarray]
+    last_proj_centroid: Optional[Tuple[float, float]]
+    consecutive_hits: int = 1
+    first_seen_t: float = 0.0
+    last_hit_t: float = 0.0
+
+
 def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
     if a.shape != b.shape:
         return 0.0
@@ -94,11 +111,18 @@ class ObjectTracker:
         iou_match_threshold: float = 0.3,
         stale_after_s: float = 2.0,
         names_path: str = OBJECT_NAMES_FILE,
+        promote_after_frames: int = 3,
+        candidate_match_iou: float = 0.2,
+        candidate_match_dist_px: float = 50.0,
     ):
         self.iou_match_threshold = iou_match_threshold
         self.stale_after_s = stale_after_s
         self.names_path = names_path
+        self.promote_after_frames = promote_after_frames
+        self.candidate_match_iou = candidate_match_iou
+        self.candidate_match_dist_px = candidate_match_dist_px
         self._tracks: Dict[int, _Track] = {}
+        self._candidates: List[_Candidate] = []
         self._next_id: int = 1
         self._names: Dict[str, str] = self._load_names()
 
@@ -176,28 +200,81 @@ class ObjectTracker:
             tr.age_frames += 1
             tr.misses = 0
 
-        # Create new tracks for unmatched fresh detections.
+        # Create new tracks ONLY for fresh detections that have survived
+        # ``promote_after_frames`` consecutive frames as a candidate.
         for fi, fd in enumerate(fresh):
             if fi in matched_fresh:
                 continue
-            new_id = self._next_id
-            self._next_id += 1
-            color = PALETTE[(new_id - 1) % len(PALETTE)]
-            saved_name = self._names.get(str(new_id))
-            obj = DetectedObject(
-                object_id=new_id,
-                name=saved_name or fd.label or f"object {new_id}",
-                color_rgb=color,
-                cam_mask=fd.cam_mask,
-                proj_mask=fd.proj_mask,
-                centroid_cam=_mask_centroid(fd.cam_mask),
-                centroid_proj=fd.proj_centroid,
-                bbox_cam=_mask_bbox(fd.cam_mask),
-                median_depth_m=fd.median_depth_m,
-                last_seen_t=now,
-                label_score=fd.label_score,
-            )
-            self._tracks[new_id] = _Track(obj=obj, age_frames=1, misses=0)
+            f_cent = _mask_centroid(fd.cam_mask)
+            # Match this unmatched fresh to an existing candidate?
+            best_cand_idx: Optional[int] = None
+            best_cand_score = -1.0
+            for ci, cand in enumerate(self._candidates):
+                iou = _mask_iou(fd.cam_mask, cand.last_cam_mask)
+                dx, dy = f_cent[0] - cand.last_centroid[0], f_cent[1] - cand.last_centroid[1]
+                dist = (dx * dx + dy * dy) ** 0.5
+                if iou >= self.candidate_match_iou:
+                    score = 1.0 + iou
+                elif dist < self.candidate_match_dist_px:
+                    score = 0.5 - dist / (2 * self.candidate_match_dist_px)
+                else:
+                    continue
+                if score > best_cand_score:
+                    best_cand_score = score
+                    best_cand_idx = ci
+            if best_cand_idx is not None:
+                cand = self._candidates[best_cand_idx]
+                cand.last_cam_mask = fd.cam_mask
+                cand.last_centroid = f_cent
+                cand.last_label = fd.label
+                cand.last_label_score = fd.label_score
+                cand.last_depth_m = fd.median_depth_m
+                cand.last_proj_mask = fd.proj_mask
+                cand.last_proj_centroid = fd.proj_centroid
+                cand.consecutive_hits += 1
+                cand.last_hit_t = now
+                if cand.consecutive_hits >= self.promote_after_frames:
+                    new_id = self._next_id
+                    self._next_id += 1
+                    color = PALETTE[(new_id - 1) % len(PALETTE)]
+                    saved_name = self._names.get(str(new_id))
+                    obj = DetectedObject(
+                        object_id=new_id,
+                        name=saved_name or cand.last_label or f"object {new_id}",
+                        color_rgb=color,
+                        cam_mask=cand.last_cam_mask,
+                        proj_mask=cand.last_proj_mask,
+                        centroid_cam=cand.last_centroid,
+                        centroid_proj=cand.last_proj_centroid,
+                        bbox_cam=_mask_bbox(cand.last_cam_mask),
+                        median_depth_m=cand.last_depth_m,
+                        last_seen_t=now,
+                        label_score=cand.last_label_score,
+                    )
+                    self._tracks[new_id] = _Track(obj=obj, age_frames=cand.consecutive_hits, misses=0)
+                    self._candidates.pop(best_cand_idx)
+            else:
+                self._candidates.append(_Candidate(
+                    last_cam_mask=fd.cam_mask,
+                    last_centroid=f_cent,
+                    last_label=fd.label,
+                    last_label_score=fd.label_score,
+                    last_depth_m=fd.median_depth_m,
+                    last_proj_mask=fd.proj_mask,
+                    last_proj_centroid=fd.proj_centroid,
+                    consecutive_hits=1,
+                    first_seen_t=now,
+                    last_hit_t=now,
+                ))
+
+        # Reap candidates that haven't been re-hit recently (1.5 s without a
+        # matching detection means it was a flicker, not a real object).
+        kept_candidates: List[_Candidate] = []
+        for cand in self._candidates:
+            if now - cand.last_hit_t > 1.5:
+                continue
+            kept_candidates.append(cand)
+        self._candidates = kept_candidates
 
         # Retire stale tracks.
         for tid in list(self._tracks.keys()):
