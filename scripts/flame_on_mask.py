@@ -92,6 +92,7 @@ def main():
     gblk = cv2.cvtColor(cam_black, cv2.COLOR_BGR2GRAY).astype(np.int16)
     campts, projpts = [], []
     diffs = []
+    ch, cw = cam_black.shape[:2]
     for fx, fy in DOT_FRACS:
         pxy = (fx*PW, fy*PH)
         dot(pxy); time.sleep(0.2)
@@ -99,14 +100,38 @@ def main():
         d = cv2.GaussianBlur(np.clip(cv2.cvtColor(cd, cv2.COLOR_BGR2GRAY).astype(np.int16)-gblk, 0, 255).astype(np.uint8), (0, 0), 5)
         _, mx, _, loc = cv2.minMaxLoc(d)
         diffs.append(int(mx))
-        if mx > 15:
-            campts.append([loc[0], loc[1]]); projpts.append([pxy[0], pxy[1]])
+        bxx, byy = loc
+        on_border = bxx < 8 or byy < 8 or bxx > cw-8 or byy > ch-8
+        if mx > 30 and not on_border:     # strong diff, not a frame-edge artifact
+            campts.append([bxx, byy]); projpts.append([pxy[0], pxy[1]])
     dot(None)
-    print(f"dot maxdiffs: {diffs}")
+    print(f"dot maxdiffs: {diffs}  kept {len(campts)}")
     if len(campts) < 4:
         print(f"calibration FAILED: only {len(campts)} dots detected"); p.stop(); pygame.quit(); return
     H, _ = cv2.findHomography(np.array(campts, np.float32), np.array(projpts, np.float32), cv2.RANSAC, 5.0)
     print(f"calibration: {len(campts)}/9 dots")
+    print(f"H matrix:\n{H}")
+    # Sanity: where do the 4 camera-frame corners map to in projector space?
+    ch_d, cw_d = cam_black.shape[:2]
+    corners_cam = np.array([[[0, 0]], [[cw_d - 1, 0]],
+                             [[cw_d - 1, ch_d - 1]], [[0, ch_d - 1]]], dtype=np.float32)
+    corners_proj = cv2.perspectiveTransform(corners_cam, H).reshape(-1, 2)
+    print(f"cam frame corners map to projector:\n{corners_proj}")
+    cv2.imwrite(os.path.join(OUT, "fom_baseline.png"), cam_black)
+
+    # Map the 4 projector corners back into camera space so we can restrict
+    # candidate-blob analysis to the region the projector can actually cover.
+    # Anything outside this quad cannot be lit by the projector and must not
+    # be considered as the "guitar" - otherwise off-axis white objects (e.g.
+    # a storage box outside the projection field) hijack the area-based score.
+    H_inv = np.linalg.inv(H)
+    proj_corners = np.array([[[0, 0]], [[PW - 1, 0]],
+                              [[PW - 1, PH - 1]], [[0, PH - 1]]], dtype=np.float32)
+    proj_in_cam = cv2.perspectiveTransform(proj_corners, H_inv).reshape(-1, 2).astype(np.float32)
+    print(f"projector quad in camera space:\n{proj_in_cam}")
+    proj_quad_mask = np.zeros((ch_d, cw_d), dtype=np.uint8)
+    cv2.fillConvexPoly(proj_quad_mask, proj_in_cam.astype(np.int32), 1)
+    cv2.imwrite(os.path.join(OUT, "fom_proj_quad_in_cam.png"), proj_quad_mask * 255)
 
     # ---- guitar body mask (proven recipe) ----
     hsv = cv2.cvtColor(cam_black, cv2.COLOR_BGR2HSV)
@@ -121,6 +146,8 @@ def main():
     nod = (depth == 0).astype(np.uint8)
     cand = cv2.bitwise_and(white, cv2.bitwise_or(near, nod))
     cand[:int(CONFIG["top_ignore_frac"]*H_img)] = 0
+    # Restrict candidates to the projector's reachable footprint.
+    cand = cv2.bitwise_and(cand, proj_quad_mask)
     cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
     n, lbl, stats, _ = cv2.connectedComponentsWithStats(cand, 8)
@@ -139,6 +166,9 @@ def main():
             best, gi = sc, i
     seed = (lbl == gi).astype(np.uint8)
     region = cv2.dilate(seed, np.ones((61, 61), np.uint8))
+    # Also clip the dilation region to the projector footprint so the final
+    # body contour can never bleed off the reachable area.
+    region = cv2.bitwise_and(region, proj_quad_mask)
     body = cv2.morphologyEx(cv2.bitwise_and(white, region), cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
     cnts, _ = cv2.findContours(body, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cnts = [c for c in cnts if cv2.contourArea(c) > 200]
@@ -146,13 +176,27 @@ def main():
     if cnts:
         cv2.drawContours(body, [max(cnts, key=cv2.contourArea)], -1, 1, cv2.FILLED)
     cam_mask = (body > 0).astype(np.uint8)
+    print(f"cam_mask: {int(cam_mask.sum())} px, bbox in cam: ", end="")
+    yc, xc = np.where(cam_mask > 0)
+    if xc.size:
+        print(f"({xc.min()},{yc.min()})-({xc.max()},{yc.max()}) shape={cam_mask.shape}")
+    else:
+        print("EMPTY")
+    cv2.imwrite(os.path.join(OUT, "fom_cam_mask.png"), cam_mask * 255)
+    # Annotated baseline showing where the mask landed in the camera frame
+    overlay = cam_black.copy()
+    overlay[cam_mask > 0] = (0, 255, 0)
+    blended = cv2.addWeighted(cam_black, 0.5, overlay, 0.5, 0)
+    cv2.imwrite(os.path.join(OUT, "fom_cam_mask_overlay.png"), blended)
 
     # ---- warp mask to projector space ----
     proj_mask = cv2.warpPerspective(cam_mask*255, H, (PW, PH), flags=cv2.INTER_NEAREST)
     proj_mask = (proj_mask > 127).astype(np.uint8)
     ys, xs = np.where(proj_mask > 0)
+    cv2.imwrite(os.path.join(OUT, "fom_proj_mask.png"), proj_mask * 255)
     if xs.size == 0:
-        print("mask did not map into projector"); p.stop(); pygame.quit(); return
+        print("mask did not map into projector (saved diagnostics to scripts/out/fom_*.png)")
+        p.stop(); pygame.quit(); return
     bx0, by0, bx1, by1 = xs.min(), ys.min(), xs.max(), ys.max()
     pm3 = cv2.merge([proj_mask, proj_mask, proj_mask])
     print(f"proj mask bbox=({bx0},{by0},{bx1-bx0},{by1-by0})")
