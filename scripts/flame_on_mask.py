@@ -22,8 +22,8 @@ CONFIG = dict(
     exposure=700,
     dot_r=70,
     white_S_max=80, white_V_min=140, depth_margin_m=0.12, top_ignore_frac=0.40,
-    animate_secs=4.0,
-    fire_intensity=1.15,
+    animate_secs=20.0,
+    fire_intensity=2.5,
 )
 DOT_FRACS = [(fx, fy) for fy in (0.2, 0.5, 0.8) for fx in (0.2, 0.5, 0.8)]
 
@@ -78,6 +78,30 @@ def main():
         pygame.display.flip()
         for _ in range(6):
             pygame.event.pump(); time.sleep(0.03)
+
+    banner_font = pygame.font.SysFont(None, 220)
+    sub_font = pygame.font.SysFont(None, 90)
+
+    def banner(line1, line2="", secs=3.0, bg=(20, 20, 20), fg=(255, 255, 255)):
+        """Big centered text on the projector for N seconds. So you can SEE
+        when the script is doing something."""
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            screen.fill(bg)
+            t1 = banner_font.render(line1, True, fg)
+            screen.blit(t1, (PW // 2 - t1.get_width() // 2,
+                              PH // 2 - t1.get_height() // 2 - 60))
+            if line2:
+                t2 = sub_font.render(line2, True, fg)
+                screen.blit(t2, (PW // 2 - t2.get_width() // 2,
+                                  PH // 2 + 120))
+            pygame.display.flip()
+            for _ in pygame.event.get():
+                pass
+            time.sleep(0.05)
+
+    banner("STARTING", "9-dot calibration in 3 seconds. Watch the wall.",
+            secs=3.0, bg=(40, 0, 0), fg=(255, 255, 255))
 
     def grab():
         for _ in range(18):
@@ -202,6 +226,8 @@ def main():
     print(f"proj mask bbox=({bx0},{by0},{bx1-bx0},{by1-by0})")
 
     # ---- animate blue fire clipped to the mask ----
+    banner("FLAME ON GUITAR", f"projecting for {CONFIG['animate_secs']:.0f}s",
+            secs=2.5, bg=(0, 0, 40), fg=(120, 200, 255))
     cam_res = cam_black
     t0 = time.time(); captured = False
     canvas = np.zeros((PH, PW, 3), np.uint8)
@@ -220,6 +246,8 @@ def main():
             time.sleep(0.2); cam_res, _ = grab(); captured = True
         time.sleep(0.03)
     screen.fill((0, 0, 0)); pygame.display.flip()
+    banner("DONE", "see scripts/out/flamemask.png", secs=2.0,
+            bg=(0, 30, 0), fg=(255, 255, 255))
     p.stop(); pygame.quit()
 
     # ---- evaluate over the camera body mask ----
