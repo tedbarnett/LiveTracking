@@ -44,6 +44,7 @@ for _d in (RUNTIME_DIR, TMP_DIR, CALIB_DIR, MASK_DIR, SCRIPT_OUT_DIR):
 # Calibration artifacts
 HOMOGRAPHY_FILE: str = os.path.join(CALIB_DIR, "H.npy")
 CALIB_META_FILE: str = os.path.join(CALIB_DIR, "calib.json")
+MEASURED_FOOTPRINT_FILE: str = os.path.join(CALIB_DIR, "footprint_measured.png")
 
 # Object naming persistence
 OBJECT_NAMES_FILE: str = os.path.join(RUNTIME_DIR, "object_names.json")

@@ -39,7 +39,7 @@ from livetracking.paths import (
 )
 from livetracking.perception.capture import RealSenseCapture
 from livetracking.perception.footprint import (
-    footprint_corners_in_camera,
+    footprint_outline_in_camera,
     load_homography,
 )
 from livetracking.perception.pipeline import Pipeline, PipelineConfig
@@ -107,7 +107,7 @@ class PerceptionDaemon:
         self.pipeline = Pipeline(
             H, cw, ch, PipelineConfig(proj_w=PW, proj_h=PH)
         )
-        self.fp_corners = footprint_corners_in_camera(H, PW, PH)
+        self.fp_corners = footprint_outline_in_camera(H, PW, PH, cw, ch)
 
         ctx = zmq.Context.instance()
         self.objects_pub = ctx.socket(zmq.PUB)

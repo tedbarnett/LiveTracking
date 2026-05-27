@@ -34,14 +34,15 @@ from livetracking.perception.capture import RealSenseCapture
 from livetracking.perception.footprint import save_homography
 
 
-# Dot radius in *projector* pixels. At 3840x2160 a radius of 180 gives a dot
-# ~5% of frame width, which is reliably detectable in the camera even with
-# room lighting and the projector throwing color. Older code used 70 — too
-# small at 4K.
 DOT_RADIUS_PROJ_PX = 180
 DOT_GRID = [(fx, fy) for fy in (0.2, 0.5, 0.8) for fx in (0.2, 0.5, 0.8)]
 DIFF_THRESHOLD = 30
 EDGE_REJECT_PX = 8
+# Pixels that brighten by more than this between full-black and full-white
+# projector frames count as "the projector is lighting that camera pixel".
+# Measured, not computed — handles multi-plane scenes (wall + sofa) correctly.
+FOOTPRINT_DIFF_THRESHOLD = 25
+FOOTPRINT_MORPH_CLOSE = 9
 
 
 def pick_projector_display(pygame):
@@ -79,6 +80,12 @@ def main() -> int:
         for _ in pygame.event.get():
             pass
 
+    def show_fill(color):
+        screen.fill(color)
+        pygame.display.flip()
+        for _ in pygame.event.get():
+            pass
+
     cap = RealSenseCapture()
     cw, ch = cap.size()
     try:
@@ -90,6 +97,53 @@ def main() -> int:
         baseline = cap.read()
         gblk = cv2.cvtColor(baseline.color, cv2.COLOR_BGR2GRAY).astype(np.int16)
         cv2.imwrite(os.path.join(SCRIPT_OUT_DIR, "calib_baseline.png"), baseline.color)
+
+        # ---- measured projector footprint: project distinctive color, diff ----
+        # White-vs-black diff fails when ambient room light is bright (the
+        # diff is small even outside the projector cone, but small EVERYWHERE
+        # so thresholding picks up the whole frame). Instead, project
+        # MAGENTA — high red+blue, low green — and look for pixels whose
+        # red+blue went UP much more than green did. Real projector pixels
+        # will show this chroma shift; ambient-lit pixels won't.
+        show_fill((255, 0, 255))
+        time.sleep(0.8)
+        for _ in range(5):
+            cap.read()
+        mag_shot = cap.read()
+        show_fill((0, 0, 0))
+        # BGR; "magenta" means high B + high R, low G
+        b0, g0, r0 = cv2.split(baseline.color.astype(np.int16))
+        b1, g1, r1 = cv2.split(mag_shot.color.astype(np.int16))
+        # Chroma signal = (Δred + Δblue) - 2·Δgreen.  Pixels lit by magenta
+        # projection get a big positive value; pixels merely brightened by
+        # ambient changes get ~0.
+        chroma = (r1 - r0) + (b1 - b0) - 2 * (g1 - g0)
+        chroma = np.clip(chroma, 0, 255).astype(np.uint8)
+        _, lit = cv2.threshold(chroma, FOOTPRINT_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+        k = np.ones((FOOTPRINT_MORPH_CLOSE, FOOTPRINT_MORPH_CLOSE), np.uint8)
+        lit = cv2.morphologyEx(lit, cv2.MORPH_CLOSE, k)
+        # Also fill holes inside the lit region (dark objects don't reflect
+        # magenta well, but they're INSIDE the cone so should still count).
+        # Fill via flood-fill from corners marking background, then invert.
+        h, w = lit.shape
+        ff = lit.copy()
+        ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+        cv2.floodFill(ff, ff_mask, (0, 0), 255)
+        cv2.floodFill(ff, ff_mask, (w - 1, 0), 255)
+        cv2.floodFill(ff, ff_mask, (0, h - 1), 255)
+        cv2.floodFill(ff, ff_mask, (w - 1, h - 1), 255)
+        holes_filled = cv2.bitwise_or(lit, cv2.bitwise_not(ff))
+        n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(holes_filled, 8)
+        footprint_meas = np.zeros_like(lit)
+        if n_lab > 1:
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            footprint_meas[labels == largest] = 255
+        cv2.imwrite(os.path.join(SCRIPT_OUT_DIR, "calib_magenta.png"), mag_shot.color)
+        cv2.imwrite(os.path.join(SCRIPT_OUT_DIR, "calib_footprint_diff.png"), chroma)
+        cv2.imwrite(os.path.join(SCRIPT_OUT_DIR, "calib_footprint_measured.png"), footprint_meas)
+        meas_frac = float((footprint_meas > 0).sum()) / (cw * ch)
+        print(f"[calib] measured footprint = {int((footprint_meas>0).sum())} px "
+              f"({100*meas_frac:.1f}% of camera frame)")
 
         cam_pts, proj_pts = [], []
         dotvis = baseline.color.copy()
@@ -139,6 +193,31 @@ def main() -> int:
         if abs(det) < 0.01:
             print("[calib] WARNING: near-degenerate homography (det too small).")
 
+        # ---- saved homography + measured dot quad ----
+        # We record the 4 *outermost* detected dot positions so the perception
+        # daemon can draw a quadrilateral that bounds where we actually
+        # observed the projector — not an extrapolation of H to the full
+        # projector frame (which goes wildly off when the calibration plane
+        # is a compromise between wall and sofa).
+        cam_pts_arr = np.array(cam_pts, dtype=np.float32)
+        proj_pts_arr = np.array(proj_pts, dtype=np.float32)
+        # Build a convex hull of the measured dot positions, then approximate
+        # to a quadrilateral.
+        hull = cv2.convexHull(cam_pts_arr.reshape(-1, 1, 2))
+        # Approximate to 4 points (or just use the hull if fewer)
+        peri = cv2.arcLength(hull, True)
+        approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+        # Save just the dot-camera positions; perception can decide how to
+        # turn that into a footprint outline.
+        np.save(os.path.join(os.path.dirname(__file__), "..", "runtime",
+                             "calibration", "dot_cam_pts.npy"),
+                cam_pts_arr)
+        np.save(os.path.join(os.path.dirname(__file__), "..", "runtime",
+                             "calibration", "dot_proj_pts.npy"),
+                proj_pts_arr)
+        print(f"[calib] saved {len(cam_pts)} measured dot positions for "
+              f"footprint estimation (hull has {len(approx)} corners)")
+
         save_homography(
             H,
             proj_size=(PW, PH),
@@ -148,8 +227,16 @@ def main() -> int:
                 "ransac_inliers": n_in,
                 "det_2x2": round(det, 4),
                 "dot_grid": [list(p) for p in DOT_GRID],
+                "measured_footprint_file": "footprint_measured.png",
+                "measured_footprint_fraction": round(meas_frac, 4),
             },
         )
+        # Also persist the measured footprint mask alongside H.
+        import shutil
+        meas_path = os.path.join(os.path.dirname(__file__), "..", "runtime",
+                                 "calibration", "footprint_measured.png")
+        os.makedirs(os.path.dirname(meas_path), exist_ok=True)
+        cv2.imwrite(meas_path, footprint_meas)
         cv2.imwrite(os.path.join(SCRIPT_OUT_DIR, "calib_dots.png"), dotvis)
         print(f"[calib] saved homography + meta + {os.path.join(SCRIPT_OUT_DIR, 'calib_dots.png')}")
         return 0
