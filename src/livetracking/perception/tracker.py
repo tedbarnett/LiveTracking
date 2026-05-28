@@ -303,3 +303,28 @@ class ObjectTracker:
 
     def active(self) -> List[DetectedObject]:
         return [tr.obj for tr in self._tracks.values()]
+
+    def refresh_track(
+        self,
+        object_id: int,
+        cam_mask: np.ndarray,
+        proj_mask: Optional[np.ndarray],
+        proj_centroid: Optional[Tuple[float, float]],
+        median_depth_m: float,
+    ) -> bool:
+        """Used by Pipeline.fast_step() — updates geometry-only fields of an
+        existing track without rerunning DINO/SAM. Label, color, name stay put.
+        """
+        tr = self._tracks.get(object_id)
+        if tr is None:
+            return False
+        tr.obj.cam_mask = cam_mask
+        tr.obj.proj_mask = proj_mask
+        tr.obj.centroid_cam = _mask_centroid(cam_mask)
+        tr.obj.centroid_proj = proj_centroid
+        tr.obj.bbox_cam = _mask_bbox(cam_mask)
+        tr.obj.median_depth_m = median_depth_m
+        tr.obj.last_seen_t = time.time()
+        tr.age_frames += 1
+        tr.misses = 0
+        return True

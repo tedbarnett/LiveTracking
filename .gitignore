@@ -23,3 +23,5 @@ scripts/out/
 
 # Plans (local working notes)
 .hermes/
+scripts/_cleanup.ps1
+scripts/_repoint.ps1

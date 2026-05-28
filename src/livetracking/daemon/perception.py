@@ -160,7 +160,8 @@ class PerceptionDaemon:
             return {"ok": ok}
         if cmd == "highlight":
             obj_id = int(msg["id"])
-            tracked = self.pipeline.tracker.active()
+            with self.pipeline.tracker_lock:
+                tracked = self.pipeline.tracker.active()
             target = next((o for o in tracked if o.object_id == obj_id), None)
             if target is None or target.proj_mask is None:
                 self.proj_push.send_json({"type": "clear"})
@@ -190,7 +191,8 @@ class PerceptionDaemon:
         if cmd == "pin":
             # Like highlight but doesn't auto-clear on mouseleave.
             obj_id = int(msg["id"])
-            tracked = self.pipeline.tracker.active()
+            with self.pipeline.tracker_lock:
+                tracked = self.pipeline.tracker.active()
             target = next((o for o in tracked if o.object_id == obj_id), None)
             if target is None or target.proj_mask is None:
                 return {"ok": False, "reason": "no such object / no proj_mask"}
@@ -218,7 +220,8 @@ class PerceptionDaemon:
             self.proj_push.send_json({"type": "set_intensity", "value": v})
             return {"ok": True, "value": v}
         if cmd == "highlight_all":
-            tracked = self.pipeline.tracker.active()
+            with self.pipeline.tracker_lock:
+                tracked = self.pipeline.tracker.active()
             self.proj_push.send_json({
                 "type": "highlight_all",
                 "objects": [
@@ -243,8 +246,10 @@ class PerceptionDaemon:
         if cmd == "state":
             return {"ok": True, "paused": self.paused}
         if cmd == "list":
+            with self.pipeline.tracker_lock:
+                act = self.pipeline.tracker.active()
             return {"ok": True, "objects": _objects_to_payload(
-                self.pipeline.tracker.active(), self.pipeline.last_timings_ms
+                act, self.pipeline.last_timings_ms
             )["objects"]}
         return {"ok": False, "reason": f"unknown cmd {cmd!r}"}
 
@@ -282,8 +287,9 @@ class PerceptionDaemon:
                 self.frame_idx += 1
                 continue
 
-            with self._ctrl_lock:
-                objects = self.pipeline.step(frame.color, frame.depth_m)
+            # No need to hold _ctrl_lock here — Pipeline owns its own
+            # tracker_lock; ctrl ops contend only on tracker, not on the GPU.
+            objects = self.pipeline.step_auto(frame.color, frame.depth_m)
             payload = _objects_to_payload(objects, self.pipeline.last_timings_ms)
             payload["paused"] = False
             self.objects_pub.send_multipart([
@@ -301,7 +307,8 @@ class PerceptionDaemon:
             now = time.time()
             if now - last_print > 2.0:
                 t = self.pipeline.last_timings_ms
-                print(f"[perception] frame {self.frame_idx} "
+                kind = "FAST" if t.get("fast") else "FULL"
+                print(f"[perception] frame {self.frame_idx} [{kind}] "
                       f"total={t['total_ms']:.0f}ms "
                       f"(s1={t['stage1_ms']:.0f} dino={t['dino_ms']:.0f} "
                       f"sam={t['sam_ms']:.0f}) "
@@ -309,6 +316,7 @@ class PerceptionDaemon:
                       f"objects={t['n_objects']}")
                 last_print = now
 
+        self.pipeline.stop_async()
         self.cap.close()
         print("[perception] exited")
 
