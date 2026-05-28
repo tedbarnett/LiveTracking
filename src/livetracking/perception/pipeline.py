@@ -58,12 +58,12 @@ class PipelineConfig:
     require_geometric_overlap: bool = True   # require some Stage-1 overlap
     geometric_overlap_min: float = 0.15
     iou_match_threshold: float = 0.25
-    # 30s of DINO silence before we retire a track. With async DINO running
-    # every ~2s, this gives a track 15 chances to be re-seen. Combined with
+    # 60s of DINO silence before we retire a track. With async DINO running
+    # every ~2s, this gives a track ~30 chances to be re-seen. Combined with
     # fast_step keeping `last_seen_t` fresh (it calls refresh_track every fast
     # frame for matched tracks), retirement now only fires when an object
-    # genuinely leaves the scene.
-    stale_after_s: float = 30.0
+    # genuinely leaves the scene for a full minute.
+    stale_after_s: float = 60.0
     # Heavy DINO+SAM runs every N frames. The N-1 frames between use Stage-1
     # blobs to refresh each tracked object's cam_mask, parallax and proj_mask
     # in-place. 1 = full pass every frame (old behaviour, ~1-2 fps).
@@ -79,10 +79,15 @@ class PipelineConfig:
     # appearing/disappearing"). Any unmatched Stage-1 blob inside the footprint
     # that persists across this many consecutive fast_step frames gets promoted
     # to a real track with a placeholder name. The async recognizer attaches a
-    # real label later. At ~10 Hz fast frames, 8 → ~0.8s appearance latency.
-    provisional_promote_frames: int = 8
+    # real label later. At ~10 Hz fast frames, 25 → ~2.5 s of "really there"
+    # evidence before we add an object. Set higher to be more conservative.
+    provisional_promote_frames: int = 25
     provisional_match_dist_px: float = 60.0
-    provisional_min_blob_area_px: int = 1200
+    provisional_min_blob_area_px: int = 1500
+    # Max consecutive fast frames a provisional can be missing before its
+    # hit-count is reset (kills flickering noise from accruing hits across
+    # long gaps). 2 frames = ~200 ms tolerance.
+    provisional_max_gap_frames: int = 2
     # Async mode: when True, DINO+SAM run in a background thread and the main
     # loop always runs the FAST path. The heavy thread refreshes the tracker
     # whenever it finishes. Set False to use sync FAST/FULL alternation.
@@ -357,7 +362,7 @@ class Pipeline:
                     already_tracked = True
                     break
                 ti = int(np.logical_and(b.cam_mask > 0, o.cam_mask > 0).sum())
-                if ti / max(1, area) > 0.3:
+                if ti / max(1, area) > 0.05:
                     already_tracked = True
                     break
             if already_tracked:
@@ -371,10 +376,18 @@ class Pipeline:
                     best_dist, best_p = d, pi
             if best_p >= 0 and best_dist < self.cfg.provisional_match_dist_px:
                 p = self._provisional_blobs[best_p]
+                gap = self._frame_idx - p["last_seen_frame"]
                 p["centroid"] = (bcx, bcy)
                 p["last_seen_frame"] = self._frame_idx
-                p["hits"] += 1
                 p["last_cam_mask"] = b.cam_mask
+                # If we lost sight of this blob for > max_gap frames, treat
+                # the previous run as unreliable and restart the count. Stops
+                # one-off Stage-1 noise from accumulating hits across seconds
+                # of absence.
+                if gap > self.cfg.provisional_max_gap_frames:
+                    p["hits"] = 1
+                else:
+                    p["hits"] += 1
                 if p["hits"] >= self.cfg.provisional_promote_frames:
                     new_promotions.append(p)
                     self._provisional_blobs.pop(best_p)
@@ -385,10 +398,10 @@ class Pipeline:
                     "hits": 1,
                     "last_cam_mask": b.cam_mask,
                 })
-        # Reap provisionals not seen in the last 5 fast frames.
+        # Reap provisionals not seen in the last 3 fast frames.
         self._provisional_blobs = [
             p for p in self._provisional_blobs
-            if self._frame_idx - p["last_seen_frame"] <= 5
+            if self._frame_idx - p["last_seen_frame"] <= 3
         ]
 
         with self.tracker_lock:
