@@ -233,6 +233,24 @@ def create_app() -> Flask:
         data = request.get_json(silent=True) or {}
         return jsonify(_send_ctrl({"cmd": "intensity", "value": float(data.get("value", 0.78))}))
 
+    @app.route("/hide", methods=["POST"])
+    def hide():
+        data = request.get_json(silent=True) or {}
+        return jsonify(_send_ctrl({"cmd": "hide", "id": int(data["id"])}))
+
+    @app.route("/unhide", methods=["POST"])
+    def unhide():
+        data = request.get_json(silent=True) or {}
+        return jsonify(_send_ctrl({"cmd": "unhide", "id": int(data["id"])}))
+
+    @app.route("/unhide_all", methods=["POST"])
+    def unhide_all():
+        return jsonify(_send_ctrl({"cmd": "unhide_all"}))
+
+    @app.route("/hidden_list")
+    def hidden_list():
+        return jsonify(_send_ctrl({"cmd": "hidden_list"}))
+
     @app.route("/healthz")
     def healthz():
         return jsonify({

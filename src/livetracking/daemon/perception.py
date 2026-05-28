@@ -158,10 +158,25 @@ class PerceptionDaemon:
         if cmd == "rename":
             ok = self.pipeline.tracker.rename(int(msg["id"]), str(msg["name"]))
             return {"ok": ok}
+        if cmd == "hide":
+            ok = self.pipeline.tracker.hide(int(msg["id"]))
+            # Also clear the projection if we just hid the currently lit object.
+            self.proj_push.send_json({"type": "clear"})
+            return {"ok": ok}
+        if cmd == "unhide":
+            ok = self.pipeline.tracker.unhide(int(msg["id"]))
+            return {"ok": ok}
+        if cmd == "unhide_all":
+            ids = self.pipeline.tracker.hidden_ids()
+            for oid in ids:
+                self.pipeline.tracker.unhide(oid)
+            return {"ok": True, "count": len(ids)}
+        if cmd == "hidden_list":
+            return {"ok": True, "ids": self.pipeline.tracker.hidden_ids()}
         if cmd == "highlight":
             obj_id = int(msg["id"])
             with self.pipeline.tracker_lock:
-                tracked = self.pipeline.tracker.active()
+                tracked = self.pipeline.tracker.visible()
             target = next((o for o in tracked if o.object_id == obj_id), None)
             if target is None or target.proj_mask is None:
                 self.proj_push.send_json({"type": "clear"})
@@ -192,7 +207,7 @@ class PerceptionDaemon:
             # Like highlight but doesn't auto-clear on mouseleave.
             obj_id = int(msg["id"])
             with self.pipeline.tracker_lock:
-                tracked = self.pipeline.tracker.active()
+                tracked = self.pipeline.tracker.visible()
             target = next((o for o in tracked if o.object_id == obj_id), None)
             if target is None or target.proj_mask is None:
                 return {"ok": False, "reason": "no such object / no proj_mask"}
@@ -221,7 +236,7 @@ class PerceptionDaemon:
             return {"ok": True, "value": v}
         if cmd == "highlight_all":
             with self.pipeline.tracker_lock:
-                tracked = self.pipeline.tracker.active()
+                tracked = self.pipeline.tracker.visible()
             self.proj_push.send_json({
                 "type": "highlight_all",
                 "objects": [
@@ -247,7 +262,7 @@ class PerceptionDaemon:
             return {"ok": True, "paused": self.paused}
         if cmd == "list":
             with self.pipeline.tracker_lock:
-                act = self.pipeline.tracker.active()
+                act = self.pipeline.tracker.visible()
             return {"ok": True, "objects": _objects_to_payload(
                 act, self.pipeline.last_timings_ms
             )["objects"]}
@@ -289,7 +304,10 @@ class PerceptionDaemon:
 
             # No need to hold _ctrl_lock here — Pipeline owns its own
             # tracker_lock; ctrl ops contend only on tracker, not on the GPU.
-            objects = self.pipeline.step_auto(frame.color, frame.depth_m)
+            objects_all = self.pipeline.step_auto(frame.color, frame.depth_m)
+            # User-hidden tracks stay in the matcher but never reach the UI
+            # or the projector.
+            objects = [o for o in objects_all if not o.hidden]
             payload = _objects_to_payload(objects, self.pipeline.last_timings_ms)
             payload["paused"] = False
             self.objects_pub.send_multipart([
