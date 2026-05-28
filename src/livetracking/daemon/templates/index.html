@@ -30,6 +30,8 @@
   .obj.hovered { background: #333; outline: 1px solid #555; }
   .obj.pinned  { background: #2b2b3a; outline: 2px solid #88a; }
   .swatch { width: 18px; height: 18px; border-radius: 4px; flex-shrink: 0; border: 1px solid #000; box-shadow: 0 0 0 1px #444; }
+  .hide-btn { background: transparent; border: 1px solid #444; color: #888; width: 22px; height: 22px; border-radius: 4px; padding: 0; font-size: 12px; cursor: pointer; flex-shrink: 0; }
+  .hide-btn:hover { background: #4a1f1f; border-color: #c44; color: #fff; }
   .num { width: 24px; text-align: right; color: #888; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; }
   .name { flex: 1; min-width: 0; }
   .name input { background: transparent; border: 1px solid transparent; color: #eee; font-size: 14px; padding: 2px 4px; border-radius: 3px; width: 100%; box-sizing: border-box; }
@@ -48,6 +50,7 @@
     <button id="btnPause" class="primary">⏸ Pause</button>
     <button id="btnAll">Highlight all</button>
     <button id="btnClear">Clear</button>
+    <button id="btnUnhide" style="display:none;">Unhide all</button>
   </div>
   <div class="meta"><span id="frameTimings">…</span></div>
 </header>
@@ -82,6 +85,7 @@ const pausedOverlay = document.getElementById('paused-overlay');
 const btnPause = document.getElementById('btnPause');
 const btnAll = document.getElementById('btnAll');
 const btnClear = document.getElementById('btnClear');
+const btnUnhide = document.getElementById('btnUnhide');
 const intensitySlider = document.getElementById('intensitySlider');
 const intensityVal = document.getElementById('intensityVal');
 
@@ -149,9 +153,16 @@ function render(payload) {
         <div class="name">
           <input type="text" />
           <div class="meta-line"></div>
-        </div>`;
+        </div>
+        <button class="hide-btn" title="Hide this object — won't reappear until you click 'Unhide all'">✕</button>`;
       const inp = row.querySelector('input');
       const swatch = row.querySelector('.swatch');
+      const hideBtn = row.querySelector('.hide-btn');
+      hideBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        fetch('/hide', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: o.id }) });
+      });
       let clickTimer = null;
       swatch.addEventListener('click', e => {
         e.stopPropagation();
@@ -213,6 +224,24 @@ function render(payload) {
 
 // Initial state sync
 fetch('/state').then(r => r.json()).then(j => { if ('paused' in j) setPaused(j.paused); });
+
+btnUnhide.addEventListener('click', () => {
+  fetch('/unhide_all', { method: 'POST' }).then(() => refreshHiddenCount());
+});
+
+function refreshHiddenCount() {
+  fetch('/hidden_list').then(r => r.json()).then(j => {
+    const n = (j && j.ids) ? j.ids.length : 0;
+    if (n > 0) {
+      btnUnhide.style.display = '';
+      btnUnhide.textContent = `Unhide all (${n})`;
+    } else {
+      btnUnhide.style.display = 'none';
+    }
+  }).catch(() => {});
+}
+setInterval(refreshHiddenCount, 3000);
+refreshHiddenCount();
 
 const es = new EventSource('/objects');
 es.addEventListener('update', e => {

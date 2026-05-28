@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from livetracking.paths import OBJECT_NAMES_FILE
+from livetracking.paths import HIDDEN_OBJECTS_FILE, OBJECT_NAMES_FILE
 from .types import DetectedObject
 
 
@@ -111,6 +111,7 @@ class ObjectTracker:
         iou_match_threshold: float = 0.3,
         stale_after_s: float = 2.0,
         names_path: str = OBJECT_NAMES_FILE,
+        hidden_path: str = HIDDEN_OBJECTS_FILE,
         promote_after_frames: int = 3,
         candidate_match_iou: float = 0.2,
         candidate_match_dist_px: float = 50.0,
@@ -118,6 +119,7 @@ class ObjectTracker:
         self.iou_match_threshold = iou_match_threshold
         self.stale_after_s = stale_after_s
         self.names_path = names_path
+        self.hidden_path = hidden_path
         self.promote_after_frames = promote_after_frames
         self.candidate_match_iou = candidate_match_iou
         self.candidate_match_dist_px = candidate_match_dist_px
@@ -125,6 +127,7 @@ class ObjectTracker:
         self._candidates: List[_Candidate] = []
         self._next_id: int = 1
         self._names: Dict[str, str] = self._load_names()
+        self._hidden_ids: set = self._load_hidden()
 
     # ---- name persistence ----
     def _load_names(self) -> Dict[str, str]:
@@ -140,6 +143,44 @@ class ObjectTracker:
         os.makedirs(os.path.dirname(self.names_path), exist_ok=True)
         with open(self.names_path, "w") as f:
             json.dump(self._names, f, indent=2)
+
+    # ---- hidden persistence ----
+    def _load_hidden(self) -> set:
+        if not os.path.exists(self.hidden_path):
+            return set()
+        try:
+            with open(self.hidden_path) as f:
+                return set(int(x) for x in json.load(f))
+        except Exception:
+            return set()
+
+    def _save_hidden(self) -> None:
+        os.makedirs(os.path.dirname(self.hidden_path), exist_ok=True)
+        with open(self.hidden_path, "w") as f:
+            json.dump(sorted(self._hidden_ids), f, indent=2)
+
+    def hide(self, object_id: int) -> bool:
+        """Mark a track hidden — it stays in the matcher (so Stage-1 blobs at
+        its location don't keep promoting fresh duplicates) but is excluded
+        from active()/visible() and from the projector wash."""
+        tr = self._tracks.get(object_id)
+        if tr is None:
+            return False
+        tr.obj.hidden = True
+        self._hidden_ids.add(object_id)
+        self._save_hidden()
+        return True
+
+    def unhide(self, object_id: int) -> bool:
+        tr = self._tracks.get(object_id)
+        if tr is not None:
+            tr.obj.hidden = False
+        self._hidden_ids.discard(object_id)
+        self._save_hidden()
+        return tr is not None
+
+    def hidden_ids(self) -> List[int]:
+        return sorted(self._hidden_ids)
 
     def rename(self, object_id: int, new_name: str) -> bool:
         track = self._tracks.get(object_id)
@@ -279,6 +320,8 @@ class ObjectTracker:
                         label_score=cand.last_label_score,
                     )
                     self._tracks[new_id] = _Track(obj=obj, age_frames=cand.consecutive_hits, misses=0)
+                    if new_id in self._hidden_ids:
+                        obj.hidden = True
                     self._candidates.pop(best_cand_idx)
             else:
                 self._candidates.append(_Candidate(
@@ -314,7 +357,12 @@ class ObjectTracker:
         return [tr.obj for tr in self._tracks.values()]
 
     def active(self) -> List[DetectedObject]:
+        """All live tracks, including hidden. Used internally for matching."""
         return [tr.obj for tr in self._tracks.values()]
+
+    def visible(self) -> List[DetectedObject]:
+        """Live tracks excluding user-hidden ones. Use for UI/projector."""
+        return [tr.obj for tr in self._tracks.values() if not tr.obj.hidden]
 
     def refresh_track(
         self,
@@ -375,4 +423,6 @@ class ObjectTracker:
             label_score=0.0,  # no DINO confidence yet
         )
         self._tracks[new_id] = _Track(obj=obj, age_frames=1, misses=0)
+        if new_id in self._hidden_ids:
+            obj.hidden = True
         return new_id

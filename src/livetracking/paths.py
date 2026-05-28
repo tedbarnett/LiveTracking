@@ -48,6 +48,7 @@ MEASURED_FOOTPRINT_FILE: str = os.path.join(CALIB_DIR, "footprint_measured.png")
 
 # Object naming persistence
 OBJECT_NAMES_FILE: str = os.path.join(RUNTIME_DIR, "object_names.json")
+HIDDEN_OBJECTS_FILE: str = os.path.join(RUNTIME_DIR, "object_hidden.json")
 
 
 def _env_int(name: str, default: int) -> int:
