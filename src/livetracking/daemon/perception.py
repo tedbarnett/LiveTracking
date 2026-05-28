@@ -21,6 +21,7 @@ Holds the D455 exclusively for the lifetime of the process. NSSM-install as
 from __future__ import annotations
 
 import json
+import os
 import signal
 import sys
 import threading
@@ -104,8 +105,22 @@ class PerceptionDaemon:
         PW, PH = int(meta["proj_w"]), int(meta["proj_h"])
         self.cap = RealSenseCapture()
         cw, ch = self.cap.size()
+        # Per-object parallax compensation knobs (env overrides for live tuning
+        # without code edits).
+        cfg = PipelineConfig(proj_w=PW, proj_h=PH)
+        env_compensate = os.environ.get("LIVETRACKING_PARALLAX_COMPENSATE")
+        if env_compensate is not None:
+            cfg.parallax_compensate = env_compensate.lower() not in ("0", "false", "no", "off")
+        env_sign = os.environ.get("LIVETRACKING_PARALLAX_SIGN")
+        if env_sign:
+            cfg.parallax_sign = float(env_sign)
+        env_scale = os.environ.get("LIVETRACKING_PARALLAX_SCALE")
+        if env_scale:
+            cfg.parallax_scale = float(env_scale)
+        print(f"[perception] parallax: compensate={cfg.parallax_compensate} "
+              f"sign={cfg.parallax_sign} scale={cfg.parallax_scale}")
         self.pipeline = Pipeline(
-            H, cw, ch, PipelineConfig(proj_w=PW, proj_h=PH)
+            H, cw, ch, cfg
         )
         self.fp_corners = footprint_outline_in_camera(H, PW, PH, cw, ch)
 
@@ -127,6 +142,9 @@ class PerceptionDaemon:
         self.running = True
         self.paused = False
         self._pinned_id: Optional[int] = None
+        # When > current time, suppress perception's own projector messages
+        # so a `test_point` highlight from /test_light stays on screen.
+        self._test_hold_until: float = 0.0
         self.frame_idx = 0
         signal.signal(signal.SIGINT, self._stop)
         signal.signal(signal.SIGTERM, self._stop)
@@ -224,6 +242,51 @@ class PerceptionDaemon:
             return {"ok": True}
         if cmd == "unpin":
             self._pinned_id = None
+            self.proj_push.send_json({"type": "clear"})
+            return {"ok": True}
+        if cmd == "test_point":
+            # Project a fixed-size white square at the projector coordinates
+            # obtained by warping (cam_x, cam_y) through H. Used by the
+            # calibration QA probe.
+            try:
+                cx_c = float(msg["cam_x"])
+                cy_c = float(msg["cam_y"])
+                size_px = int(msg.get("size_px", 300))
+                hold_s = float(msg.get("hold_s", 2.0))
+            except Exception:
+                return {"ok": False, "reason": "bad test_point payload"}
+            import cv2 as _cv2
+            pt = np.array([[[cx_c, cy_c]]], dtype=np.float32)
+            pp = _cv2.perspectiveTransform(pt, self.pipeline.H).reshape(2)
+            px, py = float(pp[0]), float(pp[1])
+            PW = self.pipeline.cfg.proj_w
+            PH = self.pipeline.cfg.proj_h
+            mask = np.zeros((PH, PW), dtype=np.uint8)
+            x0 = max(0, int(round(px - size_px / 2)))
+            y0 = max(0, int(round(py - size_px / 2)))
+            x1 = min(PW, x0 + size_px)
+            y1 = min(PH, y0 + size_px)
+            mask[y0:y1, x0:x1] = 255
+            mask_path = os.path.join(RUNTIME_DIR, "masks", "test_point.png")
+            os.makedirs(os.path.dirname(mask_path), exist_ok=True)
+            _cv2.imwrite(mask_path, mask)
+            self.proj_push.send_json({
+                "type": "highlight",
+                "id": 99,
+                "color": [255, 255, 255],
+                "mask_path": mask_path,
+                "proj_centroid": [px, py],
+            })
+            # Hold-lock: suppress perception's own projector messages for
+            # hold_s seconds.
+            self._test_hold_until = time.time() + hold_s
+            return {
+                "ok": True,
+                "proj_xy": [px, py],
+                "in_frame": (0 <= px < PW and 0 <= py < PH),
+            }
+        if cmd == "test_clear":
+            self._test_hold_until = 0.0
             self.proj_push.send_json({"type": "clear"})
             return {"ok": True}
         if cmd == "intensity":

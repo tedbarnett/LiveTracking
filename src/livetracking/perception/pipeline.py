@@ -57,6 +57,18 @@ class PipelineConfig:
     min_obj_area_px: int = 800
     require_geometric_overlap: bool = True   # require some Stage-1 overlap
     geometric_overlap_min: float = 0.15
+    # Per-object parallax compensation. The wall-plane homography aims at the
+    # wall behind every object; for objects sitting in front of the wall we
+    # shift their camera-space mask before warping so the projector hits the
+    # object itself, not its shadow on the wall. Disable when the projector
+    # and camera are coaxial (so parallax is ~zero) or for debugging. The
+    # `parallax_sign` multiplier controls direction: +1 pushes the mask away
+    # from the camera image center, -1 pulls it toward center. Set to -1 if
+    # the projector ends up consistently off-target on the opposite side from
+    # where you'd expect.
+    parallax_compensate: bool = True
+    parallax_sign: float = 1.0
+    parallax_scale: float = 1.0     # extra multiplier on the geometric scale
     iou_match_threshold: float = 0.25
     # 60s of DINO silence before we retire a track. With async DINO running
     # every ~2s, this gives a track ~30 chances to be re-seen. Combined with
@@ -92,6 +104,19 @@ class PipelineConfig:
     # loop always runs the FAST path. The heavy thread refreshes the tracker
     # whenever it finishes. Set False to use sync FAST/FULL alternation.
     async_recognize: bool = True
+    # Auto-segment-inside-blob: when True, every Stage-1 mega-blob is split
+    # by running SAM2 on a grid of points inside its bbox, then each
+    # sub-mask becomes its own FreshDetection (DINO labels via bbox-IoU
+    # against the whole-image DINO pass). This is the fix for "couch +
+    # bodhran + guitar + pillow fuse into one 'Pillow' object" — Stage-1
+    # cannot separate co-planar objects sitting on the same furniture, but
+    # SAM2 distinguishes them by color/texture cues.
+    auto_segment_blobs: bool = True
+    auto_seg_grid_n: int = 4              # 4x4 grid of point prompts per blob
+    auto_seg_min_blob_px: int = 8000      # only split mega-blobs above this area
+    auto_seg_score_thresh: float = 0.55   # SAM IoU score cutoff for sub-masks
+    auto_seg_dedupe_iou: float = 0.55     # NMS IoU between sub-masks
+    auto_seg_max_area_frac: float = 0.85  # drop sub-masks that cover most of parent
 
 
 class Pipeline:
@@ -186,16 +211,20 @@ class Pipeline:
 
         ys_m, xs_m = np.where(cam_mask > 0)
         cam_mask_for_warp = cam_mask
-        if med_z > 0.1 and ys_m.size:
+        if (self.cfg.parallax_compensate
+                and med_z > 0.1 and ys_m.size):
             cx_m = float(xs_m.mean()); cy_m = float(ys_m.mean())
             u = (cx_m - cx) / fx
             v = (cy_m - cy) / fy
             denom = a * u + b * v + c
             z_wall = (-d_plane / denom) if abs(denom) > 1e-6 else 0.0
             if z_wall > 0.1:
-                scale = (z_wall - med_z) / z_wall
-                shift_x = (cx_m - cx) * scale
-                shift_y = (cy_m - cy) * scale
+                base_scale = (z_wall - med_z) / z_wall
+                eff_scale = (
+                    self.cfg.parallax_sign * self.cfg.parallax_scale * base_scale
+                )
+                shift_x = (cx_m - cx) * eff_scale
+                shift_y = (cy_m - cy) * eff_scale
                 if abs(shift_x) > 0.5 or abs(shift_y) > 0.5:
                     M = np.array([[1.0, 0.0, shift_x],
                                   [0.0, 1.0, shift_y]], dtype=np.float32)
@@ -456,6 +485,17 @@ class Pipeline:
         """Heavy DINO + SAM + parallax → list of FreshDetection. No tracker.
 
         Used by step() (sync) and the async recognize thread.
+
+        When cfg.auto_segment_blobs is on (the default), each Stage-1 blob
+        bigger than auto_seg_min_blob_px is split into per-object sub-masks
+        via SAM2-on-a-grid. Sub-masks become the candidate object set;
+        Stage-1 blobs below the size threshold pass through unchanged. The
+        whole-image DINO pass still runs once for labeling; each candidate
+        mask gets its label by best bbox-IoU against DINO's boxes.
+
+        Without auto-segment (cfg.auto_segment_blobs = False) the old
+        DINO-driven path runs: filter DINO boxes inside the footprint, SAM
+        each box centroid, that's the candidate set.
         """
         t0 = time.perf_counter()
         blobs, dbg = detect_blobs(
@@ -478,18 +518,56 @@ class Pipeline:
         dino_filt = self._dedupe_dino(dino_filt)
         t_dino = time.perf_counter()
 
-        if dino_filt:
-            prompts = [(d["bbox"][0] + d["bbox"][2] / 2,
-                        d["bbox"][1] + d["bbox"][3] / 2) for d in dino_filt]
-            sam_results = self.recognizer.segment_with_points(color, prompts)
+        # ---- candidate mask set ------------------------------------------
+        # `candidates`: list of (cam_mask uint8, sam_score float, source tag).
+        candidates: List[Tuple[np.ndarray, float, str]] = []
+
+        if self.cfg.auto_segment_blobs:
+            n_splits_total = 0
+            for blob in blobs:
+                area = int((blob.cam_mask > 0).sum())
+                if area < self.cfg.auto_seg_min_blob_px:
+                    # Small Stage-1 blob: trust it as-is, no SAM split.
+                    candidates.append((blob.cam_mask.copy(), 1.0, "stage1"))
+                    continue
+                # Big mega-blob: SAM-split it.
+                bx, by, bw, bh = blob.bbox_cam
+                subs = self.recognizer.auto_segment_in_bbox(
+                    color, (bx, by, bw, bh),
+                    parent_mask=blob.cam_mask,
+                    grid_n=self.cfg.auto_seg_grid_n,
+                    score_thresh=self.cfg.auto_seg_score_thresh,
+                    dedupe_iou=self.cfg.auto_seg_dedupe_iou,
+                    max_area_frac=self.cfg.auto_seg_max_area_frac,
+                )
+                n_splits_total += len(subs)
+                if not subs:
+                    # SAM gave us nothing useful — fall back to whole blob.
+                    candidates.append((blob.cam_mask.copy(), 1.0, "stage1-fallback"))
+                    continue
+                for sub_mask, sub_score in subs:
+                    candidates.append((sub_mask, sub_score, "sam-split"))
+            sam_subs = n_splits_total
         else:
-            sam_results = []
+            # Old path: DINO-driven point prompts for SAM.
+            if dino_filt:
+                prompts = [(d["bbox"][0] + d["bbox"][2] / 2,
+                            d["bbox"][1] + d["bbox"][3] / 2) for d in dino_filt]
+                sam_results = self.recognizer.segment_with_points(color, prompts)
+            else:
+                sam_results = []
+            for det, (sam_mask, sam_score) in zip(dino_filt, sam_results):
+                # Pre-attach DINO label by ordering: det[i] paired with sam_results[i].
+                # We re-do labeling uniformly below, so just record the mask here.
+                candidates.append((sam_mask, sam_score, "dino-sam"))
+            sam_subs = 0
         t_sam = time.perf_counter()
 
+        # ---- label + parallax warp ---------------------------------------
         plane = dbg.get("plane", [0, 0, -1, 3.0])
         fresh: List[FreshDetection] = []
-        for det, (sam_mask, sam_score) in zip(dino_filt, sam_results):
-            cam_mask = cv2.bitwise_and(sam_mask, self.footprint * 255)
+        for cand_mask, sam_score, src in candidates:
+            cam_mask = cv2.bitwise_and(cand_mask, self.footprint * 255)
             area = int((cam_mask > 0).sum())
             if area < self.cfg.min_obj_area_px:
                 continue
@@ -497,13 +575,62 @@ class Pipeline:
                 overlap = int(np.logical_and(cam_mask > 0, geom_union > 0).sum())
                 if overlap / max(1, area) < self.cfg.geometric_overlap_min:
                     continue
+            # Label via DINO. For each SAM sub-mask, prefer DINO boxes whose
+            # CENTERS lie inside the mask AND whose area is comparable to or
+            # smaller than the mask's. This beats raw bbox-IoU because the
+            # SAM sub-masks of a couch can each IoU-well with DINO's
+            # whole-couch box and inherit "sofa couch", drowning out the
+            # smaller "guitar" / "drum" / "pillow" DINO labels.
+            ys, xs = np.where(cam_mask > 0)
+            if ys.size:
+                bx = int(xs.min()); by = int(ys.min())
+                bw = int(xs.max() - bx + 1); bh = int(ys.max() - by + 1)
+            else:
+                bx = by = bw = bh = 0
+            mask_area = max(1, bw * bh)
+            best_label = "object"
+            best_label_score = 0.0
+            for det in dino_filt:
+                dx, dy, dw, dh = det["bbox"]
+                d_cx = dx + dw / 2.0
+                d_cy = dy + dh / 2.0
+                d_area = max(1, dw * dh)
+                # Inside-mask test (center pixel of DINO box must be in our mask).
+                cx_i = int(round(d_cx)); cy_i = int(round(d_cy))
+                inside_mask = (
+                    0 <= cx_i < self.cam_w
+                    and 0 <= cy_i < self.cam_h
+                    and cam_mask[cy_i, cx_i] > 0
+                )
+                # bbox IoU as fallback signal.
+                ix0 = max(bx, dx); iy0 = max(by, dy)
+                ix1 = min(bx + bw, dx + dw); iy1 = min(by + bh, dy + dh)
+                iw = max(0, ix1 - ix0); ih = max(0, iy1 - iy0)
+                inter = iw * ih
+                union = bw * bh + dw * dh - inter
+                iou = inter / union if union > 0 else 0.0
+                # Containment: fraction of DINO box inside the sub-mask bbox.
+                contain = inter / d_area
+                # Prefer "DINO box is mostly inside this mask, and is no bigger
+                # than the mask itself" (a smaller-or-equal labeled box living
+                # inside this segment is a much stronger labeling signal than
+                # raw IoU). Inside-mask gets a big bonus.
+                size_ratio = min(1.0, mask_area / d_area)
+                score = det["score"] * (
+                    (1.5 if inside_mask else 0.0)
+                    + 1.0 * contain * size_ratio
+                    + 0.25 * iou
+                )
+                if score > best_label_score:
+                    best_label_score = score
+                    best_label = det["label"] or "object"
             proj_mask, proj_centroid, med_z = self._warp_with_parallax(
                 cam_mask, depth_m, plane
             )
             fresh.append(FreshDetection(
                 cam_mask=cam_mask,
-                label=det["label"],
-                label_score=float(det["score"] * sam_score),
+                label=best_label,
+                label_score=float(best_label_score * sam_score),
                 median_depth_m=med_z,
                 proj_mask=proj_mask,
                 proj_centroid=proj_centroid,
@@ -514,5 +641,7 @@ class Pipeline:
             "sam_ms": (t_sam - t_dino) * 1000,
             "n_dino_raw": len(dino_all),
             "n_dino_kept": len(dino_filt),
+            "n_sam_subs": sam_subs,
+            "n_fresh": len(fresh),
         }
         return fresh, timings
