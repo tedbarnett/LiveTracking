@@ -38,7 +38,12 @@ class GeometryParams:
     foreground_offset_m: float = 0.05    # pixel must be 5 cm closer than wall
     min_blob_area_px: int = 1500
     morph_open: int = 5
-    morph_close: int = 25
+    # Morph close kernel. KEEP SMALL (≤ ~9 px). The previous 25 px kernel
+    # welded the bodhran + guitar + pillow + couch back into a single mega-
+    # blob that DINO could only label once ("Pillow"). With 9 px we still
+    # smooth over per-pixel noise + thin depth gaps but distinct objects on
+    # the same plane stay separable.
+    morph_close: int = 9
     footprint_inside_frac: float = 0.7   # blob must be ≥ this fraction inside footprint
 
 

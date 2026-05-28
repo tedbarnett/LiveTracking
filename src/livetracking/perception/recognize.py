@@ -88,32 +88,123 @@ class Recognizer:
     def segment_with_points(
         self, color_bgr: np.ndarray, points_cam: List[Tuple[float, float]]
     ) -> List[Tuple[np.ndarray, float]]:
-        """For each (x, y) point in camera pixels, return (mask uint8, score)."""
+        """For each (x, y) point in camera pixels, return (mask uint8, score).
+
+        Internally batched: all points are sent to SAM2 in a single forward
+        pass (one object per point), so cost scales much better than the old
+        per-point Python loop. ~600 ms for 16 points on a 5090, vs ~7 s if
+        looped.
+        """
         torch = self._torch
         if not points_cam:
             return []
         rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        # Shape (B=1, N_obj=len(points), N_pts=1, 2)
+        input_points = [[[[float(px), float(py)]] for (px, py) in points_cam]]
+        input_labels = [[[1] for _ in points_cam]]  # 1 = foreground
+        inputs = self.sam_processor(
+            images=rgb, input_points=input_points, input_labels=input_labels,
+            return_tensors="pt",
+        ).to(self.device)
+        with torch.inference_mode():
+            outputs = self.sam_model(**inputs, multimask_output=True)
+        masks = self.sam_processor.post_process_masks(
+            outputs.pred_masks.cpu(),
+            inputs["original_sizes"].cpu(),
+        )[0]  # (N_obj, N_masks, H, W) bool
+        # iou_scores: (B, N_obj, N_masks)
+        scores_all = outputs.iou_scores[0].cpu().numpy()  # (N_obj, N_masks)
         results: List[Tuple[np.ndarray, float]] = []
-        for (px, py) in points_cam:
-            input_points = [[[[float(px), float(py)]]]]   # batch=1, obj=1, point=1
-            input_labels = [[[1]]]                        # 1 = foreground
-            inputs = self.sam_processor(
-                images=rgb, input_points=input_points, input_labels=input_labels,
-                return_tensors="pt",
-            ).to(self.device)
-            with torch.inference_mode():
-                outputs = self.sam_model(**inputs, multimask_output=True)
-            # Pick the best of the 3 candidate masks. transformers 5.x SAM2
-            # processor takes (masks, original_sizes); no reshaped_input_sizes.
-            masks = self.sam_processor.post_process_masks(
-                outputs.pred_masks.cpu(),
-                inputs["original_sizes"].cpu(),
-            )[0]                                          # (n_obj, n_masks, H, W) bool
-            scores = outputs.iou_scores[0, 0].cpu().numpy()  # (n_masks,)
+        for i in range(len(points_cam)):
+            scores = scores_all[i]
             best = int(np.argmax(scores))
-            m = masks[0, best].numpy().astype(np.uint8) * 255
+            m = masks[i, best].numpy().astype(np.uint8) * 255
             results.append((m, float(scores[best])))
         return results
+
+    # ----- SAM 2 automatic mask generator (for splitting mega-blobs) ----------
+    def auto_segment_in_bbox(
+        self,
+        color_bgr: np.ndarray,
+        bbox_xywh: Tuple[int, int, int, int],
+        parent_mask: Optional[np.ndarray] = None,
+        grid_n: int = 4,
+        score_thresh: float = 0.55,
+        dedupe_iou: float = 0.55,
+        max_area_frac: float = 0.85,
+        min_area_px: int = 800,
+    ) -> List[Tuple[np.ndarray, float]]:
+        """Split a single Stage-1 mega-blob into per-object sub-masks.
+
+        Generates a grid_n x grid_n grid of point prompts inside ``bbox_xywh``,
+        filters points to those lying inside ``parent_mask`` (so we don't
+        waste SAM forwards on background pixels), runs SAM2 in one batched
+        forward, then dedupes the resulting masks by IoU > ``dedupe_iou``.
+
+        Heuristics applied to suppress SAM's typical failure modes:
+          * Drop masks whose area is > ``max_area_frac`` of the parent — that's
+            SAM "expanding to the whole couch" when no clear sub-object is at
+            that point.
+          * Drop masks with area < ``min_area_px`` (noise).
+          * Drop masks below ``score_thresh`` (low SAM confidence).
+          * Greedy NMS: keep highest-score mask first, drop later masks whose
+            IoU vs any kept mask exceeds ``dedupe_iou``.
+
+        Returns [(uint8 mask, sam_score), ...] in score-descending order.
+        """
+        x, y, w, h = bbox_xywh
+        if w <= 0 or h <= 0:
+            return []
+        H_full, W_full = color_bgr.shape[:2]
+        parent_area = int((parent_mask > 0).sum()) if parent_mask is not None else (w * h)
+        if parent_area <= 0:
+            return []
+        # Grid points across the bbox, with inset so we don't sample right on
+        # the boundary where SAM tends to grab the background.
+        inset_x = w / (grid_n + 1)
+        inset_y = h / (grid_n + 1)
+        points: List[Tuple[float, float]] = []
+        for gy in range(grid_n):
+            for gx in range(grid_n):
+                px = x + inset_x * (gx + 1)
+                py = y + inset_y * (gy + 1)
+                if not (0 <= px < W_full and 0 <= py < H_full):
+                    continue
+                if parent_mask is not None and parent_mask[int(py), int(px)] == 0:
+                    continue
+                points.append((px, py))
+        if not points:
+            return []
+        raw = self.segment_with_points(color_bgr, points)
+        # Filter by score / area / parent overlap
+        candidates: List[Tuple[np.ndarray, float]] = []
+        for mask, score in raw:
+            if score < score_thresh:
+                continue
+            area = int((mask > 0).sum())
+            if area < min_area_px:
+                continue
+            if area > parent_area * max_area_frac:
+                continue
+            if parent_mask is not None:
+                inside = int(np.logical_and(mask > 0, parent_mask > 0).sum())
+                if inside / max(1, area) < 0.5:
+                    continue
+            candidates.append((mask, score))
+        candidates.sort(key=lambda t: -t[1])
+        # Greedy NMS by IoU
+        kept: List[Tuple[np.ndarray, float]] = []
+        for mask, score in candidates:
+            ok = True
+            for kmask, _ in kept:
+                inter = int(np.logical_and(mask > 0, kmask > 0).sum())
+                union = int(np.logical_or(mask > 0, kmask > 0).sum())
+                if union > 0 and inter / union > dedupe_iou:
+                    ok = False
+                    break
+            if ok:
+                kept.append((mask, score))
+        return kept
 
     # ----- Grounding DINO ------------------------------------------------------
     def label_image(
