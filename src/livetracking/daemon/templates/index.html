@@ -50,6 +50,8 @@
     <button id="btnPause" class="primary">⏸ Pause</button>
     <button id="btnAll">Highlight all</button>
     <button id="btnClear">Clear</button>
+    <button id="btnWhite">☀ White Light</button>
+    <button id="btnRecalibrate" title="Stop perception, project dot grid, re-solve homography, restart.">⟳ Re-calibrate</button>
     <button id="btnUnhide" style="display:none;">Unhide all</button>
   </div>
   <div class="meta"><span id="frameTimings">…</span></div>
@@ -85,6 +87,8 @@ const pausedOverlay = document.getElementById('paused-overlay');
 const btnPause = document.getElementById('btnPause');
 const btnAll = document.getElementById('btnAll');
 const btnClear = document.getElementById('btnClear');
+const btnWhite = document.getElementById('btnWhite');
+const btnRecalibrate = document.getElementById('btnRecalibrate');
 const btnUnhide = document.getElementById('btnUnhide');
 const intensitySlider = document.getElementById('intensitySlider');
 const intensityVal = document.getElementById('intensityVal');
@@ -113,6 +117,60 @@ btnAll.addEventListener('click', () => {
 });
 btnClear.addEventListener('click', () => {
   fetch('/clear', { method: 'POST' });
+});
+
+let whiteOn = false;
+btnWhite.addEventListener('click', async () => {
+  whiteOn = !whiteOn;
+  await fetch('/white_light', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value: whiteOn })
+  });
+  btnWhite.classList.toggle('primary', whiteOn);
+  btnWhite.textContent = whiteOn ? '☀ White Light (on)' : '☀ White Light';
+});
+
+// ---- Re-calibrate --------------------------------------------------------
+let calibPollTimer = null;
+function setRecalLabel(text, busy) {
+  btnRecalibrate.textContent = text;
+  btnRecalibrate.disabled = !!busy;
+  btnRecalibrate.classList.toggle('warn', !!busy);
+}
+async function pollCalibStatus() {
+  try {
+    const r = await fetch('/calibrate_status');
+    const j = await r.json();
+    const s = j.status;
+    if (!s) return;
+    if (s.phase === 'done') {
+      clearInterval(calibPollTimer);
+      calibPollTimer = null;
+      const ok = s.ok === true;
+      setRecalLabel(ok ? '⟳ Re-calibrate (done ✓)' : '⟳ Re-calibrate (failed)', false);
+      if (!ok) alert('Calibration failed: ' + (s.detail || 'unknown'));
+      setTimeout(() => setRecalLabel('⟳ Re-calibrate', false), 4000);
+    } else {
+      setRecalLabel('⟳ ' + s.phase.replaceAll('_', ' ') + '…', true);
+    }
+  } catch (e) {
+    // ignore transient
+  }
+}
+btnRecalibrate.addEventListener('click', async () => {
+  if (!confirm('Re-calibrate? The projector + camera will be unavailable for ~30 seconds.')) return;
+  setRecalLabel('⟳ starting…', true);
+  const r = await fetch('/recalibrate', { method: 'POST' });
+  const j = await r.json();
+  if (!j.ok) {
+    alert('Could not start calibration: ' + (j.reason || 'unknown'));
+    setRecalLabel('⟳ Re-calibrate', false);
+    return;
+  }
+  if (calibPollTimer) clearInterval(calibPollTimer);
+  calibPollTimer = setInterval(pollCalibStatus, 800);
+  pollCalibStatus();
 });
 
 intensitySlider.addEventListener('input', () => {

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import subprocess
 import threading
 import time
 from typing import Optional
@@ -23,7 +24,7 @@ from typing import Optional
 import zmq
 from flask import Flask, Response, jsonify, render_template, request
 
-from livetracking.paths import WEB_UI_PORT, ZMQ_OBJECTS_PUB
+from livetracking.paths import RUNTIME_DIR, WEB_UI_PORT, ZMQ_OBJECTS_PUB
 
 
 CTRL_ENDPOINT = "tcp://127.0.0.1:5573"
@@ -232,6 +233,49 @@ def create_app() -> Flask:
     def intensity():
         data = request.get_json(silent=True) or {}
         return jsonify(_send_ctrl({"cmd": "intensity", "value": float(data.get("value", 0.78))}))
+
+    @app.route("/white_light", methods=["POST"])
+    def white_light():
+        data = request.get_json(silent=True) or {}
+        return jsonify(_send_ctrl({"cmd": "white_light", "value": bool(data.get("value", False))}))
+
+    # ---- re-calibrate --------------------------------------------------
+    # Calibration must run in the user's desktop session (it grabs display
+    # 1 + the RealSense). Flask runs as LocalSystem in Session 0, so we
+    # trigger a pre-registered scheduled task (LiveTrackingCalibrate) and
+    # let it orchestrate stop -> calibrate -> restart of the other tasks.
+    CALIB_STATUS_FILE = os.path.join(RUNTIME_DIR, "calibration_status.json")
+
+    @app.route("/recalibrate", methods=["POST"])
+    def recalibrate():
+        try:
+            # Reset status so the UI sees fresh state immediately.
+            os.makedirs(os.path.dirname(CALIB_STATUS_FILE), exist_ok=True)
+            with open(CALIB_STATUS_FILE, "w") as f:
+                json.dump({"phase": "starting", "ok": None,
+                           "detail": "", "t": time.time()}, f)
+            r = subprocess.run(
+                ["schtasks", "/run", "/tn", "LiveTrackingCalibrate"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0:
+                return jsonify({
+                    "ok": False,
+                    "reason": (r.stdout + r.stderr).strip()[-400:],
+                })
+            return jsonify({"ok": True, "started": True})
+        except Exception as e:
+            return jsonify({"ok": False, "reason": repr(e)})
+
+    @app.route("/calibrate_status")
+    def calibrate_status():
+        try:
+            with open(CALIB_STATUS_FILE) as f:
+                return jsonify({"ok": True, "status": json.load(f)})
+        except FileNotFoundError:
+            return jsonify({"ok": True, "status": None})
+        except Exception as e:
+            return jsonify({"ok": False, "reason": repr(e)})
 
     @app.route("/hide", methods=["POST"])
     def hide():
