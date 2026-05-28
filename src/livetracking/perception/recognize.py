@@ -25,7 +25,8 @@ from .types import Blob
 
 
 DEFAULT_DINO_PROMPT = (
-    "guitar. acoustic guitar. electric guitar. drum. drum head. snare drum. "
+    "guitar. acoustic guitar. electric guitar. bass guitar. ukulele. "
+    "drum. drum head. snare drum. bodhran. frame drum. hand drum. djembe. "
     "tambourine. cymbal. piano. keyboard. microphone. cushion. throw pillow. "
     "sofa. couch. armchair. chair. ottoman. picture frame. painting. map. "
     "poster. mirror. lamp. plant. book. mug. cup. bottle. can. plate. bowl. "
