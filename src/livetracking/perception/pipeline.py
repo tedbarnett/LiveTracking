@@ -37,6 +37,13 @@ from .tracker import FreshDetection, ObjectTracker
 from .types import DetectedObject
 
 
+def _bbox_contains(bbox, pt) -> bool:
+    """True iff (x,y) lies within (x,y,w,h)."""
+    x, y, w, h = bbox
+    px, py = pt
+    return x <= px <= x + w and y <= py <= y + h
+
+
 @dataclass
 class PipelineConfig:
     intrinsics: Tuple[float, float, float, float] = (615.0, 615.0, 424.0, 240.0)
@@ -51,7 +58,12 @@ class PipelineConfig:
     require_geometric_overlap: bool = True   # require some Stage-1 overlap
     geometric_overlap_min: float = 0.15
     iou_match_threshold: float = 0.25
-    stale_after_s: float = 5.0
+    # 30s of DINO silence before we retire a track. With async DINO running
+    # every ~2s, this gives a track 15 chances to be re-seen. Combined with
+    # fast_step keeping `last_seen_t` fresh (it calls refresh_track every fast
+    # frame for matched tracks), retirement now only fires when an object
+    # genuinely leaves the scene.
+    stale_after_s: float = 30.0
     # Heavy DINO+SAM runs every N frames. The N-1 frames between use Stage-1
     # blobs to refresh each tracked object's cam_mask, parallax and proj_mask
     # in-place. 1 = full pass every frame (old behaviour, ~1-2 fps).
@@ -63,6 +75,14 @@ class PipelineConfig:
     # its last known state (likely momentarily occluded).
     fast_iou_min: float = 0.10
     fast_centroid_max_px: int = 80
+    # Stage-1-driven provisional promotion (Option B fix for "objects keep
+    # appearing/disappearing"). Any unmatched Stage-1 blob inside the footprint
+    # that persists across this many consecutive fast_step frames gets promoted
+    # to a real track with a placeholder name. The async recognizer attaches a
+    # real label later. At ~10 Hz fast frames, 8 → ~0.8s appearance latency.
+    provisional_promote_frames: int = 8
+    provisional_match_dist_px: float = 60.0
+    provisional_min_blob_area_px: int = 1200
     # Async mode: when True, DINO+SAM run in a background thread and the main
     # loop always runs the FAST path. The heavy thread refreshes the tracker
     # whenever it finishes. Set False to use sync FAST/FULL alternation.
@@ -107,6 +127,10 @@ class Pipeline:
         self._async_running = False
         self.tracker_lock = threading.Lock()
         self.last_async_timings_ms: dict = {}
+        # Provisional blob history for Stage-1-driven track promotion.
+        # Each entry: {"centroid": (x,y), "last_seen_frame": int, "hits": int,
+        #              "last_cam_mask": ndarray, "last_depth": float}
+        self._provisional_blobs: List[dict] = []
 
     def _dedupe_dino(self, dets: List[dict]) -> List[dict]:
         """Drop DINO bboxes that are mostly redundant with a higher-scoring one."""
@@ -307,11 +331,82 @@ class Pipeline:
             )
             refresh_calls.append((obj.object_id, new_cam_mask, proj_mask, proj_centroid, med_z))
 
+        # ---- Provisional promotion (Stage-1-driven, no DINO required) -----
+        # For each blob NOT bound to an existing track, see if it's also
+        # outside every track's bbox. If so, treat it as a candidate provisional.
+        # Match across fast frames by centroid distance; promote after N hits.
+        new_promotions: List[dict] = []
+        with self.tracker_lock:
+            active_objs = list(self.tracker.active())
+        for i, b in enumerate(blobs):
+            if i in used_blob_idx:
+                continue
+            ys, xs = np.where(b.cam_mask > 0)
+            if not ys.size:
+                continue
+            area = int((b.cam_mask > 0).sum())
+            if area < self.cfg.provisional_min_blob_area_px:
+                continue
+            bcx, bcy = float(xs.mean()), float(ys.mean())
+            # Skip if this blob overlaps any active track meaningfully
+            # (avoids creating a duplicate provisional for a partially-occluded
+            # tracked object that fast_step couldn't match this frame).
+            already_tracked = False
+            for o in active_objs:
+                if _bbox_contains(o.bbox_cam, (bcx, bcy)):
+                    already_tracked = True
+                    break
+                ti = int(np.logical_and(b.cam_mask > 0, o.cam_mask > 0).sum())
+                if ti / max(1, area) > 0.3:
+                    already_tracked = True
+                    break
+            if already_tracked:
+                continue
+            # Match against existing provisional history by centroid distance
+            best_p, best_dist = -1, float("inf")
+            for pi, p in enumerate(self._provisional_blobs):
+                pcx, pcy = p["centroid"]
+                d = ((bcx - pcx) ** 2 + (bcy - pcy) ** 2) ** 0.5
+                if d < best_dist:
+                    best_dist, best_p = d, pi
+            if best_p >= 0 and best_dist < self.cfg.provisional_match_dist_px:
+                p = self._provisional_blobs[best_p]
+                p["centroid"] = (bcx, bcy)
+                p["last_seen_frame"] = self._frame_idx
+                p["hits"] += 1
+                p["last_cam_mask"] = b.cam_mask
+                if p["hits"] >= self.cfg.provisional_promote_frames:
+                    new_promotions.append(p)
+                    self._provisional_blobs.pop(best_p)
+            else:
+                self._provisional_blobs.append({
+                    "centroid": (bcx, bcy),
+                    "last_seen_frame": self._frame_idx,
+                    "hits": 1,
+                    "last_cam_mask": b.cam_mask,
+                })
+        # Reap provisionals not seen in the last 5 fast frames.
+        self._provisional_blobs = [
+            p for p in self._provisional_blobs
+            if self._frame_idx - p["last_seen_frame"] <= 5
+        ]
+
         with self.tracker_lock:
             for oid, cm, pm, pc, mz in refresh_calls:
                 self.tracker.refresh_track(
                     oid, cam_mask=cm, proj_mask=pm,
                     proj_centroid=pc, median_depth_m=mz,
+                )
+            for p in new_promotions:
+                cam_mask = cv2.bitwise_and(p["last_cam_mask"], self.footprint * 255)
+                proj_mask, proj_centroid, med_z = self._warp_with_parallax(
+                    cam_mask, depth_m, plane
+                )
+                self.tracker.promote_provisional(
+                    cam_mask=cam_mask,
+                    proj_mask=proj_mask,
+                    proj_centroid=proj_centroid,
+                    median_depth_m=med_z,
                 )
             objects = self.tracker.active()
         t_end = time.perf_counter()
