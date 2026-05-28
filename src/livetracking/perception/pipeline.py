@@ -23,6 +23,7 @@ false positives.
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -51,6 +52,21 @@ class PipelineConfig:
     geometric_overlap_min: float = 0.15
     iou_match_threshold: float = 0.25
     stale_after_s: float = 5.0
+    # Heavy DINO+SAM runs every N frames. The N-1 frames between use Stage-1
+    # blobs to refresh each tracked object's cam_mask, parallax and proj_mask
+    # in-place. 1 = full pass every frame (old behaviour, ~1-2 fps).
+    # 6 ≈ 5-7 fps end-to-end on the 5090 with 30 Hz Stage-1.
+    recognize_every_n: int = 6
+    # On fast frames, a Stage-1 blob is accepted as the same tracked object if
+    # IoU(prior cam_mask, blob mask) >= this. Below it, we fall back to nearest
+    # centroid (within fast_centroid_max_px), otherwise the object is left at
+    # its last known state (likely momentarily occluded).
+    fast_iou_min: float = 0.10
+    fast_centroid_max_px: int = 80
+    # Async mode: when True, DINO+SAM run in a background thread and the main
+    # loop always runs the FAST path. The heavy thread refreshes the tracker
+    # whenever it finishes. Set False to use sync FAST/FULL alternation.
+    async_recognize: bool = True
 
 
 class Pipeline:
@@ -79,6 +95,18 @@ class Pipeline:
         self._frame_idx = 0
         self._last_dino: List[dict] = []
         self.last_stage1_debug: dict = {}
+        # Async recognize machinery — only used when cfg.async_recognize=True.
+        # The main loop submits the most recent (color, depth_m) into a 1-slot
+        # box; the background thread pops it, runs DINO+SAM, calls
+        # tracker.update(...) under tracker_lock, and the result becomes
+        # visible to the next fast_step.
+        self._async_thread = None
+        self._async_box = None              # (color, depth_m) — newest only
+        self._async_lock = threading.Lock()
+        self._async_cv = threading.Condition(self._async_lock)
+        self._async_running = False
+        self.tracker_lock = threading.Lock()
+        self.last_async_timings_ms: dict = {}
 
     def _dedupe_dino(self, dets: List[dict]) -> List[dict]:
         """Drop DINO bboxes that are mostly redundant with a higher-scoring one."""
@@ -110,22 +138,227 @@ class Pipeline:
             return False
         return bool(self.footprint[cy, cx] > 0)
 
-    def step(self, color: np.ndarray, depth_m: np.ndarray) -> List[DetectedObject]:
+    def _warp_with_parallax(
+        self,
+        cam_mask: np.ndarray,
+        depth_m: np.ndarray,
+        plane,
+    ) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]], float]:
+        """Compute median depth + parallax-shifted proj_mask + proj_centroid.
+
+        Returns (proj_mask_or_None, proj_centroid_or_None, median_depth_m).
+        Used by both step() (full pass) and fast_step() (Stage-1-driven update).
+        """
+        fx, fy, cx, cy = self.cfg.intrinsics
+        a, b, c, d_plane = plane
+
+        z_pix = depth_m[(cam_mask > 0) & (depth_m > 0)]
+        med_z = float(np.median(z_pix)) if z_pix.size else 0.0
+
+        ys_m, xs_m = np.where(cam_mask > 0)
+        cam_mask_for_warp = cam_mask
+        if med_z > 0.1 and ys_m.size:
+            cx_m = float(xs_m.mean()); cy_m = float(ys_m.mean())
+            u = (cx_m - cx) / fx
+            v = (cy_m - cy) / fy
+            denom = a * u + b * v + c
+            z_wall = (-d_plane / denom) if abs(denom) > 1e-6 else 0.0
+            if z_wall > 0.1:
+                scale = (z_wall - med_z) / z_wall
+                shift_x = (cx_m - cx) * scale
+                shift_y = (cy_m - cy) * scale
+                if abs(shift_x) > 0.5 or abs(shift_y) > 0.5:
+                    M = np.array([[1.0, 0.0, shift_x],
+                                  [0.0, 1.0, shift_y]], dtype=np.float32)
+                    cam_mask_for_warp = cv2.warpAffine(
+                        cam_mask, M, (self.cam_w, self.cam_h),
+                        flags=cv2.INTER_NEAREST, borderValue=0,
+                    )
+
+        proj_mask = cv2.warpPerspective(
+            cam_mask_for_warp, self.H, (self.cfg.proj_w, self.cfg.proj_h),
+            flags=cv2.INTER_NEAREST,
+        )
+        if not proj_mask.any():
+            return None, None, med_z
+        py, px = np.where(proj_mask > 0)
+        return proj_mask, (float(px.mean()), float(py.mean())), med_z
+
+    def step_auto(self, color: np.ndarray, depth_m: np.ndarray) -> List[DetectedObject]:
+        """Pick the right path based on config.
+
+        async_recognize=True (default for the live daemon): always run fast_step;
+            the background recognize thread refreshes tracks/labels in parallel.
+            Submit the freshest frame to the recognize thread on the way through.
+        async_recognize=False: sync FAST/FULL alternation by recognize_every_n.
+        """
+        if self.cfg.async_recognize:
+            if not self._async_running:
+                self.start_async()
+            # Hand the freshest frame to the recognize thread (replaces any
+            # pending one — we always work on the latest).
+            with self._async_cv:
+                self._async_box = (color, depth_m)
+                self._async_cv.notify()
+            # If tracker has nothing yet, run a sync full pass so we boot.
+            if not self.tracker.active():
+                with self.tracker_lock:
+                    return self.step(color, depth_m)
+            return self.fast_step(color, depth_m)
+
+        if (self.cfg.recognize_every_n <= 1
+                or self._frame_idx % self.cfg.recognize_every_n == 0
+                or not self.tracker.active()):
+            return self.step(color, depth_m)
+        return self.fast_step(color, depth_m)
+
+    # ---- async recognize thread ----
+    def start_async(self) -> None:
+        if self._async_running:
+            return
+        self._async_running = True
+        self._async_thread = threading.Thread(
+            target=self._async_loop, name="recognize", daemon=True
+        )
+        self._async_thread.start()
+
+    def stop_async(self) -> None:
+        self._async_running = False
+        with self._async_cv:
+            self._async_cv.notify_all()
+
+    def _async_loop(self) -> None:
+        while self._async_running:
+            with self._async_cv:
+                while self._async_running and self._async_box is None:
+                    self._async_cv.wait(timeout=0.5)
+                if not self._async_running:
+                    return
+                color, depth_m = self._async_box
+                self._async_box = None
+            try:
+                fresh, timings = self._compute_fresh(color, depth_m)
+                with self.tracker_lock:
+                    objects = self.tracker.update(fresh)
+                timings["n_objects"] = len(objects)
+                timings["total_ms"] = timings["stage1_ms"] + timings["dino_ms"] + timings["sam_ms"]
+                self.last_async_timings_ms = timings
+            except Exception as e:
+                print(f"[pipeline.async] error: {e!r}")
+
+    def fast_step(self, color: np.ndarray, depth_m: np.ndarray) -> List[DetectedObject]:
+        """Cheap update: re-run Stage 1 only and bind blobs to existing tracks.
+
+        For each currently-tracked object, find the Stage-1 blob with greatest
+        IoU against its prior cam_mask. If none qualifies, fall back to the
+        nearest blob within fast_centroid_max_px. Refresh the track's cam_mask,
+        parallax-corrected proj_mask, centroids and median depth in-place.
+        """
         t0 = time.perf_counter()
-        # ---- Stage 1: depth-foreground (gives us proof there's stuff inside the footprint) ----
         blobs, dbg = detect_blobs(
             color, depth_m, self.footprint, self.cfg.intrinsics, self.cfg.geometry
         )
         self.last_stage1_debug = dbg
-        # Union of all Stage-1 blob masks — used to require any new object to
-        # overlap the depth-foreground region (kills DINO hallucinations on the
-        # bare wall).
+        plane = dbg.get("plane", [0, 0, -1, 3.0])
+        t_stage1 = time.perf_counter()
+
+        with self.tracker_lock:
+            tracked = list(self.tracker.active())
+        used_blob_idx: set = set()
+        refresh_calls = []  # apply under lock at the end
+        for obj in tracked:
+            prior = obj.cam_mask
+            best_i, best_iou = -1, 0.0
+            for i, b in enumerate(blobs):
+                if i in used_blob_idx:
+                    continue
+                inter = int(np.logical_and(prior > 0, b.cam_mask > 0).sum())
+                union = int(np.logical_or(prior > 0, b.cam_mask > 0).sum())
+                if union == 0:
+                    continue
+                iou = inter / union
+                if iou > best_iou:
+                    best_iou, best_i = iou, i
+            if best_i < 0 or best_iou < self.cfg.fast_iou_min:
+                # Centroid fallback
+                pcx, pcy = obj.centroid_cam
+                best_c, best_dist = -1, float("inf")
+                for i, b in enumerate(blobs):
+                    if i in used_blob_idx:
+                        continue
+                    ys, xs = np.where(b.cam_mask > 0)
+                    if not ys.size:
+                        continue
+                    bcx, bcy = float(xs.mean()), float(ys.mean())
+                    d = ((bcx - pcx) ** 2 + (bcy - pcy) ** 2) ** 0.5
+                    if d < best_dist:
+                        best_dist, best_c = d, i
+                if best_c >= 0 and best_dist < self.cfg.fast_centroid_max_px:
+                    best_i = best_c
+            if best_i < 0:
+                continue  # leave object untouched — momentarily lost
+            used_blob_idx.add(best_i)
+            new_cam_mask = cv2.bitwise_and(blobs[best_i].cam_mask,
+                                           self.footprint * 255)
+            if int((new_cam_mask > 0).sum()) < self.cfg.min_obj_area_px:
+                continue
+            proj_mask, proj_centroid, med_z = self._warp_with_parallax(
+                new_cam_mask, depth_m, plane
+            )
+            refresh_calls.append((obj.object_id, new_cam_mask, proj_mask, proj_centroid, med_z))
+
+        with self.tracker_lock:
+            for oid, cm, pm, pc, mz in refresh_calls:
+                self.tracker.refresh_track(
+                    oid, cam_mask=cm, proj_mask=pm,
+                    proj_centroid=pc, median_depth_m=mz,
+                )
+            objects = self.tracker.active()
+        t_end = time.perf_counter()
+        self.last_timings_ms = {
+            "stage1_ms": (t_stage1 - t0) * 1000,
+            "dino_ms": 0.0,
+            "sam_ms": 0.0,
+            "merge_ms": (t_end - t_stage1) * 1000,
+            "total_ms": (t_end - t0) * 1000,
+            "n_dino_raw": 0,
+            "n_dino_kept": 0,
+            "n_objects": len(objects),
+            "fast": True,
+        }
+        self._frame_idx += 1
+        return objects
+
+    def step(self, color: np.ndarray, depth_m: np.ndarray) -> List[DetectedObject]:
+        """Synchronous full pass: Stage 1 + DINO + SAM + tracker.update."""
+        t0 = time.perf_counter()
+        fresh, timings = self._compute_fresh(color, depth_m)
+        objects = self.tracker.update(fresh)
+        t_end = time.perf_counter()
+        timings["merge_ms"] = (t_end - t0) * 1000 - timings["stage1_ms"] - timings["dino_ms"] - timings["sam_ms"]
+        timings["total_ms"] = (t_end - t0) * 1000
+        timings["n_objects"] = len(objects)
+        self.last_timings_ms = timings
+        self._frame_idx += 1
+        return objects
+
+    def _compute_fresh(
+        self, color: np.ndarray, depth_m: np.ndarray
+    ) -> Tuple[List[FreshDetection], dict]:
+        """Heavy DINO + SAM + parallax → list of FreshDetection. No tracker.
+
+        Used by step() (sync) and the async recognize thread.
+        """
+        t0 = time.perf_counter()
+        blobs, dbg = detect_blobs(
+            color, depth_m, self.footprint, self.cfg.intrinsics, self.cfg.geometry
+        )
+        self.last_stage1_debug = dbg
         geom_union = np.zeros((self.cam_h, self.cam_w), np.uint8)
         for b in blobs:
             geom_union = cv2.bitwise_or(geom_union, b.cam_mask)
         t_stage1 = time.perf_counter()
 
-        # ---- DINO (every frame for now; can be throttled later) ----
         dino_all = self.recognizer.label_image(
             color, prompt=self.cfg.dino_prompt,
             box_threshold=self.cfg.dino_box_thresh,
@@ -137,7 +370,6 @@ class Pipeline:
         dino_filt = self._dedupe_dino(dino_filt)
         t_dino = time.perf_counter()
 
-        # ---- SAM2 prompted by each surviving DINO detection's bbox center ----
         if dino_filt:
             prompts = [(d["bbox"][0] + d["bbox"][2] / 2,
                         d["bbox"][1] + d["bbox"][3] / 2) for d in dino_filt]
@@ -146,14 +378,7 @@ class Pipeline:
             sam_results = []
         t_sam = time.perf_counter()
 
-        # ---- Build FreshDetections (mask ∩ footprint, then geometric-overlap gate) ----
-        # Estimate the calibration plane depth at each pixel for parallax
-        # correction. From the Stage-1 RANSAC plane:
-        #   ray (u, v, 1) hits plane at z_plane(u,v) = -d / (a*u + b*v + c)
         plane = dbg.get("plane", [0, 0, -1, 3.0])
-        fx, fy, cx, cy = self.cfg.intrinsics
-        a, b, c, d_plane = plane
-
         fresh: List[FreshDetection] = []
         for det, (sam_mask, sam_score) in zip(dino_filt, sam_results):
             cam_mask = cv2.bitwise_and(sam_mask, self.footprint * 255)
@@ -164,68 +389,22 @@ class Pipeline:
                 overlap = int(np.logical_and(cam_mask > 0, geom_union > 0).sum())
                 if overlap / max(1, area) < self.cfg.geometric_overlap_min:
                     continue
-            # Median depth on the cam_mask
-            z = depth_m[(cam_mask > 0) & (depth_m > 0)]
-            med_z = float(np.median(z)) if z.size else 0.0
-
-            # ---- Parallax correction (B) -----------------------------------
-            # The H was calibrated against the wall plane. An object at depth
-            # z_obj < z_wall reprojects from the camera through the wall plane
-            # at a different (u, v). We approximate this by shifting the
-            # entire cam_mask by the centroid's parallax offset before warping.
-            ys_m, xs_m = np.where(cam_mask > 0)
-            cam_mask_for_warp = cam_mask
-            if med_z > 0.1 and ys_m.size:
-                cx_m = float(xs_m.mean()); cy_m = float(ys_m.mean())
-                u = (cx_m - cx) / fx
-                v = (cy_m - cy) / fy
-                denom = a * u + b * v + c
-                z_wall_at_centroid = (-d_plane / denom) if abs(denom) > 1e-6 else 0.0
-                if z_wall_at_centroid > 0.1:
-                    # Pixel shift along the camera-to-centroid ray. Sign:
-                    # if z_obj < z_wall the object's wall projection is OUTWARD
-                    # from the principal point.
-                    scale = (z_wall_at_centroid - med_z) / z_wall_at_centroid
-                    shift_x = (cx_m - cx) * scale
-                    shift_y = (cy_m - cy) * scale
-                    if abs(shift_x) > 0.5 or abs(shift_y) > 0.5:
-                        M = np.array([[1.0, 0.0, shift_x],
-                                      [0.0, 1.0, shift_y]], dtype=np.float32)
-                        cam_mask_for_warp = cv2.warpAffine(
-                            cam_mask, M, (self.cam_w, self.cam_h),
-                            flags=cv2.INTER_NEAREST, borderValue=0,
-                        )
-
-            # Warp into projector space (the wall-calibrated H)
-            proj_mask = cv2.warpPerspective(
-                cam_mask_for_warp, self.H, (self.cfg.proj_w, self.cfg.proj_h),
-                flags=cv2.INTER_NEAREST,
+            proj_mask, proj_centroid, med_z = self._warp_with_parallax(
+                cam_mask, depth_m, plane
             )
-            proj_cy, proj_cx = np.where(proj_mask > 0)
-            if proj_cy.size:
-                proj_centroid = (float(proj_cx.mean()), float(proj_cy.mean()))
-            else:
-                proj_centroid = None
             fresh.append(FreshDetection(
                 cam_mask=cam_mask,
                 label=det["label"],
                 label_score=float(det["score"] * sam_score),
                 median_depth_m=med_z,
-                proj_mask=proj_mask if proj_mask.any() else None,
+                proj_mask=proj_mask,
                 proj_centroid=proj_centroid,
             ))
-
-        objects = self.tracker.update(fresh)
-        t_end = time.perf_counter()
-        self.last_timings_ms = {
+        timings = {
             "stage1_ms": (t_stage1 - t0) * 1000,
             "dino_ms": (t_dino - t_stage1) * 1000,
             "sam_ms": (t_sam - t_dino) * 1000,
-            "merge_ms": (t_end - t_sam) * 1000,
-            "total_ms": (t_end - t0) * 1000,
             "n_dino_raw": len(dino_all),
             "n_dino_kept": len(dino_filt),
-            "n_objects": len(objects),
         }
-        self._frame_idx += 1
-        return objects
+        return fresh, timings
