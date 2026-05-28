@@ -246,21 +246,64 @@ class PerceptionDaemon:
             return {"ok": True}
         if cmd == "test_point":
             # Project a fixed-size white square at the projector coordinates
-            # obtained by warping (cam_x, cam_y) through H. Used by the
+            # for camera (cam_x, cam_y). If parallax=True and depth_m is
+            # provided (or readable from the last frame), routes through
+            # Pipeline._warp_with_parallax so the wash lands on the *object*
+            # at that depth, not the wall behind it. Used by the
             # calibration QA probe.
             try:
                 cx_c = float(msg["cam_x"])
                 cy_c = float(msg["cam_y"])
                 size_px = int(msg.get("size_px", 300))
                 hold_s = float(msg.get("hold_s", 2.0))
+                use_parallax = bool(msg.get("parallax", False))
+                depth_m_val = msg.get("depth_m", None)
+                if depth_m_val is not None:
+                    depth_m_val = float(depth_m_val)
             except Exception:
                 return {"ok": False, "reason": "bad test_point payload"}
             import cv2 as _cv2
-            pt = np.array([[[cx_c, cy_c]]], dtype=np.float32)
-            pp = _cv2.perspectiveTransform(pt, self.pipeline.H).reshape(2)
-            px, py = float(pp[0]), float(pp[1])
             PW = self.pipeline.cfg.proj_w
             PH = self.pipeline.cfg.proj_h
+            CW = self.pipeline.cam_w
+            CH = self.pipeline.cam_h
+            px = py = 0.0
+            method = "raw_H"
+            if use_parallax and depth_m_val and depth_m_val > 0.1:
+                # Build a small cam-mask disc, run through parallax-aware warp.
+                disc = np.zeros((CH, CW), dtype=np.uint8)
+                _cv2.circle(disc, (int(round(cx_c)), int(round(cy_c))),
+                            max(4, size_px // 16), 255, -1)
+                # Synthesize a depth array that says "depth_m at the disc".
+                fake_depth = np.zeros((CH, CW), dtype=np.float32)
+                fake_depth[disc > 0] = depth_m_val
+                # Plane: prefer the last Stage-1 plane if available.
+                plane = None
+                try:
+                    plane = self.pipeline.last_stage1_debug.get("plane")
+                except Exception:
+                    plane = None
+                if plane is None:
+                    plane = [0.0, 0.0, -1.0, 3.7]  # fallback flat wall @ 3.7m
+                pm, pc, _med = self.pipeline._warp_with_parallax(
+                    disc, fake_depth, plane,
+                )
+                if pm is not None and pc is not None:
+                    # Re-render as a centered square at the parallax-shifted
+                    # projector centroid (so the visual is consistent).
+                    px, py = float(pc[0]), float(pc[1])
+                    method = "parallax"
+                else:
+                    # parallax couldn't compute (e.g. mask warped offscreen);
+                    # fall through to raw H so something still projects.
+                    pt = np.array([[[cx_c, cy_c]]], dtype=np.float32)
+                    pp = _cv2.perspectiveTransform(pt, self.pipeline.H).reshape(2)
+                    px, py = float(pp[0]), float(pp[1])
+                    method = "raw_H_fallback"
+            else:
+                pt = np.array([[[cx_c, cy_c]]], dtype=np.float32)
+                pp = _cv2.perspectiveTransform(pt, self.pipeline.H).reshape(2)
+                px, py = float(pp[0]), float(pp[1])
             mask = np.zeros((PH, PW), dtype=np.uint8)
             x0 = max(0, int(round(px - size_px / 2)))
             y0 = max(0, int(round(py - size_px / 2)))
@@ -284,6 +327,9 @@ class PerceptionDaemon:
                 "ok": True,
                 "proj_xy": [px, py],
                 "in_frame": (0 <= px < PW and 0 <= py < PH),
+                "method": method,
+                "parallax_sign": self.pipeline.cfg.parallax_sign,
+                "parallax_scale": self.pipeline.cfg.parallax_scale,
             }
         if cmd == "test_clear":
             self._test_hold_until = 0.0

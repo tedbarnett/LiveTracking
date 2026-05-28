@@ -136,6 +136,27 @@ class Pipeline:
             H, self.cfg.proj_w, self.cfg.proj_h, cam_w, cam_h
         )
         self.recognizer = recognizer or Recognizer()
+        # Optional: calibrated wall plane (a, b, c, d) loaded from
+        # runtime/calibration/wall_plane.npy. When present, parallax
+        # compensation uses this plane instead of the per-frame Stage-1
+        # plane — Stage-1 fits the dominant ground plane (often the couch
+        # seat), which gives spurious parallax for wall objects.
+        self.wall_plane: Optional[List[float]] = None
+        try:
+            import os as _os
+            wp_path = _os.path.join(
+                _os.path.dirname(_os.path.dirname(_os.path.dirname(
+                    _os.path.dirname(_os.path.abspath(__file__))))),
+                "runtime", "calibration", "wall_plane.npy",
+            )
+            if _os.path.exists(wp_path):
+                wp = np.load(wp_path)
+                if wp.size == 4:
+                    self.wall_plane = wp.tolist()
+                    print(f"[pipeline] loaded calibrated wall plane: "
+                          f"{[round(x, 4) for x in self.wall_plane]}")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[pipeline] wall_plane.npy load failed: {_e}")
         self.tracker = ObjectTracker(
             iou_match_threshold=self.cfg.iou_match_threshold,
             stale_after_s=self.cfg.stale_after_s,
@@ -202,9 +223,17 @@ class Pipeline:
 
         Returns (proj_mask_or_None, proj_centroid_or_None, median_depth_m).
         Used by both step() (full pass) and fast_step() (Stage-1-driven update).
+
+        If self.wall_plane is set (from calibration), it overrides the
+        per-frame Stage-1 plane — the calibration plane is the actual
+        surface H was solved on, so it's the correct reference for the
+        "how much closer is the object than the projection plane" math.
         """
         fx, fy, cx, cy = self.cfg.intrinsics
-        a, b, c, d_plane = plane
+        if self.wall_plane is not None:
+            a, b, c, d_plane = self.wall_plane
+        else:
+            a, b, c, d_plane = plane
 
         z_pix = depth_m[(cam_mask > 0) & (depth_m > 0)]
         med_z = float(np.median(z_pix)) if z_pix.size else 0.0

@@ -176,6 +176,9 @@ def main() -> int:
     cw, ch = cap.size()
     cam_pts: list[list[float]] = []
     proj_pts: list[list[float]] = []
+    # (cam_u, cam_v, depth_m) at each detected marker center — used to
+    # fit the wall plane for parallax compensation.
+    cam_depth_samples: list[list[float]] = []
     overview = None
     n_detected = 0
     miss_ids: list[int] = []
@@ -209,6 +212,21 @@ def main() -> int:
                         cam_pts.append([float(cam4[k, 0]), float(cam4[k, 1])])
                         proj_pts.append([float(corners_proj[k, 0]),
                                          float(corners_proj[k, 1])])
+                    # Sample wall depth at this marker's center for plane fit.
+                    cxm, cym = cam4.mean(axis=0)
+                    ix, iy = int(round(cxm)), int(round(cym))
+                    if 0 <= ix < shot.depth_m.shape[1] and \
+                       0 <= iy < shot.depth_m.shape[0]:
+                        # 5x5 median for robustness against missing pixels.
+                        x0 = max(0, ix - 2); x1 = min(shot.depth_m.shape[1], ix + 3)
+                        y0 = max(0, iy - 2); y1 = min(shot.depth_m.shape[0], iy + 3)
+                        patch = shot.depth_m[y0:y1, x0:x1]
+                        valid = patch[patch > 0.1]
+                        if valid.size >= 4:
+                            cam_depth_samples.append(
+                                [float(cxm), float(cym),
+                                 float(np.median(valid))]
+                            )
                     cv2.polylines(overview,
                                   [cam4.astype(np.int32)], True,
                                   (0, 255, 0), 2)
@@ -266,6 +284,58 @@ def main() -> int:
         os.makedirs(calib_dir, exist_ok=True)
         np.save(os.path.join(calib_dir, "dot_cam_pts.npy"), cam_arr)
         np.save(os.path.join(calib_dir, "dot_proj_pts.npy"), proj_arr)
+
+        # Fit wall plane in camera 3D space from depth samples at the
+        # detected ArUco marker centers. This is the surface the H was
+        # solved on, so it's the correct reference plane for parallax
+        # compensation (objects closer than this plane need shifting).
+        plane = None
+        if len(cam_depth_samples) >= 3:
+            # Hard-coded D455 intrinsics (matches PipelineConfig.intrinsics).
+            fx, fy, cx_i, cy_i = 615.0, 615.0, 424.0, 240.0
+            # Sort by depth and keep only the FAR HALF — markers that
+            # landed on the back wall, filtering out ones that hit closer
+            # surfaces (couch, objects). This matters because the JMGO
+            # projects partially onto the couch + objects in front of the
+            # wall, and we want the wall plane, not the couch plane.
+            samples_sorted = sorted(cam_depth_samples, key=lambda s: -s[2])
+            kept = samples_sorted[: max(3, len(samples_sorted) // 2)]
+            print(f"[calib] plane-fit samples: {len(cam_depth_samples)} "
+                  f"detected, keeping {len(kept)} farthest "
+                  f"(depth range {kept[-1][2]:.2f}m - {kept[0][2]:.2f}m).")
+            pts3 = []
+            for u, v, z in kept:
+                X = (u - cx_i) * z / fx
+                Y = (v - cy_i) * z / fy
+                pts3.append([X, Y, z])
+            P = np.array(pts3, dtype=np.float64)
+            # Plane fit: minimize ||A n + b|| where n=(a,b,c), b=-d_plane.
+            # Use SVD on centered points to get the normal robustly.
+            centroid = P.mean(axis=0)
+            U, S, Vt = np.linalg.svd(P - centroid, full_matrices=False)
+            normal = Vt[-1]                       # smallest singular vector
+            a, b, c = float(normal[0]), float(normal[1]), float(normal[2])
+            d_p = float(-(a * centroid[0] + b * centroid[1] + c * centroid[2]))
+            # Normalize so c is negative (Z increases away from camera,
+            # plane is "in front" of camera → aX+bY+cZ+d=0 with c<0).
+            if c > 0:
+                a, b, c, d_p = -a, -b, -c, -d_p
+            plane = [a, b, c, d_p]
+            # Residuals (perpendicular distances)
+            resid = (P @ np.array([a, b, c]) + d_p) / max(
+                1e-6, float(np.linalg.norm([a, b, c]))
+            )
+            print(f"[calib] wall plane: a={a:.4f} b={b:.4f} c={c:.4f} "
+                  f"d={d_p:.4f}  (residual median={float(np.median(np.abs(resid))):.3f}m, "
+                  f"max={float(np.max(np.abs(resid))):.3f}m, "
+                  f"n_samples={len(pts3)})")
+            np.save(os.path.join(calib_dir, "wall_plane.npy"),
+                    np.array(plane, dtype=np.float64))
+            print(f"[calib] saved wall_plane.npy")
+        else:
+            print(f"[calib] only {len(cam_depth_samples)} depth samples — "
+                  "skipping wall plane fit (parallax will fall back to "
+                  "Stage-1 plane).")
 
         save_homography(
             H,
