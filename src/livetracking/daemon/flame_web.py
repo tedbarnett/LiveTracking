@@ -239,6 +239,78 @@ def create_app() -> Flask:
         data = request.get_json(silent=True) or {}
         return jsonify(_send_ctrl({"cmd": "white_light", "value": bool(data.get("value", False))}))
 
+    # ---- remote probe --------------------------------------------------
+    # GET /probe/<id>?hold=2&size=300 -- flash a bright projector square
+    # at the given object's current cam centroid (parallax-compensated),
+    # then return the latest annotated snapshot as JPEG so a remote user
+    # can verify wash alignment from anywhere. The hold suppresses
+    # perception's own projector messages for `hold` seconds.
+    @app.route("/probe/<int:obj_id>")
+    def probe(obj_id):
+        from flask import Response
+        hold = float(request.args.get("hold", "1.6"))
+        size = int(request.args.get("size", "300"))
+        st = _send_ctrl({"cmd": "list"})
+        if not st.get("ok"):
+            return jsonify({"ok": False, "reason": "list failed",
+                            "detail": st}), 502
+        target = None
+        for o in (st.get("objects") or []):
+            if int(o.get("id")) == obj_id:
+                target = o
+                break
+        if target is None:
+            return jsonify({"ok": False, "reason": f"no object id {obj_id}"}), 404
+        cx, cy = target["centroid_cam"]
+        depth = float(target.get("depth_m") or 0.0)
+        rep = _send_ctrl({
+            "cmd": "test_point",
+            "cam_x": float(cx), "cam_y": float(cy),
+            "size_px": size, "hold_s": hold,
+            "parallax": True, "depth_m": depth,
+        })
+        time.sleep(0.6)
+        # Grab the latest annotated frame via our own /snapshot.jpg route.
+        import urllib.request as _ur
+        try:
+            jpeg_bytes = _ur.urlopen(
+                "http://127.0.0.1:5070/snapshot.jpg", timeout=3,
+            ).read()
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"ok": True, "test_point": rep, "target": target,
+                            "no_snapshot": True,
+                            "snapshot_error": str(e)})
+        return Response(
+            jpeg_bytes,
+            mimetype="image/jpeg",
+            headers={
+                "X-Probe-Target-Id": str(obj_id),
+                "X-Probe-Target-Name": str(target.get("name", "")),
+                "X-Probe-Proj-Xy": str(rep.get("proj_xy") or ""),
+                "X-Probe-Method": str(rep.get("method") or ""),
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.route("/probe", methods=["GET"])
+    def probe_index():
+        """One link per current object -- useful on a phone to fire-and-screenshot."""
+        st = _send_ctrl({"cmd": "list"})
+        objs = (st.get("objects") or []) if st.get("ok") else []
+        rows = "\n".join(
+            f'<li><a href="/probe/{o["id"]}?hold=2">id={o["id"]} '
+            f'{o["name"]} (d={o.get("depth_m", 0):.2f}m)</a></li>'
+            for o in objs
+        ) or "<li><em>no objects</em></li>"
+        return (
+            "<!doctype html><title>LiveTracking remote probe</title>"
+            "<style>body{font-family:system-ui;padding:1em}"
+            "a{display:block;padding:0.6em;font-size:1.1em}</style>"
+            "<h2>Probe -- tap an object to fire the projector + capture</h2>"
+            f"<ul>{rows}</ul>"
+        )
+
+
     # ---- re-calibrate --------------------------------------------------
     # Calibration must run in the user's desktop session (it grabs display
     # 1 + the RealSense). Flask runs as LocalSystem in Session 0, so we

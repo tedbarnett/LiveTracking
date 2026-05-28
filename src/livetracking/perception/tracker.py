@@ -130,19 +130,75 @@ class ObjectTracker:
         self._hidden_ids: set = self._load_hidden()
 
     # ---- name persistence ----
+    # New schema (v2): JSON dict with two top-level keys.
+    #   "by_id":          legacy {id_str: name} mapping kept for back-compat.
+    #   "by_fingerprint": [{name, label, cam_xy, depth_m, last_seen}, ...]
+    #                     allows renames to survive perception restarts: when
+    #                     a new track is promoted we look up its fingerprint
+    #                     (label class + camera centroid within FP_XY_TOL_PX
+    #                     + depth within FP_DEPTH_TOL_M) and inherit the name.
+    # Old schema (v1) ({id_str: name}) is still read and treated as by_id.
+    _FP_XY_TOL_PX = 60.0
+    _FP_DEPTH_TOL_M = 0.40
+
     def _load_names(self) -> Dict[str, str]:
+        """Load the legacy id -> name map (v1) or by_id sub-dict (v2)."""
+        self._fp_renames: List[dict] = []
         if not os.path.exists(self.names_path):
             return {}
         try:
             with open(self.names_path) as f:
-                return dict(json.load(f))
+                data = json.load(f)
+            # v2?
+            if isinstance(data, dict) and (
+                "by_id" in data or "by_fingerprint" in data
+            ):
+                self._fp_renames = list(data.get("by_fingerprint") or [])
+                return dict(data.get("by_id") or {})
+            # v1 (flat id -> name dict)
+            if isinstance(data, dict):
+                return dict(data)
         except Exception:
-            return {}
+            pass
+        return {}
 
     def _save_names(self) -> None:
+        """Save both id-keyed and fingerprint-keyed renames (v2 schema)."""
         os.makedirs(os.path.dirname(self.names_path), exist_ok=True)
+        payload = {
+            "by_id": self._names,
+            "by_fingerprint": self._fp_renames,
+        }
         with open(self.names_path, "w") as f:
-            json.dump(self._names, f, indent=2)
+            json.dump(payload, f, indent=2)
+
+    def _lookup_fingerprint_name(
+        self, label: str, cam_xy: Tuple[float, float], depth_m: float,
+    ) -> Optional[str]:
+        """Return a previously-saved user name whose fingerprint matches."""
+        best: Optional[dict] = None
+        best_score: float = -1.0
+        cx, cy = cam_xy
+        for fp in self._fp_renames:
+            # Require same label class (so a couch rename doesn't poach a
+            # pillow at the same coords).
+            if (fp.get("label") or "").lower() != (label or "").lower():
+                continue
+            fcx, fcy = fp.get("cam_xy") or (0, 0)
+            dx, dy = cx - float(fcx), cy - float(fcy)
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist > self._FP_XY_TOL_PX:
+                continue
+            fd = float(fp.get("depth_m") or 0.0)
+            if depth_m > 0.1 and fd > 0.1 \
+                    and abs(depth_m - fd) > self._FP_DEPTH_TOL_M:
+                continue
+            # Pick the closest match.
+            score = -dist
+            if score > best_score:
+                best_score = score
+                best = fp
+        return best.get("name") if best else None
 
     # ---- hidden persistence ----
     def _load_hidden(self) -> set:
@@ -188,6 +244,34 @@ class ObjectTracker:
             return False
         track.obj.name = new_name
         self._names[str(object_id)] = new_name
+        # Also store a fingerprint so the rename survives a perception
+        # restart (where object_id will be reassigned).
+        obj = track.obj
+        # The fingerprint label is the DINO class (object.name once was
+        # the DINO label before rename); we use the CURRENT cam centroid
+        # + depth and *the label DINO assigned*, captured here at rename
+        # time from obj.bbox_cam-derived locality. We don't store
+        # obj.name -- that's the new user-supplied name.
+        fp = {
+            "name": new_name,
+            "label": obj.dino_label or obj.name,
+            "cam_xy": [float(obj.centroid_cam[0]),
+                       float(obj.centroid_cam[1])],
+            "depth_m": float(obj.median_depth_m),
+            "last_seen": time.time(),
+        }
+        # Replace any prior fingerprint at this location for the same label.
+        self._fp_renames = [
+            f for f in self._fp_renames
+            if not (
+                (f.get("label") or "").lower() == (fp["label"] or "").lower()
+                and abs((f.get("cam_xy") or [0, 0])[0] - fp["cam_xy"][0])
+                    < self._FP_XY_TOL_PX
+                and abs((f.get("cam_xy") or [0, 0])[1] - fp["cam_xy"][1])
+                    < self._FP_XY_TOL_PX
+            )
+        ]
+        self._fp_renames.append(fp)
         self._save_names()
         return True
 
@@ -260,6 +344,10 @@ class ObjectTracker:
             tr.obj.bbox_cam = _mask_bbox(fd.cam_mask)
             tr.obj.median_depth_m = fd.median_depth_m
             tr.obj.label_score = max(tr.obj.label_score, fd.label_score)
+            # Always track the latest DINO label (fingerprint key), even
+            # if the user renamed the display name.
+            if fd.label:
+                tr.obj.dino_label = fd.label
             # Only overwrite label/name with DINO's pick if user hasn't renamed.
             user_named = str(tid) in self._names
             if not user_named and fd.label and fd.label_score > tr.obj.label_score - 0.05:
@@ -305,7 +393,14 @@ class ObjectTracker:
                     new_id = self._next_id
                     self._next_id += 1
                     color = PALETTE[(new_id - 1) % len(PALETTE)]
-                    saved_name = self._names.get(str(new_id))
+                    # Prefer a fingerprint-matched name (persists across
+                    # perception restarts where ids get reassigned).
+                    fp_name = self._lookup_fingerprint_name(
+                        cand.last_label or "",
+                        cand.last_centroid,
+                        cand.last_depth_m,
+                    )
+                    saved_name = fp_name or self._names.get(str(new_id))
                     obj = DetectedObject(
                         object_id=new_id,
                         name=saved_name or cand.last_label or f"object {new_id}",
@@ -318,7 +413,13 @@ class ObjectTracker:
                         median_depth_m=cand.last_depth_m,
                         last_seen_t=now,
                         label_score=cand.last_label_score,
+                        dino_label=cand.last_label or "",
                     )
+                    # If we picked up the name from a fingerprint, also
+                    # register it under the new id so subsequent renames
+                    # / lookups still work the legacy way.
+                    if fp_name:
+                        self._names[str(new_id)] = fp_name
                     self._tracks[new_id] = _Track(obj=obj, age_frames=cand.consecutive_hits, misses=0)
                     if new_id in self._hidden_ids:
                         obj.hidden = True
@@ -353,6 +454,53 @@ class ObjectTracker:
                 tr.misses += 1
             if now - tr.obj.last_seen_t > self.stale_after_s:
                 del self._tracks[tid]
+
+        # Post-merge: collapse pairs of LIVE tracks that point at the same
+        # physical object. This happens when DINO skips one of two
+        # overlapping detections for a frame, the original track times
+        # out, a duplicate track gets promoted at the same position, and
+        # the original then re-matches on a later frame. We merge by
+        # keeping the LOWER id (older / user-renamed) and discarding the
+        # higher one. Trigger: mask IoU >= 0.5 or centroid-inside-bbox
+        # both ways. Skips hidden tracks (the user explicitly wants
+        # those kept as distinct entries even if they overlap).
+        tid_list = [tid for tid, tr in self._tracks.items()
+                    if not tr.obj.hidden]
+        tid_list.sort()  # so we keep lower ids
+        merged_away: set = set()
+        for i, a_id in enumerate(tid_list):
+            if a_id in merged_away:
+                continue
+            a = self._tracks[a_id]
+            ax, ay, aw, ah = a.obj.bbox_cam
+            a_cent = a.obj.centroid_cam
+            for b_id in tid_list[i + 1:]:
+                if b_id in merged_away:
+                    continue
+                b = self._tracks[b_id]
+                iou = _mask_iou(a.obj.cam_mask, b.obj.cam_mask)
+                bx, by, bw, bh = b.obj.bbox_cam
+                b_cent = b.obj.centroid_cam
+                a_in_b = (bx <= a_cent[0] <= bx + bw
+                          and by <= a_cent[1] <= by + bh)
+                b_in_a = (ax <= b_cent[0] <= ax + aw
+                          and ay <= b_cent[1] <= ay + ah)
+                if iou >= 0.5 or (a_in_b and b_in_a):
+                    # Merge b -> a: keep a's id/name/color, but if b has
+                    # the higher score, adopt b's mask (it's likely the
+                    # fresher detection).
+                    if b.obj.label_score > a.obj.label_score:
+                        a.obj.cam_mask = b.obj.cam_mask
+                        a.obj.proj_mask = b.obj.proj_mask
+                        a.obj.centroid_cam = b.obj.centroid_cam
+                        a.obj.centroid_proj = b.obj.centroid_proj
+                        a.obj.bbox_cam = b.obj.bbox_cam
+                        a.obj.median_depth_m = b.obj.median_depth_m
+                        a.obj.label_score = b.obj.label_score
+                    a.obj.last_seen_t = max(a.obj.last_seen_t,
+                                            b.obj.last_seen_t)
+                    merged_away.add(b_id)
+                    del self._tracks[b_id]
 
         return [tr.obj for tr in self._tracks.values()]
 
