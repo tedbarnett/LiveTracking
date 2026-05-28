@@ -32,5 +32,6 @@ class DetectedObject:
     median_depth_m: float
     last_seen_t: float                 # epoch seconds
     label_score: float = 0.0           # confidence from Grounding DINO (0..1)
+    dino_label: str = ""               # last DINO class for this track (survives rename)
     hidden: bool = False               # user-hidden — filtered out of UI/projection
     aux: dict = field(default_factory=dict)
