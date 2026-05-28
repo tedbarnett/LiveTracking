@@ -234,6 +234,10 @@ class PerceptionDaemon:
             v = max(0.0, min(1.0, v))
             self.proj_push.send_json({"type": "set_intensity", "value": v})
             return {"ok": True, "value": v}
+        if cmd == "white_light":
+            v = bool(msg.get("value", False))
+            self.proj_push.send_json({"type": "set_white_light", "value": v})
+            return {"ok": True, "value": v}
         if cmd == "highlight_all":
             with self.pipeline.tracker_lock:
                 tracked = self.pipeline.tracker.visible()

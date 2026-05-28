@@ -53,6 +53,7 @@ if ($Uninstall) {
     Remove-IfPresent -Name "LiveTrackingFlameWeb"   -Kind 'service'
     Remove-IfPresent -Name "LiveTrackingPerception" -Kind 'task'
     Remove-IfPresent -Name "LiveTrackingProjector"  -Kind 'task'
+    Remove-IfPresent -Name "LiveTrackingCalibrate"  -Kind 'task'
     Write-Host "[done] uninstalled"
     exit 0
 }
@@ -111,6 +112,28 @@ $jTask = New-ScheduledTask `
     -Action $jAction -Trigger $jTrigger -Settings $jSettings -Principal $jPrincipal `
     -Description "LiveTracking projector daemon: pygame fullscreen on JMGO display 1, ZMQ PULL hover commands."
 Register-ScheduledTask -TaskName "LiveTrackingProjector" -InputObject $jTask -Force | Out-Null
+
+# ---- 4) LiveTrackingCalibrate (Scheduled task, on-demand) ------------------
+# Manual-trigger only (no logon trigger). The Flask UI invokes
+#   schtasks /run /tn LiveTrackingCalibrate
+# which fires this task in the user's desktop session so the orchestrator
+# can grab the JMGO + RealSense.
+Remove-IfPresent -Name "LiveTrackingCalibrate" -Kind 'task'
+Write-Host "installing LiveTrackingCalibrate (scheduled task, on-demand, as $User)"
+$cAction = New-ScheduledTaskAction `
+    -Execute $Venv `
+    -Argument "-u $RepoRoot\scripts\run_calibration.py" `
+    -WorkingDirectory $RepoRoot
+$cSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+$cPrincipal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
+$cTask = New-ScheduledTask `
+    -Action $cAction -Settings $cSettings -Principal $cPrincipal `
+    -Description "LiveTracking on-demand calibration: stops perception+projector, re-runs camera->projector homography calibration, restarts them."
+Register-ScheduledTask -TaskName "LiveTrackingCalibrate" -InputObject $cTask -Force | Out-Null
 
 Write-Host ""
 Write-Host "[done] installed:"

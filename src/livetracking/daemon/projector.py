@@ -51,6 +51,7 @@ class ProjectorDaemon:
         self.current = None        # single highlight
         self.current_many = None   # highlight_all payload
         self.intensity = 0.78      # alpha multiplier (0..1)
+        self.white_light = False   # if True, paint full white over everything
 
         ctx = zmq.Context.instance()
         self.pull = ctx.socket(zmq.PULL)
@@ -83,6 +84,8 @@ class ProjectorDaemon:
                     self.current_many = msg
                 elif t == "set_intensity":
                     self.intensity = float(msg.get("value", 0.78))
+                elif t == "set_white_light":
+                    self.white_light = bool(msg.get("value", False))
             time.sleep(0)
 
     def _paint_one(self, cur: dict):
@@ -117,6 +120,13 @@ class ProjectorDaemon:
         with self.state_lock:
             cur = self.current
             many = self.current_many
+            white = self.white_light
+        if white:
+            self.screen.fill((255, 255, 255))
+            self.pygame.display.flip()
+            for _ in self.pygame.event.get():
+                pass
+            return
         self.screen.fill((0, 0, 0))
         if many is not None:
             for obj in many.get("objects", []):
