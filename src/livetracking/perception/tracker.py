@@ -169,23 +169,35 @@ class ObjectTracker:
     def update(self, fresh: List[FreshDetection]) -> List[DetectedObject]:
         now = time.time()
         # Greedy matching: prefer mask IoU, fall back to centroid proximity.
+        # The match is INTENTIONALLY loose because the heavy DINO+SAM thread
+        # only runs every ~2s, and the same physical object's SAM mask wobbles
+        # noticeably between passes — strict IoU would spawn a new candidate
+        # every cycle and inflate ids.
         unmatched_track_ids = set(self._tracks.keys())
         matched_fresh = set()
         pairs: List[Tuple[int, int, float]] = []  # (fresh_idx, track_id, score)
         for fi, fd in enumerate(fresh):
             f_cent = _mask_centroid(fd.cam_mask)
+            f_bbox = _mask_bbox(fd.cam_mask)
             for tid, tr in self._tracks.items():
                 iou = _mask_iou(fd.cam_mask, tr.obj.cam_mask)
-                # Secondary score: centroid distance, normalized to image diag.
                 t_cent = tr.obj.centroid_cam
                 dx, dy = f_cent[0] - t_cent[0], f_cent[1] - t_cent[1]
                 dist = (dx * dx + dy * dy) ** 0.5
-                # Combine: IoU dominates above threshold; otherwise allow a
-                # close (< 40 px) re-match for transient mask wobble.
-                if iou >= self.iou_match_threshold:
+                tx, ty, tw, th = tr.obj.bbox_cam
+                fx_, fy_, fw, fh = f_bbox
+                # Track-bbox-contains-fresh-centroid (or vice versa) is a
+                # strong signal even when masks shifted shape between passes.
+                fresh_cent_in_track = (tx <= f_cent[0] <= tx + tw
+                                       and ty <= f_cent[1] <= ty + th)
+                track_cent_in_fresh = (fx_ <= t_cent[0] <= fx_ + fw
+                                       and fy_ <= t_cent[1] <= fy_ + fh)
+                if iou >= 0.15:
+                    score = 2.0 + iou
+                elif fresh_cent_in_track or track_cent_in_fresh:
                     score = 1.0 + iou
-                elif dist < 40.0:
-                    score = 0.5 - dist / 100.0
+                elif dist < 60.0:
+                    score = 0.6 - dist / 200.0
                 else:
                     continue
                 pairs.append((fi, tid, score))
@@ -328,3 +340,39 @@ class ObjectTracker:
         tr.age_frames += 1
         tr.misses = 0
         return True
+
+    def promote_provisional(
+        self,
+        cam_mask: np.ndarray,
+        proj_mask: Optional[np.ndarray],
+        proj_centroid: Optional[Tuple[float, float]],
+        median_depth_m: float,
+    ) -> int:
+        """Create a new track immediately, no DINO label yet.
+
+        Used by Pipeline.fast_step() when a Stage-1 blob has been stable for
+        enough fast frames that we're confident it's a real object. The async
+        recognizer thread will attach a proper label on its next pass.
+
+        Returns the new object id.
+        """
+        now = time.time()
+        new_id = self._next_id
+        self._next_id += 1
+        color = PALETTE[(new_id - 1) % len(PALETTE)]
+        saved_name = self._names.get(str(new_id))
+        obj = DetectedObject(
+            object_id=new_id,
+            name=saved_name or f"object {new_id}",
+            color_rgb=color,
+            cam_mask=cam_mask,
+            proj_mask=proj_mask,
+            centroid_cam=_mask_centroid(cam_mask),
+            centroid_proj=proj_centroid,
+            bbox_cam=_mask_bbox(cam_mask),
+            median_depth_m=median_depth_m,
+            last_seen_t=now,
+            label_score=0.0,  # no DINO confidence yet
+        )
+        self._tracks[new_id] = _Track(obj=obj, age_frames=1, misses=0)
+        return new_id
