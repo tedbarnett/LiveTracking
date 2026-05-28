@@ -19,7 +19,7 @@ over local ZMQ:
 
 | Process | Purpose | Lifecycle on Windows |
 | --- | --- | --- |
-| `livetracking.daemon.perception` | Holds the D455. Stage 1 depth-plane foreground → Stage 2 async DINO + SAM 2 (RTX 5090). Publishes detected objects + MJPEG over ZMQ. | Scheduled task `LiveTrackingPerception` (at-logon, Interactive — needs user desktop session for USB + GPU). |
+| `livetracking.daemon.perception` | Holds the D455. Image-first pipeline: Grounding DINO (open-vocab detection) → SAM 2 (per-bbox mask) → wall-plane depth gate → parallax-compensated warp through H. Publishes detected objects + MJPEG over ZMQ. | Scheduled task `LiveTrackingPerception` (at-logon, Interactive — needs user desktop session for USB + GPU). |
 | `livetracking.daemon.projector` | Holds pygame fullscreen on the JMGO (display 1). Subscribes (PULL) for `highlight` / `clear` / `set_intensity` / `set_white_light` commands. | Scheduled task `LiveTrackingProjector` (at-logon, Interactive — needs the user desktop session for display 1). |
 | `livetracking.daemon.flame_web` | Flask UI on `:5070`. Serves the hover-to-illuminate page, MJPEG stream, control endpoints. Trampolines control messages into perception over ZMQ. | NSSM service `LiveTrackingFlameWeb` (LocalSystem, auto-start). Cloudflare tunnel `livetracking-laptop` exposes it as `livetracking.barnettlabs.tech`. |
 | `scripts/run_calibration.py` | Stops perception+projector, runs camera→projector homography calibration, restarts them. | Scheduled task `LiveTrackingCalibrate` (on-demand). Triggered by the **Re-calibrate** button in the web UI. |
@@ -28,6 +28,45 @@ Perception + projector run in the user session because they need the
 desktop (pygame display 1, USB camera passthrough). The Flask UI runs as
 a Session-0 service so it survives logoff. The Re-calibrate orchestrator
 also lives in the user session so it can hold display 1 + the camera.
+
+## Perception pipeline
+
+Image-first. For each (color, depth) frame:
+
+1. **Grounding DINO** (`IDEA-Research/grounding-dino-tiny`) runs on the color
+   frame with an open-vocab prompt (`"guitar. bodhran. picture frame. sofa
+   couch. ..."`) → list of bboxes with labels and scores.
+2. Drop low-score detections (`min_dino_score`, default 0.30) and any whose
+   bbox center is outside the projector footprint (the homography's preimage
+   in camera pixels — the area the JMGO can physically reach).
+3. **SAM 2** (`facebook/sam2.1-hiera-large`) is point-prompted at each
+   surviving bbox center → pixel-accurate `cam_mask`. Batched across all
+   detections in one forward pass.
+4. AND each mask with the footprint; drop tiny masks
+   (`min_obj_area_px`, default 800).
+5. Sample median depth at the mask. If the **calibrated wall plane** is
+   loaded (see *Calibration* below) and the mask's median depth is
+   `wall_gate_m` (default 0.40 m) BEHIND the wall, drop it — catches
+   detections seen through a doorway, in a mirror, etc.
+6. **Parallax warp.** The homography is solved on the back wall, so naïve
+   `warpPerspective(H)` puts every object's projector wash on the wall
+   behind it. We shift each mask in camera-pixel space by `(centroid −
+   image_center) × (z_wall − z_obj) / z_wall` before warping; for an object
+   sitting 1 m in front of a 3.5 m wall this is ~30 % of the radial offset.
+   Sign tuned for projector-right-of-camera; flip `parallax_sign` for
+   the opposite mount.
+7. Hand the resulting `FreshDetection`s to `ObjectTracker` for stable IDs
+   across frames (IoU-matched, sticky for `stale_after_s` = 60 s).
+
+Async mode: the heavy DINO+SAM pass (~600 ms on a 5090) runs in a background
+thread on the freshest submitted frame; the main loop streams annotated
+JPEGs at full camera rate (~30 Hz) using the most recent tracker state.
+
+Depth is **advisory** — used for parallax, gating, and the UI's "this object
+is 2.4 m away" readout — not for "is this a thing." Earlier iterations
+used depth-foreground blobs as the primary segmentation driver; that
+fused touching same-depth objects (bodhran on couch, guitar on cushion)
+into one giant blob labeled "sofa couch."
 
 ## Web UI
 
@@ -62,9 +101,15 @@ markers**:
    corner refinement). Each detected marker contributes **4 corner
    correspondences**.
 4. `cv2.findHomography(..., cv2.RANSAC, 15.0)` over all detected corners.
-5. Persist `runtime/calibration/H.npy`, `calib.json`, `dot_cam_pts.npy`,
-   `dot_proj_pts.npy`, plus a synthesized `footprint_measured.png` and
-   diagnostic PNGs to `scripts/out/`.
+5. **Wall-plane fit.** Sample depth at each detected marker's center; keep
+   the farthest half (markers that actually landed on the back wall, not
+   on couches or objects in front of it); back-project to 3D using the
+   D455 intrinsics; SVD-fit a plane. This is the surface the H was solved
+   on, so it's the correct reference for parallax compensation.
+6. Persist `runtime/calibration/H.npy`, `calib.json`, `dot_cam_pts.npy`,
+   `dot_proj_pts.npy`, `wall_plane.npy` (a 4-vector `(a, b, c, d)` so
+   `aX+bY+cZ+d=0` for points on the wall in camera 3D), plus a synthesized
+   `footprint_measured.png` and diagnostic PNGs to `scripts/out/`.
 
 Why time-multiplexed ArUco (not white dots or a single grid frame):
 
@@ -131,23 +176,25 @@ contrast ratio, the more markers ArUco recovers.
 ```
 src/livetracking/
   daemon/
-    perception.py       # D455 owner; Stage 1 + async Stage 2; ZMQ PUB/REP
+    perception.py       # D455 owner; image-first pipeline; ZMQ PUB/REP
     projector.py        # pygame on JMGO; ZMQ PULL; highlight/clear/white-light
     flame_web.py        # Flask UI + control trampoline
     templates/index.html
   perception/
     capture.py          # RealSense aligned color+depth, exposure/WB lock
-    footprint.py        # H persistence + dot-quad footprint reconstruction
-    pipeline.py         # fast_step (geometry) + async recognize
-    tracker.py          # IoU/bbox-contains matcher, provisional promotion, hide
-    geometry.py         # depth-plane RANSAC, per-object parallax warp
+    footprint.py        # H persistence + projector-footprint reconstruction
+    pipeline.py         # DINO -> SAM -> depth gate -> parallax warp -> tracker
+    recognize.py        # Grounding DINO + SAM 2 model wrappers, DEFAULT_DINO_PROMPT
+    tracker.py          # IoU matcher, stable IDs, hide/rename/color cycle
+    geometry.py         # depth-plane utilities (debug-only; unused by daemon)
   paths.py              # env-driven paths, display index, ZMQ endpoints
 scripts/
-  calibrate_homography.py   # time-multiplexed ArUco calibration
+  calibrate_homography.py   # time-multiplexed ArUco + wall-plane fit
   run_calibration.py        # orchestrator: stop/calibrate/restart + status JSON
   install_services.ps1      # idempotent service/task installer
+  probe_parallax.py         # QA: drive test_point on each tracked object
   out/                      # diagnostic dumps from calibration + tests
-runtime/                    # H.npy, calib.json, hidden_objects.json, logs (gitignored)
+runtime/                    # H.npy, wall_plane.npy, calib.json, masks, logs (gitignored)
 ```
 
 ## Logs
@@ -166,3 +213,6 @@ runtime/                    # H.npy, calib.json, hidden_objects.json, logs (giti
 | `LIVETRACKING_RUNTIME_DIR` | Where to write H, masks, logs | `<repo>/runtime` |
 | `LIVETRACKING_RS_EXPOSURE` | RealSense color exposure (locked) | `700` |
 | `LIVETRACKING_WEB_UI_PORT` | Flask port | `5070` |
+| `LIVETRACKING_PARALLAX_COMPENSATE` | Enable per-object parallax shift before warp (`0`/`false` to disable) | `1` |
+| `LIVETRACKING_PARALLAX_SIGN` | Direction of the parallax shift. `+1` for projector right of camera, `-1` for projector left of camera. | `1.0` |
+| `LIVETRACKING_PARALLAX_SCALE` | Multiplier on the geometric parallax magnitude. `1.0` = textbook formula. Crank to `1.2` if washes still lag the object, or `0.8` if they overshoot. | `1.0` |
