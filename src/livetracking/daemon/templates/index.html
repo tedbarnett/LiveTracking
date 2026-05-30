@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>LiveTracking — Perception</title>
+<title>LiveTracking</title>
 <style>
   body { background: #111; color: #eee; font-family: -apple-system, Segoe UI, Helvetica, sans-serif; margin: 0; }
   header { padding: 12px 18px; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; gap: 16px; }
@@ -50,14 +50,14 @@
 </head>
 <body>
 <header>
-  <h1>LiveTracking — perception</h1>
+  <h1>LiveTracking</h1>
   <div class="controls">
-    <button id="btnPause" class="primary">⏸ Pause</button>
-    <button id="btnAll">Highlight all</button>
-    <button id="btnClear">Clear</button>
-    <button id="btnWhite">☀ White Light</button>
-    <button id="btnRecalibrate" title="Stop perception, project dot grid, re-solve homography, restart.">⟳ Re-calibrate</button>
-    <button id="btnUnhide" style="display:none;">Unhide all</button>
+    <button id="btnPause" class="primary" title="Freeze/resume tracking. While paused the projector keeps showing the last frame's washes but perception stops detecting new objects.">⏸ Pause</button>
+    <button id="btnAll" title="Illuminate every visible object on the wall at once.">Highlight all</button>
+    <button id="btnClear" title="Turn off all projector washes.">Clear</button>
+    <button id="btnWhite" title="Project a solid white frame — useful for checking projector coverage and for ambient room light.">☀ White Light</button>
+    <button id="btnRecalibrate" title="Stop perception, project the ArUco calibration grid, re-solve the camera→projector homography, then restart. Use after moving the camera or projector.">⟳ Re-calibrate</button>
+    <button id="btnUnhide" style="display:none;" title="Bring back any objects you previously hid with the ✕ button.">Unhide all</button>
   </div>
   <div class="meta"><span id="frameTimings">…</span></div>
 </header>
