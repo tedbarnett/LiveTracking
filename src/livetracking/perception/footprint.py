@@ -27,6 +27,48 @@ from livetracking.paths import (
 )
 
 
+def _measured_footprint_mask(
+    cam_w: int, cam_h: int, measured_path: str
+) -> Optional[np.ndarray]:
+    """Load the measured projector-footprint PNG (full-white minus full-black
+    diff captured during calibration) and return it as a uint8 {0,1} mask
+    sized to (cam_h, cam_w). This is the GROUND TRUTH of where the projector
+    actually lands light — preferred over any homography-based estimate.
+    """
+    if not os.path.exists(measured_path):
+        return None
+    img = cv2.imread(measured_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None
+    if img.shape != (cam_h, cam_w):
+        img = cv2.resize(img, (cam_w, cam_h), interpolation=cv2.INTER_NEAREST)
+    mask = (img > 127).astype(np.uint8)
+    if mask.sum() < 100:  # sanity: a few-pixel mask is garbage
+        return None
+    return mask
+
+
+def _measured_footprint_outline(
+    cam_w: int, cam_h: int, measured_path: str
+) -> Optional[np.ndarray]:
+    """Extract the outline polyline of the measured footprint as (N, 2) int32."""
+    mask = _measured_footprint_mask(cam_w, cam_h, measured_path)
+    if mask is None:
+        return None
+    contours, _ = cv2.findContours(
+        (mask * 255).astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None
+    biggest = max(contours, key=cv2.contourArea)
+    # Smooth slightly so the polyline isn't pixel-staircase noisy
+    eps = 0.003 * cv2.arcLength(biggest, True)
+    approx = cv2.approxPolyDP(biggest, eps, True)
+    return approx.reshape(-1, 2).astype(np.int32)
+
+
 def _dot_based_footprint_quad(
     cam_w: int, cam_h: int, calib_dir: str = CALIB_DIR
 ) -> Optional[np.ndarray]:
@@ -121,11 +163,15 @@ def footprint_mask_in_camera(
     """Return a uint8 {0,1} mask of the projector footprint in camera space.
 
     Preference order:
-      1. Quadrilateral derived from the actually-measured dot positions.
-         This is the most reliable estimate when the scene is multi-plane
-         (e.g. wall + sofa cushion fronts).
-      2. H-extrapolated quadrilateral (kept as a last-resort fallback).
+      1. Measured footprint PNG (full-white vs full-black diff captured at
+         calibration). Ground truth for where the projector actually lands
+         light across multi-plane scenes.
+      2. Quadrilateral derived from the actually-measured dot positions.
+      3. H-extrapolated quadrilateral (last-resort fallback).
     """
+    measured = _measured_footprint_mask(cam_w, cam_h, measured_path)
+    if measured is not None:
+        return measured
     quad = _dot_based_footprint_quad(cam_w, cam_h)
     if quad is None:
         try:
@@ -147,6 +193,9 @@ def footprint_outline_in_camera(
     measured_path: str = MEASURED_FOOTPRINT_FILE,
 ) -> np.ndarray:
     """Return an (N, 2) int32 polyline tracing the projector footprint."""
+    outline = _measured_footprint_outline(cam_w, cam_h, measured_path)
+    if outline is not None:
+        return outline
     quad = _dot_based_footprint_quad(cam_w, cam_h)
     if quad is not None:
         return quad.astype(np.int32)
