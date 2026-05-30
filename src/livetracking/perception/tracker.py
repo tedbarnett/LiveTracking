@@ -142,31 +142,36 @@ class ObjectTracker:
     _FP_DEPTH_TOL_M = 0.40
 
     def _load_names(self) -> Dict[str, str]:
-        """Load the legacy id -> name map (v1) or by_id sub-dict (v2)."""
+        """Load fingerprint renames (v2). Legacy by_id entries on disk are
+        DISCARDED — see _save_names docstring for the rationale."""
         self._fp_renames: List[dict] = []
         if not os.path.exists(self.names_path):
             return {}
         try:
             with open(self.names_path) as f:
                 data = json.load(f)
-            # v2?
             if isinstance(data, dict) and (
                 "by_id" in data or "by_fingerprint" in data
             ):
                 self._fp_renames = list(data.get("by_fingerprint") or [])
-                return dict(data.get("by_id") or {})
-            # v1 (flat id -> name dict)
-            if isinstance(data, dict):
-                return dict(data)
+                return {}  # discard persisted by_id — see _save_names
+            # v1 flat dict on disk: discard, ids are stale.
         except Exception:
             pass
         return {}
 
     def _save_names(self) -> None:
-        """Save both id-keyed and fingerprint-keyed renames (v2 schema)."""
+        """Save fingerprint-keyed renames (v2 schema).
+
+        We intentionally drop the legacy by_id map from disk: ids are
+        reassigned on every perception restart, so persisting them only
+        creates cross-session name poisoning. The in-memory self._names
+        dict is still used for the current session (so /rename can look
+        up by id) but it is not persisted.
+        """
         os.makedirs(os.path.dirname(self.names_path), exist_ok=True)
         payload = {
-            "by_id": self._names,
+            "by_id": {},  # always empty on disk; kept for schema compat
             "by_fingerprint": self._fp_renames,
         }
         with open(self.names_path, "w") as f:
@@ -393,14 +398,19 @@ class ObjectTracker:
                     new_id = self._next_id
                     self._next_id += 1
                     color = PALETTE[(new_id - 1) % len(PALETTE)]
-                    # Prefer a fingerprint-matched name (persists across
-                    # perception restarts where ids get reassigned).
+                    # Fingerprint-matched name (label + cam_xy + depth)
+                    # is the ONLY cross-restart name source. The legacy
+                    # by_id map is intentionally NOT consulted here — ids
+                    # are reassigned from 1 on every restart, so trusting
+                    # by_id[new_id] would stamp last session's name onto
+                    # whatever fresh object happens to land at that id
+                    # (e.g. "Ted's guitar" appearing on a poster).
                     fp_name = self._lookup_fingerprint_name(
                         cand.last_label or "",
                         cand.last_centroid,
                         cand.last_depth_m,
                     )
-                    saved_name = fp_name or self._names.get(str(new_id))
+                    saved_name = fp_name
                     obj = DetectedObject(
                         object_id=new_id,
                         name=saved_name or cand.last_label or f"object {new_id}",
