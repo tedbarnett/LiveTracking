@@ -61,9 +61,26 @@ class PipelineConfig:
     # wall behind every object; for objects sitting in front of the wall we
     # shift their camera-space mask before warping so the projector hits the
     # object itself, not its shadow on the wall.
+    #
+    # Geometry: camera and projector are separated by a horizontal baseline
+    # B (projector RIGHT of camera in the current rig). For a point on the
+    # wall, H is exact. For a point at depth z_obj < z_wall the projector
+    # pixel that hits the WALL along the camera ray sits to the RIGHT of
+    # the projector pixel that would hit the OBJECT, by approximately
+    #     Δx_proj  ≈  f_proj * B * (1/z_obj − 1/z_wall)
+    # so we shift the warped projector mask LEFT (negative x) by that
+    # amount. We lump (f_proj * B) into a single tunable constant
+    # `parallax_k_px_m` (pixels · meters); default 1200 ≈ f_proj ~3000 px *
+    # B ~0.40 m (effective; tune live with LIVETRACKING_PARALLAX_K).
+    # `parallax_sign` sets the baseline direction: +1 for projector right
+    # of camera (default, shifts wash RIGHTWARD in projector pixels for
+    # near objects -- pulls wash from the wall-shadow back onto the
+    # object), -1 for projector left of camera.
+    # `parallax_scale` is a final multiplier for live tuning.
     parallax_compensate: bool = True
     parallax_sign: float = 1.0
     parallax_scale: float = 1.0
+    parallax_k_px_m: float = 1200.0
 
     # Wall-plane depth gating. Drop SAM masks whose median depth is more
     # than this many meters DEEPER than the calibrated wall plane at the
@@ -260,18 +277,152 @@ class Pipeline:
         timings["sam_n"] = len(sam_out)
 
         # Stage D: each (det, sam_mask) -> FreshDetection if it survives
-        # area + wall-depth gates.
+        # area + wall-depth gates + mask-quality cleanup.
         fresh: List[FreshDetection] = []
+        # Track which (label, bbox) won the same-label NMS round.
+        _winners: List[Tuple[str, Tuple[int, int, int, int], int]] = []
         for det, (cam_mask, _sam_score) in zip(kept, sam_out):
-            # Clip to footprint.
+            _lbl = det.get("label", "")
+            _bx, _by, _bw, _bh = det["bbox"]
+            _trace = (f"  lbl='{_lbl}' score={det['score']:.2f} "
+                      f"dino_bbox=[{int(_bx)},{int(_by)},"
+                      f"{int(_bw)}x{int(_bh)}] sam_raw={int((cam_mask>0).sum())}")
+            def _log(msg):
+                try:
+                    p = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.dirname(
+                            os.path.dirname(os.path.abspath(__file__))))),
+                        "runtime", "logs", "detection_trace.log")
+                    os.makedirs(os.path.dirname(p), exist_ok=True)
+                    with open(p, "a", encoding="utf-8") as f:
+                        f.write(msg + "\n")
+                except Exception:
+                    pass
+            # Clip to footprint AND to a small expansion of the DINO bbox.
+            # SAM is generous and routinely leaks beyond DINO's box --
+            # but DINO's box is the *signal* about what was actually
+            # detected. Anything outside bbox*1.5 around its center is
+            # almost always a leak onto a neighbor (the drum mask
+            # creeping onto the cushion behind it).
+            bx, by, bw_, bh_ = det["bbox"]
+            cxb = bx + bw_ * 0.5
+            cyb = by + bh_ * 0.5
+            ew = bw_ * 0.75   # half-extent (1.5x bbox total)
+            eh = bh_ * 0.75
+            x0 = max(0, int(cxb - ew))
+            y0 = max(0, int(cyb - eh))
+            x1 = min(self.cam_w, int(cxb + ew))
+            y1 = min(self.cam_h, int(cyb + eh))
+            bbox_mask = np.zeros_like(self.footprint)
+            bbox_mask[y0:y1, x0:x1] = 255
             cam_mask = cv2.bitwise_and(cam_mask, self.footprint)
+            cam_mask = cv2.bitwise_and(cam_mask, bbox_mask)
             area = int((cam_mask > 0).sum())
             if area < self.cfg.min_obj_area_px:
+                print(_trace + f" -> DROP bbox_clip area={area}", flush=True)
+                _log(_trace + f" -> DROP bbox_clip area={area}")
                 continue
 
-            # Median depth at the mask.
-            zp = depth_m[(cam_mask > 0) & (depth_m > 0)]
-            med_z = float(np.median(zp)) if zp.size else 0.0
+            # --- Mask-quality cleanup -----------------------------------
+            # Two failure modes the photos showed:
+            #   (a) wall-object label leaks onto closer foreground (Poster
+            #       1609 grabbed half the couch). Pixel depths span a huge
+            #       range; median is misleading.
+            #   (b) right-object label boundary-leaks onto a near neighbor
+            #       (bodhran mask creeping onto the cushion behind it).
+            #       Centroid drifts -> H warps wrong -> projection misses.
+            # Fix: depth-band the mask. Keep only pixels within 0.25 m of
+            # the **mode/median** depth, then morphologically clean it.
+            zp_all = depth_m[(cam_mask > 0) & (depth_m > 0)]
+            if zp_all.size < 50:
+                # Too little depth signal to trust; fall back to raw mask.
+                med_z = float(np.median(zp_all)) if zp_all.size else 0.0
+            else:
+                med_z0 = float(np.median(zp_all))
+                # Depth-band: drop mask pixels too far from median depth.
+                z_band = 0.25  # meters
+                depth_keep = ((cam_mask > 0)
+                              & (depth_m > med_z0 - z_band)
+                              & (depth_m < med_z0 + z_band))
+                cleaned = depth_keep.astype(np.uint8) * 255
+                # Morph open to break leak tendrils, then close to seal
+                # small holes punched by depth noise.
+                k3 = np.ones((3, 3), np.uint8)
+                cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, k3,
+                                           iterations=2)
+                cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k3,
+                                           iterations=1)
+                # Keep only the largest connected component -- a
+                # boundary-leak that survived open/close is usually a
+                # separate blob clinging to the real object.
+                n_lbl, lbl_img, stats, _ = cv2.connectedComponentsWithStats(
+                    cleaned, connectivity=8)
+                if n_lbl > 1:
+                    # Skip background label 0.
+                    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                    cleaned = ((lbl_img == largest).astype(np.uint8) * 255)
+                area2 = int((cleaned > 0).sum())
+                # If cleanup ate too much of the mask the SAM mask was
+                # garbage -- drop the whole detection.
+                if area2 < max(self.cfg.min_obj_area_px, area // 4):
+                    _log(_trace + f" -> DROP depth_clean pre={area} post={area2} med_z={med_z0:.2f}")
+                    continue
+                cam_mask = cleaned
+                zp_clean = depth_m[(cam_mask > 0) & (depth_m > 0)]
+                med_z = (float(np.median(zp_clean)) if zp_clean.size
+                         else med_z0)
+                area = area2
+
+            # --- Sanity gates -------------------------------------------
+            # Frame-fraction cap: anything covering > 25% of the frame is
+            # almost certainly a leak across multiple objects.
+            if area > 0.25 * self.cam_w * self.cam_h:
+                _log(_trace + f" -> DROP frame_frac area={area}")
+                continue
+            # Aspect-ratio cap for "poster|map|frame|painting|sign" labels:
+            # phantom seam strips between two real posters are very tall +
+            # narrow.
+            ys_chk, xs_chk = np.where(cam_mask > 0)
+            if ys_chk.size:
+                bw = int(xs_chk.max() - xs_chk.min() + 1)
+                bh = int(ys_chk.max() - ys_chk.min() + 1)
+                aspect = max(bw, bh) / max(1, min(bw, bh))
+                dlbl = det.get("label", "").lower()
+                if aspect > 4.0 and any(w in dlbl for w in
+                                        ("poster", "map", "frame",
+                                         "painting", "sign", "picture")):
+                    _log(_trace + f" -> DROP aspect={aspect:.1f}")
+                    continue
+                det_bbox_xywh = (int(xs_chk.min()), int(ys_chk.min()),
+                                 bw, bh)
+            else:
+                _log(_trace + " -> DROP empty_post_clean")
+                continue
+
+            # Same-label NMS on the post-cleanup bbox: among detections
+            # sharing a label word, drop later (lower-score) bboxes that
+            # overlap a kept one with IoU > 0.30.
+            dlbl_words = set(det.get("label", "").lower().split())
+            dropped_by_nms = False
+            for (wlbl, wbbox, _) in _winners:
+                if not (dlbl_words & set(wlbl.split())):
+                    continue
+                x, y, w, h = det_bbox_xywh
+                kx, ky, kw, kh = wbbox
+                ix0 = max(x, kx); iy0 = max(y, ky)
+                ix1 = min(x + w, kx + kw); iy1 = min(y + h, ky + kh)
+                iw = max(0, ix1 - ix0); ih2 = max(0, iy1 - iy0)
+                inter = iw * ih2
+                union = w * h + kw * kh - inter
+                if union > 0 and inter / union > 0.30:
+                    dropped_by_nms = True
+                    break
+            if dropped_by_nms:
+                _log(_trace + " -> DROP same_label_nms")
+                continue
+            _winners.append((det.get("label", "").lower(),
+                             det_bbox_xywh, area))
+            _log(_trace + f" -> KEEP area={area} z={med_z:.2f}")
 
             # Wall-depth gate: drop masks that sit BEHIND the wall plane.
             # (Objects in a doorway / mirror / through-window detections.)
@@ -324,31 +475,44 @@ class Pipeline:
         if ys_m.size == 0:
             return None, None
 
-        cam_for_warp = cam_mask
+        # INTER_LINEAR + re-threshold gives smooth, anti-aliased
+        # projector-mask edges instead of the pixel staircases that
+        # INTER_NEAREST produces on diagonals.
+        proj_mask = cv2.warpPerspective(
+            cam_mask, self.H,
+            (self.cfg.proj_w, self.cfg.proj_h),
+            flags=cv2.INTER_LINEAR,
+        )
+        _, proj_mask = cv2.threshold(proj_mask, 127, 255, cv2.THRESH_BINARY)
+
+        # Constant baseline parallax shift in PROJECTOR pixels. Applied
+        # AFTER warpPerspective because the parallax error is a property
+        # of the camera-projector baseline in the projector's view, not a
+        # radial scaling around the camera's principal point (the old
+        # cam-space (cx_m - cx) * (z_wall-z_obj)/z_wall formula zeroed
+        # out for centered objects like the bodhran -- the bug we just
+        # fixed).
         if (self.cfg.parallax_compensate
                 and self.wall_plane is not None
                 and med_z > 0.1):
             cx_m = float(xs_m.mean()); cy_m = float(ys_m.mean())
             z_wall = self._wall_z_at(cx_m, cy_m)
-            if z_wall > 0.1:
-                base = (z_wall - med_z) / z_wall
-                eff = (self.cfg.parallax_sign
-                       * self.cfg.parallax_scale * base)
-                shift_x = (cx_m - cx) * eff
-                shift_y = (cy_m - cy) * eff
-                if abs(shift_x) > 0.5 or abs(shift_y) > 0.5:
+            if z_wall > 0.1 and med_z < z_wall - 0.05:
+                disparity = (1.0 / med_z) - (1.0 / z_wall)  # 1/m, positive
+                shift_x = (self.cfg.parallax_sign
+                           * self.cfg.parallax_scale
+                           * self.cfg.parallax_k_px_m
+                           * disparity)
+                if abs(shift_x) > 0.5:
                     M = np.array([[1.0, 0.0, shift_x],
-                                  [0.0, 1.0, shift_y]], dtype=np.float32)
-                    cam_for_warp = cv2.warpAffine(
-                        cam_mask, M, (self.cam_w, self.cam_h),
-                        flags=cv2.INTER_NEAREST, borderValue=0,
+                                  [0.0, 1.0, 0.0]], dtype=np.float32)
+                    proj_mask = cv2.warpAffine(
+                        proj_mask, M,
+                        (self.cfg.proj_w, self.cfg.proj_h),
+                        flags=cv2.INTER_LINEAR, borderValue=0,
                     )
-
-        proj_mask = cv2.warpPerspective(
-            cam_for_warp, self.H,
-            (self.cfg.proj_w, self.cfg.proj_h),
-            flags=cv2.INTER_NEAREST,
-        )
+                    _, proj_mask = cv2.threshold(
+                        proj_mask, 127, 255, cv2.THRESH_BINARY)
         if not proj_mask.any():
             return None, None
         py, px = np.where(proj_mask > 0)

@@ -214,5 +214,6 @@ runtime/                    # H.npy, wall_plane.npy, calib.json, masks, logs (gi
 | `LIVETRACKING_RS_EXPOSURE` | RealSense color exposure (locked) | `700` |
 | `LIVETRACKING_WEB_UI_PORT` | Flask port | `5070` |
 | `LIVETRACKING_PARALLAX_COMPENSATE` | Enable per-object parallax shift before warp (`0`/`false` to disable) | `1` |
-| `LIVETRACKING_PARALLAX_SIGN` | Direction of the parallax shift. `+1` for projector right of camera, `-1` for projector left of camera. | `1.0` |
-| `LIVETRACKING_PARALLAX_SCALE` | Multiplier on the geometric parallax magnitude. `1.0` = textbook formula. Crank to `1.2` if washes still lag the object, or `0.8` if they overshoot. | `1.0` |
+| `LIVETRACKING_PARALLAX_SIGN` | Baseline direction. `+1` = projector RIGHT of camera (default, shifts mask RIGHT in projector pixels for near objects); `-1` = projector LEFT of camera. | `+1.0` |
+| `LIVETRACKING_PARALLAX_SCALE` | Final multiplier on the parallax shift (live tuning). | `1.0` |
+| `LIVETRACKING_PARALLAX_K` | Effective `f_proj · B` in pixels·meters. Shift in projector pixels = `sign · scale · K · (1/z_obj − 1/z_wall)`. Tuned live; current default sized to ~4" of correction at 1 m off the wall on the JMGO. | `1200.0` |

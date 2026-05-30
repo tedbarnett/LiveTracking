@@ -62,14 +62,31 @@ def _render_annotated(
     cv2.polylines(out, [fp_corners.astype(np.int32)], True, (0, 255, 255), 2)
     for o in objects:
         col = o.color_rgb
-        contours, _ = cv2.findContours(o.cam_mask, cv2.RETR_EXTERNAL,
+        # Smooth the mask before contour extraction so frame-to-frame
+        # pixel-step noise on the SAM boundary doesn't drive jitter.
+        # o.cam_mask is uint8 with values {0,1}; normalize to {0,255}
+        # first so the Gaussian + threshold actually has signal.
+        m = (o.cam_mask > 0).astype(np.uint8) * 255
+        m = cv2.GaussianBlur(m, (0, 0), sigmaX=2.0)
+        _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(out, contours, -1, col, 3)
+        smoothed = []
+        for c in contours:
+            if len(c) < 4:
+                smoothed.append(c)
+                continue
+            eps = 0.004 * cv2.arcLength(c, True)
+            smoothed.append(cv2.approxPolyDP(c, eps, True))
+        cv2.drawContours(out, smoothed, -1, col, 2, cv2.LINE_AA)
         cx, cy = int(o.centroid_cam[0]), int(o.centroid_cam[1])
-        cv2.circle(out, (cx, cy), 22, (0, 0, 0), -1)
-        cv2.circle(out, (cx, cy), 22, col, 2)
-        cv2.putText(out, str(o.object_id), (cx - 10, cy + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        # Smaller preview number badge (~half prior size) to reduce
+        # visual clutter in the web preview.
+        cv2.circle(out, (cx, cy), 12, (0, 0, 0), -1)
+        cv2.circle(out, (cx, cy), 12, col, 1)
+        cv2.putText(out, str(o.object_id), (cx - 6, cy + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1,
+                    cv2.LINE_AA)
     return out
 
 
@@ -117,8 +134,12 @@ class PerceptionDaemon:
         env_scale = os.environ.get("LIVETRACKING_PARALLAX_SCALE")
         if env_scale:
             cfg.parallax_scale = float(env_scale)
+        env_k = os.environ.get("LIVETRACKING_PARALLAX_K")
+        if env_k:
+            cfg.parallax_k_px_m = float(env_k)
         print(f"[perception] parallax: compensate={cfg.parallax_compensate} "
-              f"sign={cfg.parallax_sign} scale={cfg.parallax_scale}")
+              f"sign={cfg.parallax_sign} scale={cfg.parallax_scale} "
+              f"k_px_m={cfg.parallax_k_px_m}")
         self.pipeline = Pipeline(
             H, cw, ch, cfg
         )
@@ -202,6 +223,7 @@ class PerceptionDaemon:
             self.proj_push.send_json({
                 "type": "highlight",
                 "id": obj_id,
+                "name": target.name,
                 "color": list(target.color_rgb),
                 "proj_centroid": (
                     list(target.centroid_proj) if target.centroid_proj else None
@@ -232,6 +254,7 @@ class PerceptionDaemon:
             self.proj_push.send_json({
                 "type": "highlight",
                 "id": obj_id,
+                "name": target.name,
                 "color": list(target.color_rgb),
                 "proj_centroid": (list(target.centroid_proj)
                                   if target.centroid_proj else None),
@@ -355,6 +378,7 @@ class PerceptionDaemon:
                 "objects": [
                     {
                         "id": o.object_id,
+                        "name": o.name,
                         "color": list(o.color_rgb),
                         "proj_centroid": (list(o.centroid_proj)
                                           if o.centroid_proj else None),
