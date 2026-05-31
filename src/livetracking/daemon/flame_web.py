@@ -367,6 +367,75 @@ def create_app() -> Flask:
     def hidden_list():
         return jsonify(_send_ctrl({"cmd": "hidden_list"}))
 
+    @app.route("/detector", methods=["GET"])
+    def detector_get():
+        """Return both the persisted selection and the running daemon's
+        selection. They differ briefly during a restart."""
+        from livetracking.perception.recognize import (
+            VALID_DETECTORS, read_active_detector,
+        )
+        persisted = read_active_detector()
+        live = _send_ctrl({"cmd": "detector_info"}, timeout_ms=1500)
+        return jsonify({
+            "ok": True,
+            "persisted": persisted,
+            "live": (live.get("detector") if live.get("ok") else None),
+            "choices": list(VALID_DETECTORS),
+        })
+
+    @app.route("/detector", methods=["POST"])
+    def detector_set():
+        """Persist a new detector choice and restart the perception task."""
+        from livetracking.perception.recognize import (
+            VALID_DETECTORS, read_active_detector, write_active_detector,
+        )
+        data = request.get_json(silent=True) or {}
+        name = str(data.get("detector", "")).lower()
+        if name not in VALID_DETECTORS:
+            return jsonify({
+                "ok": False,
+                "reason": f"detector must be one of {list(VALID_DETECTORS)}",
+            }), 400
+        current = read_active_detector()
+        if name == current:
+            return jsonify({
+                "ok": True, "detector": name, "restarted": False,
+                "reason": "already active",
+            })
+        try:
+            write_active_detector(name)
+        except Exception as e:
+            return jsonify({"ok": False, "reason": repr(e)}), 500
+        # Bounce the perception task. /end then /run; if /end fails (e.g.
+        # task wasn't running) we still try /run so we end up in the right
+        # state. The task itself loads runtime/active_detector.json on
+        # startup, so by the time it's back up it has the new backend.
+        try:
+            subprocess.run(
+                ["schtasks", "/end", "/tn", "LiveTrackingPerception"],
+                capture_output=True, text=True, timeout=10,
+            )
+            time.sleep(2)
+            r = subprocess.run(
+                ["schtasks", "/run", "/tn", "LiveTrackingPerception"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0:
+                return jsonify({
+                    "ok": False,
+                    "detector": name,
+                    "restarted": False,
+                    "reason": (r.stdout + r.stderr).strip()[-400:],
+                })
+        except Exception as e:
+            return jsonify({
+                "ok": False,
+                "detector": name,
+                "restarted": False,
+                "reason": repr(e),
+            })
+        return jsonify({"ok": True, "detector": name, "restarted": True})
+
     @app.route("/healthz")
     def healthz():
         return jsonify({

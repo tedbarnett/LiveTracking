@@ -1,20 +1,44 @@
-"""Stage 2: open-vocabulary recognition + clean masks via SAM 2 + Grounding DINO.
+"""Stage 2: open/closed-vocab recognition + clean masks via SAM 2.
 
-Inputs from Stage 1: a list of Blob objects (with cam_mask, centroid, bbox).
-Outputs: a list of DetectedObject — clean SAM-refined masks and DINO labels.
+We offer three interchangeable *detector* backends, all paired with SAM 2 for
+segmentation so the rest of the pipeline (mask cleanup, depth band, parallax
+warp, tracker) is detector-agnostic:
 
-Models (all auto-downloaded from HuggingFace on first use, cached in ~/.cache/huggingface):
-  - SAM 2.1 Hiera-Large  via `transformers` Sam2Model
-      checkpoint: facebook/sam2.1-hiera-large
-  - Grounding DINO Tiny  via `transformers` AutoModelForZeroShotObjectDetection
-      checkpoint: IDEA-Research/grounding-dino-tiny
+  - DinoRecognizer        — Grounding DINO Tiny (open-vocab text prompt)
+                            via transformers; the original backend.
+  - YoloRecognizer        — Ultralytics YOLO11n (closed-vocab, COCO 80) —
+                            very fast, no posters / bodhran / drum-frame.
+  - MediapipeRecognizer   — MediaPipe Object Detector EfficientDet-Lite0
+                            (closed-vocab, COCO 80) — fast on CPU, same
+                            blind spots as YOLO.
 
-Heavy imports (torch, transformers) are lazy so importing this module doesn't
-slow down lightweight CLI work that only needs Stage 1.
+All three implement the same public surface used by `pipeline.Pipeline`:
+
+    label_image(color_bgr, prompt=..., box_threshold=..., text_threshold=...)
+        -> List[{"label": str, "score": float, "bbox": (x, y, w, h)}]
+    segment_with_points(color_bgr, points)
+        -> List[(mask_uint8, score)]   # uint8 {0,255}, camera-space
+
+`prompt`, `box_threshold`, `text_threshold` are honored by DINO and ignored
+(silently) by YOLO/MediaPipe.
+
+Pick a backend with:
+
+    rec = create_recognizer("dino" | "yolo" | "mediapipe")
+
+The active backend is persisted in `runtime/active_detector.json` and read
+by the perception daemon at startup. The web UI's detector dropdown writes
+that file and then restarts the perception task.
+
+Heavy imports (torch, transformers, ultralytics, mediapipe) are deferred
+to first instantiation so importing this module is cheap.
 """
 from __future__ import annotations
 
+import json
+import os
 import time
+import urllib.request
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -34,32 +58,73 @@ DEFAULT_DINO_PROMPT = (
     "ball. toy. blanket. towel. shoe. object."
 )
 
+VALID_DETECTORS = ("dino", "yolo", "mediapipe")
+DEFAULT_DETECTOR = "dino"
+
+
+def _runtime_dir() -> str:
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))),
+        "runtime",
+    )
+
+
+def _active_detector_path() -> str:
+    return os.path.join(_runtime_dir(), "active_detector.json")
+
+
+def read_active_detector() -> str:
+    """Read the currently-selected detector name from disk.
+
+    Returns DEFAULT_DETECTOR if the file is missing, malformed, or names
+    an unknown backend.
+    """
+    path = _active_detector_path()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        name = str(data.get("detector", DEFAULT_DETECTOR)).lower()
+        if name in VALID_DETECTORS:
+            return name
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return DEFAULT_DETECTOR
+
+
+def write_active_detector(name: str) -> None:
+    name = name.lower()
+    if name not in VALID_DETECTORS:
+        raise ValueError(f"unknown detector {name!r}; choices: {VALID_DETECTORS}")
+    path = _active_detector_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"detector": name}, f, indent=2)
+
 
 @dataclass
 class RecognitionResult:
     sam_mask_cam: np.ndarray          # uint8 {0,255}, camera-space, refined mask
-    label: str                        # best DINO label
+    label: str                        # best detector label
     label_score: float                # 0..1
     sam_score: float                  # SAM's own quality score
     source_blob_id: int
 
 
-class Recognizer:
-    """Loads SAM2 + Grounding DINO once, then segments+labels on demand."""
+# =========================================================================
+# Base: SAM2 segmentation (shared by all three detector backends).
+# =========================================================================
+class _BaseRecognizer:
+    """Loads SAM2 once; subclasses add their own detector for `label_image`."""
 
     def __init__(
         self,
         sam_checkpoint: str = "facebook/sam2.1-hiera-large",
-        dino_checkpoint: str = "IDEA-Research/grounding-dino-tiny",
         device: Optional[str] = None,
         dtype: str = "float16",
     ):
         import torch                                    # heavy import deferred
-        from transformers import (                       # noqa: F401
-            AutoProcessor,
-            AutoModelForZeroShotObjectDetection,
-            Sam2Model,
-        )
+        from transformers import AutoProcessor, Sam2Model
 
         self._torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -72,15 +137,6 @@ class Recognizer:
         self.sam_model.eval()
         print(f"[recognize] SAM2 loaded in {time.perf_counter()-t0:.1f}s")
 
-        print(f"[recognize] loading Grounding DINO ({dino_checkpoint})...")
-        t0 = time.perf_counter()
-        self.dino_processor = AutoProcessor.from_pretrained(dino_checkpoint)
-        self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
-            dino_checkpoint
-        ).to(self.device)
-        self.dino_model.eval()
-        print(f"[recognize] DINO loaded in {time.perf_counter()-t0:.1f}s")
-
     @property
     def torch(self):
         return self._torch
@@ -89,20 +145,13 @@ class Recognizer:
     def segment_with_points(
         self, color_bgr: np.ndarray, points_cam: List[Tuple[float, float]]
     ) -> List[Tuple[np.ndarray, float]]:
-        """For each (x, y) point in camera pixels, return (mask uint8, score).
-
-        Internally batched: all points are sent to SAM2 in a single forward
-        pass (one object per point), so cost scales much better than the old
-        per-point Python loop. ~600 ms for 16 points on a 5090, vs ~7 s if
-        looped.
-        """
+        """For each (x, y) point in camera pixels, return (mask uint8, score)."""
         torch = self._torch
         if not points_cam:
             return []
         rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
-        # Shape (B=1, N_obj=len(points), N_pts=1, 2)
         input_points = [[[[float(px), float(py)]] for (px, py) in points_cam]]
-        input_labels = [[[1] for _ in points_cam]]  # 1 = foreground
+        input_labels = [[[1] for _ in points_cam]]
         inputs = self.sam_processor(
             images=rgb, input_points=input_points, input_labels=input_labels,
             return_tensors="pt",
@@ -112,9 +161,8 @@ class Recognizer:
         masks = self.sam_processor.post_process_masks(
             outputs.pred_masks.cpu(),
             inputs["original_sizes"].cpu(),
-        )[0]  # (N_obj, N_masks, H, W) bool
-        # iou_scores: (B, N_obj, N_masks)
-        scores_all = outputs.iou_scores[0].cpu().numpy()  # (N_obj, N_masks)
+        )[0]
+        scores_all = outputs.iou_scores[0].cpu().numpy()
         results: List[Tuple[np.ndarray, float]] = []
         for i in range(len(points_cam)):
             scores = scores_all[i]
@@ -135,24 +183,6 @@ class Recognizer:
         max_area_frac: float = 0.85,
         min_area_px: int = 800,
     ) -> List[Tuple[np.ndarray, float]]:
-        """Split a single Stage-1 mega-blob into per-object sub-masks.
-
-        Generates a grid_n x grid_n grid of point prompts inside ``bbox_xywh``,
-        filters points to those lying inside ``parent_mask`` (so we don't
-        waste SAM forwards on background pixels), runs SAM2 in one batched
-        forward, then dedupes the resulting masks by IoU > ``dedupe_iou``.
-
-        Heuristics applied to suppress SAM's typical failure modes:
-          * Drop masks whose area is > ``max_area_frac`` of the parent — that's
-            SAM "expanding to the whole couch" when no clear sub-object is at
-            that point.
-          * Drop masks with area < ``min_area_px`` (noise).
-          * Drop masks below ``score_thresh`` (low SAM confidence).
-          * Greedy NMS: keep highest-score mask first, drop later masks whose
-            IoU vs any kept mask exceeds ``dedupe_iou``.
-
-        Returns [(uint8 mask, sam_score), ...] in score-descending order.
-        """
         x, y, w, h = bbox_xywh
         if w <= 0 or h <= 0:
             return []
@@ -160,8 +190,6 @@ class Recognizer:
         parent_area = int((parent_mask > 0).sum()) if parent_mask is not None else (w * h)
         if parent_area <= 0:
             return []
-        # Grid points across the bbox, with inset so we don't sample right on
-        # the boundary where SAM tends to grab the background.
         inset_x = w / (grid_n + 1)
         inset_y = h / (grid_n + 1)
         points: List[Tuple[float, float]] = []
@@ -177,7 +205,6 @@ class Recognizer:
         if not points:
             return []
         raw = self.segment_with_points(color_bgr, points)
-        # Filter by score / area / parent overlap
         candidates: List[Tuple[np.ndarray, float]] = []
         for mask, score in raw:
             if score < score_thresh:
@@ -193,7 +220,6 @@ class Recognizer:
                     continue
             candidates.append((mask, score))
         candidates.sort(key=lambda t: -t[1])
-        # Greedy NMS by IoU
         kept: List[Tuple[np.ndarray, float]] = []
         for mask, score in candidates:
             ok = True
@@ -207,15 +233,76 @@ class Recognizer:
                 kept.append((mask, score))
         return kept
 
-    # ----- Grounding DINO ------------------------------------------------------
+    # ----- detector interface — each subclass overrides label_image ----------
+    def label_image(self, color_bgr: np.ndarray, **kwargs) -> List[dict]:
+        raise NotImplementedError("subclass must implement label_image()")
+
+    # ----- combined (kept for any callers; not used by the live pipeline) ----
+    def recognize(
+        self,
+        color_bgr: np.ndarray,
+        blobs: List[Blob],
+        prompt: str = DEFAULT_DINO_PROMPT,
+    ) -> List[RecognitionResult]:
+        results: List[RecognitionResult] = []
+        if not blobs:
+            return results
+        sam_out = self.segment_with_points(
+            color_bgr, [b.centroid_cam for b in blobs]
+        )
+        dets = self.label_image(color_bgr, prompt=prompt)
+        for blob, (sam_mask, sam_score) in zip(blobs, sam_out):
+            bx, by, bw, bh = _mask_bbox(sam_mask)
+            best_label = "object"
+            best_score = 0.0
+            for det in dets:
+                iou = _bbox_iou((bx, by, bw, bh), det["bbox"])
+                weighted = iou * det["score"]
+                if weighted > best_score:
+                    best_score = weighted
+                    best_label = det["label"] or "object"
+            results.append(RecognitionResult(
+                sam_mask_cam=sam_mask,
+                label=best_label,
+                label_score=best_score,
+                sam_score=sam_score,
+                source_blob_id=blob.blob_id,
+            ))
+        return results
+
+
+# =========================================================================
+# Backend 1: Grounding DINO Tiny (open-vocab via text prompt).
+# =========================================================================
+class DinoRecognizer(_BaseRecognizer):
+    name = "dino"
+
+    def __init__(
+        self,
+        sam_checkpoint: str = "facebook/sam2.1-hiera-large",
+        dino_checkpoint: str = "IDEA-Research/grounding-dino-tiny",
+        device: Optional[str] = None,
+        dtype: str = "float16",
+    ):
+        super().__init__(sam_checkpoint=sam_checkpoint, device=device, dtype=dtype)
+        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+        print(f"[recognize] loading Grounding DINO ({dino_checkpoint})...")
+        t0 = time.perf_counter()
+        self.dino_processor = AutoProcessor.from_pretrained(dino_checkpoint)
+        self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            dino_checkpoint
+        ).to(self.device)
+        self.dino_model.eval()
+        print(f"[recognize] DINO loaded in {time.perf_counter()-t0:.1f}s")
+
     def label_image(
         self,
         color_bgr: np.ndarray,
         prompt: str = DEFAULT_DINO_PROMPT,
         box_threshold: float = 0.25,
         text_threshold: float = 0.25,
+        **_,
     ) -> List[dict]:
-        """Return [{'label': str, 'score': float, 'bbox': (x,y,w,h)}, ...] over the whole image."""
         torch = self._torch
         rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
         inputs = self.dino_processor(
@@ -231,7 +318,6 @@ class Recognizer:
             target_sizes=target_sizes,
         )[0]
         out = []
-        # transformers 5.x returns 'text_labels'; older returns 'labels'.
         label_list = post.get("text_labels", post.get("labels", []))
         for score, label, box in zip(
             post["scores"].cpu().numpy(),
@@ -246,41 +332,181 @@ class Recognizer:
             })
         return out
 
-    # ----- Combined ------------------------------------------------------------
-    def recognize(
+
+# =========================================================================
+# Backend 2: Ultralytics YOLO11n (closed-vocab COCO).
+# =========================================================================
+class YoloRecognizer(_BaseRecognizer):
+    name = "yolo"
+
+    def __init__(
+        self,
+        sam_checkpoint: str = "facebook/sam2.1-hiera-large",
+        yolo_weights: str = "yolo11n.pt",
+        device: Optional[str] = None,
+        dtype: str = "float16",
+    ):
+        super().__init__(sam_checkpoint=sam_checkpoint, device=device, dtype=dtype)
+        from ultralytics import YOLO
+        print(f"[recognize] loading YOLO ({yolo_weights})...")
+        t0 = time.perf_counter()
+        # ultralytics auto-downloads the weight on first use. To keep the
+        # cache scoped to this project, switch CWD into runtime/models for
+        # the load; the file lands there and subsequent loads find it.
+        models_dir = os.path.join(_runtime_dir(), "models")
+        os.makedirs(models_dir, exist_ok=True)
+        target = os.path.join(models_dir, yolo_weights)
+        # If the file already lives in models_dir, load by absolute path.
+        # Otherwise let ultralytics download into models_dir.
+        if os.path.exists(target):
+            self.yolo_model = YOLO(target)
+        else:
+            cwd = os.getcwd()
+            try:
+                os.chdir(models_dir)
+                self.yolo_model = YOLO(yolo_weights)
+            finally:
+                os.chdir(cwd)
+        # Warm the model on a tiny image so first real frame isn't slow.
+        try:
+            self.yolo_model.to(self.device)
+        except Exception:
+            pass
+        print(f"[recognize] YOLO loaded in {time.perf_counter()-t0:.1f}s "
+              f"(device={self.device}, classes={len(self.yolo_model.names)})")
+
+    def label_image(
         self,
         color_bgr: np.ndarray,
-        blobs: List[Blob],
-        prompt: str = DEFAULT_DINO_PROMPT,
-    ) -> List[RecognitionResult]:
-        """Per Stage-1 blob: SAM-segment around its centroid, label via DINO IoU."""
-        results: List[RecognitionResult] = []
-        if not blobs:
-            return results
-        sam_out = self.segment_with_points(
-            color_bgr, [b.centroid_cam for b in blobs]
+        prompt: str = "",
+        box_threshold: float = 0.25,
+        text_threshold: float = 0.25,
+        **_,
+    ) -> List[dict]:
+        # YOLO ignores the text prompt — vocabulary is fixed (COCO 80).
+        # We map box_threshold -> conf so the existing pipeline knob still
+        # has an effect.
+        rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        results = self.yolo_model.predict(
+            rgb, conf=float(box_threshold), device=self.device,
+            verbose=False,
         )
-        dino_dets = self.label_image(color_bgr, prompt=prompt)
+        out: List[dict] = []
+        if not results:
+            return out
+        r = results[0]
+        names = r.names  # dict[int -> str]
+        if r.boxes is None or r.boxes.xyxy is None:
+            return out
+        xyxy = r.boxes.xyxy.cpu().numpy()
+        confs = r.boxes.conf.cpu().numpy()
+        clss = r.boxes.cls.cpu().numpy().astype(int)
+        for (x0, y0, x1, y1), conf, c in zip(xyxy, confs, clss):
+            out.append({
+                "label": str(names.get(int(c), f"class_{int(c)}")),
+                "score": float(conf),
+                "bbox": (int(x0), int(y0), int(x1 - x0), int(y1 - y0)),
+            })
+        return out
 
-        for blob, (sam_mask, sam_score) in zip(blobs, sam_out):
-            # Assign label by best IoU between sam_mask bbox and any DINO bbox
-            bx, by, bw, bh = _mask_bbox(sam_mask)
-            best_label = "object"
-            best_score = 0.0
-            for det in dino_dets:
-                iou = _bbox_iou((bx, by, bw, bh), det["bbox"])
-                weighted = iou * det["score"]
-                if weighted > best_score:
-                    best_score = weighted
-                    best_label = det["label"] or "object"
-            results.append(RecognitionResult(
-                sam_mask_cam=sam_mask,
-                label=best_label,
-                label_score=best_score,
-                sam_score=sam_score,
-                source_blob_id=blob.blob_id,
-            ))
-        return results
+
+# =========================================================================
+# Backend 3: MediaPipe Object Detector EfficientDet-Lite0 (closed-vocab COCO).
+# =========================================================================
+_MP_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/object_detector/"
+    "efficientdet_lite0/float32/1/efficientdet_lite0.tflite"
+)
+
+
+class MediapipeRecognizer(_BaseRecognizer):
+    name = "mediapipe"
+
+    def __init__(
+        self,
+        sam_checkpoint: str = "facebook/sam2.1-hiera-large",
+        mp_model_url: str = _MP_MODEL_URL,
+        device: Optional[str] = None,
+        dtype: str = "float16",
+    ):
+        super().__init__(sam_checkpoint=sam_checkpoint, device=device, dtype=dtype)
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_py
+        from mediapipe.tasks.python import vision as mp_vision
+
+        models_dir = os.path.join(_runtime_dir(), "models")
+        os.makedirs(models_dir, exist_ok=True)
+        model_path = os.path.join(models_dir, "efficientdet_lite0.tflite")
+        if not os.path.exists(model_path):
+            print(f"[recognize] downloading MediaPipe model -> {model_path}")
+            urllib.request.urlretrieve(mp_model_url, model_path)
+
+        print(f"[recognize] loading MediaPipe ObjectDetector ({model_path})...")
+        t0 = time.perf_counter()
+        base_opts = mp_py.BaseOptions(model_asset_path=model_path)
+        # MediaPipe's TFLite delegate is CPU by default; GPU delegate
+        # requires extra build flags on Windows, so leave it on CPU.
+        opts = mp_vision.ObjectDetectorOptions(
+            base_options=base_opts,
+            running_mode=mp_vision.RunningMode.IMAGE,
+            score_threshold=0.25,
+            max_results=50,
+        )
+        self.mp_module = mp
+        self.mp_detector = mp_vision.ObjectDetector.create_from_options(opts)
+        print(f"[recognize] MediaPipe loaded in {time.perf_counter()-t0:.1f}s")
+
+    def label_image(
+        self,
+        color_bgr: np.ndarray,
+        prompt: str = "",
+        box_threshold: float = 0.25,
+        text_threshold: float = 0.25,
+        **_,
+    ) -> List[dict]:
+        mp = self.mp_module
+        rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = self.mp_detector.detect(mp_image)
+        out: List[dict] = []
+        if not result or not result.detections:
+            return out
+        for det in result.detections:
+            if not det.categories:
+                continue
+            cat = det.categories[0]
+            if cat.score < float(box_threshold):
+                continue
+            bb = det.bounding_box  # origin_x, origin_y, width, height
+            out.append({
+                "label": str(cat.category_name or f"class_{cat.index}"),
+                "score": float(cat.score),
+                "bbox": (int(bb.origin_x), int(bb.origin_y),
+                         int(bb.width), int(bb.height)),
+            })
+        return out
+
+
+# =========================================================================
+# Factory.
+# =========================================================================
+def create_recognizer(name: Optional[str] = None, **kwargs) -> _BaseRecognizer:
+    """Build the recognizer named by `name` (or by runtime/active_detector.json)."""
+    if name is None:
+        name = read_active_detector()
+    name = name.lower()
+    if name == "dino":
+        return DinoRecognizer(**kwargs)
+    if name == "yolo":
+        return YoloRecognizer(**kwargs)
+    if name == "mediapipe":
+        return MediapipeRecognizer(**kwargs)
+    raise ValueError(f"unknown detector {name!r}; choices: {VALID_DETECTORS}")
+
+
+# Back-compat alias: any existing code that says `Recognizer()` still gets
+# DINO (which was the only option before).
+Recognizer = DinoRecognizer
 
 
 # ---- helpers --------------------------------------------------------------

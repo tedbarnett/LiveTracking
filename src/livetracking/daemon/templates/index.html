@@ -53,6 +53,14 @@
   <h1>LiveTracking</h1>
   <div class="controls">
     <button id="btnPause" class="primary" title="Freeze/resume tracking. While paused the projector keeps showing the last frame's washes but perception stops detecting new objects.">⏸ Pause</button>
+    <label style="font-size:12px;color:#aaa;display:flex;align-items:center;gap:4px;" title="Switch the object detector backend. Switching restarts perception (~30 s).">
+      Detector:
+      <select id="detectorSelect" style="background:#222;color:#eee;border:1px solid #444;padding:2px 4px;border-radius:3px;">
+        <option value="dino">DINO (open-vocab)</option>
+        <option value="yolo">YOLO (COCO 80)</option>
+        <option value="mediapipe">MediaPipe (COCO 80)</option>
+      </select>
+    </label>
     <button id="btnAll" title="Illuminate every visible object on the wall at once.">Highlight all</button>
     <button id="btnClear" title="Turn off all projector washes.">Clear</button>
     <button id="btnWhite" title="Project a solid white frame — useful for checking projector coverage and for ambient room light.">☀ White Light</button>
@@ -244,6 +252,56 @@ intensitySlider.addEventListener('change', () => {
     body: JSON.stringify({ value: intensitySlider.value / 100 })
   });
 });
+
+// Detector backend dropdown ---------------------------------------------
+const detectorSelect = document.getElementById('detectorSelect');
+let _detectorInflight = false;
+async function refreshDetector() {
+  try {
+    const r = await fetch('/detector');
+    const j = await r.json();
+    if (!j.ok) return;
+    // Show the *live* daemon value when known, else the persisted value.
+    const cur = j.live || j.persisted;
+    if (cur && detectorSelect.value !== cur && !_detectorInflight) {
+      detectorSelect.value = cur;
+    }
+    // If persisted and live disagree, the daemon is still restarting.
+    if (j.live && j.persisted && j.live !== j.persisted) {
+      detectorSelect.disabled = true;
+      detectorSelect.title = `Switching to ${j.persisted}… (currently still ${j.live})`;
+    } else {
+      detectorSelect.disabled = false;
+      detectorSelect.title = 'Switch the object detector backend. Switching restarts perception (~30 s).';
+    }
+  } catch (e) { /* ignore */ }
+}
+detectorSelect.addEventListener('change', async () => {
+  const choice = detectorSelect.value;
+  if (!confirm(`Switch detector to ${choice}? Perception will restart and be unavailable for ~30 seconds.`)) {
+    refreshDetector();
+    return;
+  }
+  _detectorInflight = true;
+  detectorSelect.disabled = true;
+  try {
+    const r = await fetch('/detector', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ detector: choice }),
+    });
+    const j = await r.json();
+    if (!j.ok) {
+      alert('Detector switch failed: ' + (j.reason || 'unknown'));
+    }
+  } catch (e) {
+    alert('Detector switch failed: ' + e);
+  } finally {
+    _detectorInflight = false;
+  }
+});
+refreshDetector();
+setInterval(refreshDetector, 3000);
 
 function render(payload) {
   const objs = payload.objects || [];

@@ -44,6 +44,7 @@ from livetracking.perception.footprint import (
     load_homography,
 )
 from livetracking.perception.pipeline import Pipeline, PipelineConfig
+from livetracking.perception.recognize import create_recognizer, read_active_detector
 from livetracking.perception.types import DetectedObject
 
 
@@ -140,8 +141,17 @@ class PerceptionDaemon:
         print(f"[perception] parallax: compensate={cfg.parallax_compensate} "
               f"sign={cfg.parallax_sign} scale={cfg.parallax_scale} "
               f"k_px_m={cfg.parallax_k_px_m}")
+
+        # Detector backend: persisted in runtime/active_detector.json.
+        # An env override is honored so we can spin up an alternate detector
+        # without touching the file (mostly useful from a smoke-test shell).
+        detector_name = (os.environ.get("LIVETRACKING_DETECTOR")
+                         or read_active_detector())
+        print(f"[perception] detector backend: {detector_name}")
+        self.detector_name = detector_name
+        recognizer = create_recognizer(detector_name)
         self.pipeline = Pipeline(
-            H, cw, ch, cfg
+            H, cw, ch, cfg, recognizer=recognizer,
         )
         self.fp_corners = footprint_outline_in_camera(H, PW, PH, cw, ch)
 
@@ -396,7 +406,10 @@ class PerceptionDaemon:
             self.paused = False
             return {"ok": True, "paused": False}
         if cmd == "state":
-            return {"ok": True, "paused": self.paused}
+            return {"ok": True, "paused": self.paused,
+                    "detector": getattr(self, "detector_name", "dino")}
+        if cmd == "detector_info":
+            return {"ok": True, "detector": getattr(self, "detector_name", "dino")}
         if cmd == "list":
             with self.pipeline.tracker_lock:
                 act = self.pipeline.tracker.visible()
