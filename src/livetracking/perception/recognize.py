@@ -348,6 +348,21 @@ class YoloRecognizer(_BaseRecognizer):
     ):
         super().__init__(sam_checkpoint=sam_checkpoint, device=device, dtype=dtype)
         from ultralytics import YOLO
+
+        # Workaround for ultralytics 8.4.x + torch nightly (>=2.12dev):
+        # YOLO's first .predict() calls model.fuse() which iterates Conv
+        # layers and does delattr(m, 'bn'). On newer torch, Conv objects
+        # are constructed without a 'bn' attribute, triggering:
+        #   AttributeError: 'Conv' object has no attribute 'bn'
+        # mid-load, which kills the perception daemon. Disable fuse
+        # globally before any YOLO instance is built. Cost: ~1ms/frame
+        # of un-fused BatchNorm — negligible at our scale.
+        try:
+            from ultralytics.nn.tasks import BaseModel
+            BaseModel.fuse = lambda self, verbose=False: self  # noqa: E731
+        except Exception as _e:  # noqa: BLE001
+            print(f"[recognize] WARN: could not patch BaseModel.fuse: {_e}")
+
         print(f"[recognize] loading YOLO ({yolo_weights})...")
         t0 = time.perf_counter()
         # ultralytics auto-downloads the weight on first use. To keep the
