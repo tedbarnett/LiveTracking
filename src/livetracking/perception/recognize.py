@@ -58,8 +58,19 @@ DEFAULT_DINO_PROMPT = (
     "ball. toy. blanket. towel. shoe. object."
 )
 
-VALID_DETECTORS = ("dino", "yolo", "mediapipe")
+VALID_DETECTORS = ("dino", "yolo", "yoloworld", "mediapipe")
 DEFAULT_DETECTOR = "dino"
+
+
+def _prompt_to_classes(prompt: str) -> List[str]:
+    """Convert a DINO-style 'apple. banana. cherry.' prompt into a deduped,
+    lower-cased class list suitable for YOLO-World / open-vocab CLIP heads."""
+    seen: List[str] = []
+    for piece in prompt.replace(",", ".").split("."):
+        s = piece.strip().lower()
+        if s and s not in seen:
+            seen.append(s)
+    return seen
 
 
 def _runtime_dir() -> str:
@@ -426,7 +437,117 @@ class YoloRecognizer(_BaseRecognizer):
 
 
 # =========================================================================
-# Backend 3: MediaPipe Object Detector EfficientDet-Lite0 (closed-vocab COCO).
+# Backend 3: Ultralytics YOLO-World (open-vocab via CLIP text head).
+# =========================================================================
+class YoloWorldRecognizer(_BaseRecognizer):
+    """Open-vocabulary YOLO. Same speed envelope as YOLO + a CLIP text head
+    so we can pass a DINO-style class prompt and have it detect classes
+    that aren't in COCO (guitar, bodhran, poster, ...).
+
+    Implementation notes:
+      * We use `yolov8s-worldv2.pt` (small World v2). On a 5090 it runs at
+        ~15 ms/frame at 848x480. The larger `yolov8x-worldv2.pt` is ~3x
+        slower for marginal recall gains on a room-scale scene.
+      * `set_classes(...)` rebuilds the model's text head; we do it once
+        at __init__ from DEFAULT_DINO_PROMPT (or whatever the pipeline
+        passes via `label_image(prompt=...)` — re-set lazily if it
+        changes).
+      * The ultralytics fuse() bug also bites here; we re-apply the same
+        no-op monkey-patch defensively (YoloRecognizer may or may not
+        have been instantiated first in the same process).
+    """
+    name = "yoloworld"
+
+    def __init__(
+        self,
+        sam_checkpoint: str = "facebook/sam2.1-hiera-large",
+        yolo_weights: str = "yolov8s-worldv2.pt",
+        prompt: str = DEFAULT_DINO_PROMPT,
+        device: Optional[str] = None,
+        dtype: str = "float16",
+    ):
+        super().__init__(sam_checkpoint=sam_checkpoint, device=device, dtype=dtype)
+        from ultralytics import YOLOWorld
+
+        # See YoloRecognizer.__init__ for why this is needed.
+        try:
+            from ultralytics.nn.tasks import BaseModel
+            BaseModel.fuse = lambda self, verbose=False: self  # noqa: E731
+        except Exception as _e:  # noqa: BLE001
+            print(f"[recognize] WARN: could not patch BaseModel.fuse: {_e}")
+
+        print(f"[recognize] loading YOLO-World ({yolo_weights})...")
+        t0 = time.perf_counter()
+        models_dir = os.path.join(_runtime_dir(), "models")
+        os.makedirs(models_dir, exist_ok=True)
+        target = os.path.join(models_dir, yolo_weights)
+        if os.path.exists(target):
+            self.yolow_model = YOLOWorld(target)
+        else:
+            cwd = os.getcwd()
+            try:
+                os.chdir(models_dir)
+                self.yolow_model = YOLOWorld(yolo_weights)
+            finally:
+                os.chdir(cwd)
+        try:
+            self.yolow_model.to(self.device)
+        except Exception:
+            pass
+        self._classes_cached: List[str] = []
+        self._set_classes_from_prompt(prompt)
+        print(f"[recognize] YOLO-World loaded in {time.perf_counter()-t0:.1f}s "
+              f"(device={self.device}, classes={len(self._classes_cached)})")
+
+    def _set_classes_from_prompt(self, prompt: str) -> None:
+        classes = _prompt_to_classes(prompt)
+        if classes == self._classes_cached:
+            return
+        # ultralytics expects a flat list of strings.
+        self.yolow_model.set_classes(classes)
+        self._classes_cached = classes
+
+    def label_image(
+        self,
+        color_bgr: np.ndarray,
+        prompt: str = DEFAULT_DINO_PROMPT,
+        box_threshold: float = 0.05,
+        text_threshold: float = 0.25,
+        **_,
+    ) -> List[dict]:
+        # Re-build text head if the pipeline ever swaps prompt.
+        if prompt:
+            self._set_classes_from_prompt(prompt)
+        rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        # YOLO-World confidence scores are systematically lower than
+        # COCO-YOLO (CLIP-vs-bbox-head differences). Use a much lower
+        # default conf than YoloRecognizer; the pipeline's
+        # min_dino_score still gates downstream.
+        results = self.yolow_model.predict(
+            rgb, conf=float(box_threshold), device=self.device,
+            verbose=False,
+        )
+        out: List[dict] = []
+        if not results:
+            return out
+        r = results[0]
+        names = r.names
+        if r.boxes is None or r.boxes.xyxy is None:
+            return out
+        xyxy = r.boxes.xyxy.cpu().numpy()
+        confs = r.boxes.conf.cpu().numpy()
+        clss = r.boxes.cls.cpu().numpy().astype(int)
+        for (x0, y0, x1, y1), conf, c in zip(xyxy, confs, clss):
+            out.append({
+                "label": str(names.get(int(c), f"class_{int(c)}")),
+                "score": float(conf),
+                "bbox": (int(x0), int(y0), int(x1 - x0), int(y1 - y0)),
+            })
+        return out
+
+
+# =========================================================================
+# Backend 4: MediaPipe Object Detector EfficientDet-Lite0 (closed-vocab COCO).
 # =========================================================================
 _MP_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/object_detector/"
@@ -514,6 +635,8 @@ def create_recognizer(name: Optional[str] = None, **kwargs) -> _BaseRecognizer:
         return DinoRecognizer(**kwargs)
     if name == "yolo":
         return YoloRecognizer(**kwargs)
+    if name == "yoloworld":
+        return YoloWorldRecognizer(**kwargs)
     if name == "mediapipe":
         return MediapipeRecognizer(**kwargs)
     raise ValueError(f"unknown detector {name!r}; choices: {VALID_DETECTORS}")
