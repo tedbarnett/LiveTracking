@@ -53,6 +53,12 @@ class PipelineConfig:
     dino_box_thresh: float = 0.30
     dino_text_thresh: float = 0.25
     min_dino_score: float = 0.30
+    # YOLO-World uses a CLIP text head whose scores run systematically
+    # lower than DINO/COCO-YOLO bbox scores. The same 0.30 cutoff drops
+    # real detections (e.g. guitar at 0.16-0.33 depending on angle), so
+    # YoloWorldRecognizer.label_image overrides box_threshold to this
+    # value and the pipeline overrides min_dino_score too.
+    yoloworld_score_thresh: float = 0.05
 
     # Object viability after SAM.
     min_obj_area_px: int = 800
@@ -238,9 +244,16 @@ class Pipeline:
 
         # Stage A: DINO.
         t = time.perf_counter()
+        # For YOLO-World, override the box threshold and downstream
+        # min-score gate with the CLIP-tuned values (see PipelineConfig).
+        is_yw = getattr(self.recognizer, "name", "") == "yoloworld"
+        box_thresh = (self.cfg.yoloworld_score_thresh if is_yw
+                      else self.cfg.dino_box_thresh)
+        min_score = (self.cfg.yoloworld_score_thresh if is_yw
+                     else self.cfg.min_dino_score)
         dets = self.recognizer.label_image(
             color, prompt=self.cfg.dino_prompt,
-            box_threshold=self.cfg.dino_box_thresh,
+            box_threshold=box_thresh,
             text_threshold=self.cfg.dino_text_thresh,
         )
         timings["dino_ms"] = (time.perf_counter() - t) * 1000.0
@@ -250,7 +263,7 @@ class Pipeline:
         # Stage B: drop low-confidence + outside-footprint.
         kept: List[dict] = []
         for d in dets:
-            if d["score"] < self.cfg.min_dino_score:
+            if d["score"] < min_score:
                 continue
             x, y, w, h = d["bbox"]
             cx_b, cy_b = int(x + w / 2), int(y + h / 2)
@@ -275,6 +288,11 @@ class Pipeline:
         sam_out = self.recognizer.segment_with_points(color, centers)
         timings["sam_ms"] = (time.perf_counter() - t) * 1000.0
         timings["sam_n"] = len(sam_out)
+        # Profile Stage D's per-detection cleanup since it's a known
+        # cost cliff when detector recall ramps up.
+        _t_stageD = time.perf_counter()
+        _prof = {"clip": 0.0, "depthband": 0.0, "morph": 0.0, "cc": 0.0,
+                 "gates": 0.0, "warp": 0.0}
 
         # Stage D: each (det, sam_mask) -> FreshDetection if it survives
         # area + wall-depth gates + mask-quality cleanup.
@@ -288,6 +306,13 @@ class Pipeline:
                       f"dino_bbox=[{int(_bx)},{int(_by)},"
                       f"{int(_bw)}x{int(_bh)}] sam_raw={int((cam_mask>0).sum())}")
             def _log(msg):
+                # Tracing was useful while bringing the pipeline up but
+                # the cumulative cost in production is non-trivial: each
+                # call opens+appends+closes a file, and with ~12 dets/frame
+                # × several log lines each that's >100 sync writes/sec.
+                # Re-enable by setting LIVETRACKING_TRACE=1 in the env.
+                if not os.environ.get("LIVETRACKING_TRACE"):
+                    return
                 try:
                     p = os.path.join(
                         os.path.dirname(os.path.dirname(os.path.dirname(
@@ -313,11 +338,13 @@ class Pipeline:
             y0 = max(0, int(cyb - eh))
             x1 = min(self.cam_w, int(cxb + ew))
             y1 = min(self.cam_h, int(cyb + eh))
+            _ts = time.perf_counter()
             bbox_mask = np.zeros_like(self.footprint)
             bbox_mask[y0:y1, x0:x1] = 255
             cam_mask = cv2.bitwise_and(cam_mask, self.footprint)
             cam_mask = cv2.bitwise_and(cam_mask, bbox_mask)
             area = int((cam_mask > 0).sum())
+            _prof["clip"] += time.perf_counter() - _ts
             if area < self.cfg.min_obj_area_px:
                 print(_trace + f" -> DROP bbox_clip area={area}", flush=True)
                 _log(_trace + f" -> DROP bbox_clip area={area}")
@@ -335,35 +362,31 @@ class Pipeline:
             # the **mode/median** depth, then morphologically clean it.
             zp_all = depth_m[(cam_mask > 0) & (depth_m > 0)]
             if zp_all.size < 50:
-                # Too little depth signal to trust; fall back to raw mask.
                 med_z = float(np.median(zp_all)) if zp_all.size else 0.0
             else:
+                _ts = time.perf_counter()
                 med_z0 = float(np.median(zp_all))
-                # Depth-band: drop mask pixels too far from median depth.
-                z_band = 0.25  # meters
+                z_band = 0.25
                 depth_keep = ((cam_mask > 0)
                               & (depth_m > med_z0 - z_band)
                               & (depth_m < med_z0 + z_band))
                 cleaned = depth_keep.astype(np.uint8) * 255
-                # Morph open to break leak tendrils, then close to seal
-                # small holes punched by depth noise.
+                _prof["depthband"] += time.perf_counter() - _ts
+                _ts = time.perf_counter()
                 k3 = np.ones((3, 3), np.uint8)
                 cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, k3,
                                            iterations=2)
                 cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k3,
                                            iterations=1)
-                # Keep only the largest connected component -- a
-                # boundary-leak that survived open/close is usually a
-                # separate blob clinging to the real object.
+                _prof["morph"] += time.perf_counter() - _ts
+                _ts = time.perf_counter()
                 n_lbl, lbl_img, stats, _ = cv2.connectedComponentsWithStats(
                     cleaned, connectivity=8)
                 if n_lbl > 1:
-                    # Skip background label 0.
                     largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
                     cleaned = ((lbl_img == largest).astype(np.uint8) * 255)
                 area2 = int((cleaned > 0).sum())
-                # If cleanup ate too much of the mask the SAM mask was
-                # garbage -- drop the whole detection.
+                _prof["cc"] += time.perf_counter() - _ts
                 if area2 < max(self.cfg.min_obj_area_px, area // 4):
                     _log(_trace + f" -> DROP depth_clean pre={area} post={area2} med_z={med_z0:.2f}")
                     continue
@@ -435,9 +458,11 @@ class Pipeline:
                     continue
 
             # Warp through H with parallax shift.
+            _ts = time.perf_counter()
             proj_mask, proj_centroid = self._warp_with_parallax_image_first(
                 cam_mask, med_z
             )
+            _prof["warp"] += time.perf_counter() - _ts
             if proj_mask is None:
                 continue
 
@@ -451,6 +476,9 @@ class Pipeline:
             ))
 
         timings["total_ms"] = (time.perf_counter() - t0) * 1000.0
+        timings["stageD_ms"] = (time.perf_counter() - _t_stageD) * 1000.0
+        for k, v in _prof.items():
+            timings[f"d_{k}_ms"] = v * 1000.0
         timings["n_objects"] = len(fresh)
         return fresh, timings
 
@@ -469,29 +497,23 @@ class Pipeline:
     def _warp_with_parallax_image_first(
         self, cam_mask: np.ndarray, med_z: float,
     ) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]]]:
-        """Parallax-shift cam_mask then warp into projector pixels."""
+        """Parallax-shift cam_mask then warp into projector pixels.
+
+        Performance: we fold the parallax x-shift into a single 3x3
+        homography (T · H) so we run cv2.warpPerspective exactly ONCE
+        instead of warpPerspective+warpAffine. Each warp writes the full
+        proj_w × proj_h = 8.3 MP output buffer, so cutting the count in
+        half is worth ~50% of stage-D wall time when many objects are
+        visible. Behaviour is identical to the prior two-step pipeline:
+        T is a 2D translation in projector pixels, applied AFTER H.
+        """
         fx, fy, cx, cy = self.cfg.intrinsics
         ys_m, xs_m = np.where(cam_mask > 0)
         if ys_m.size == 0:
             return None, None
 
-        # INTER_LINEAR + re-threshold gives smooth, anti-aliased
-        # projector-mask edges instead of the pixel staircases that
-        # INTER_NEAREST produces on diagonals.
-        proj_mask = cv2.warpPerspective(
-            cam_mask, self.H,
-            (self.cfg.proj_w, self.cfg.proj_h),
-            flags=cv2.INTER_LINEAR,
-        )
-        _, proj_mask = cv2.threshold(proj_mask, 127, 255, cv2.THRESH_BINARY)
-
-        # Constant baseline parallax shift in PROJECTOR pixels. Applied
-        # AFTER warpPerspective because the parallax error is a property
-        # of the camera-projector baseline in the projector's view, not a
-        # radial scaling around the camera's principal point (the old
-        # cam-space (cx_m - cx) * (z_wall-z_obj)/z_wall formula zeroed
-        # out for centered objects like the bodhran -- the bug we just
-        # fixed).
+        # Compute the parallax x-shift in projector pixels (if any).
+        shift_x = 0.0
         if (self.cfg.parallax_compensate
                 and self.wall_plane is not None
                 and med_z > 0.1):
@@ -503,16 +525,23 @@ class Pipeline:
                            * self.cfg.parallax_scale
                            * self.cfg.parallax_k_px_m
                            * disparity)
-                if abs(shift_x) > 0.5:
-                    M = np.array([[1.0, 0.0, shift_x],
-                                  [0.0, 1.0, 0.0]], dtype=np.float32)
-                    proj_mask = cv2.warpAffine(
-                        proj_mask, M,
-                        (self.cfg.proj_w, self.cfg.proj_h),
-                        flags=cv2.INTER_LINEAR, borderValue=0,
-                    )
-                    _, proj_mask = cv2.threshold(
-                        proj_mask, 127, 255, cv2.THRESH_BINARY)
+
+        # Single warpPerspective with (translation ∘ H) as the matrix.
+        if abs(shift_x) > 0.5:
+            T = np.array([[1.0, 0.0, shift_x],
+                          [0.0, 1.0, 0.0],
+                          [0.0, 0.0, 1.0]], dtype=np.float64)
+            M = T @ self.H
+        else:
+            M = self.H
+
+        proj_mask = cv2.warpPerspective(
+            cam_mask, M,
+            (self.cfg.proj_w, self.cfg.proj_h),
+            flags=cv2.INTER_LINEAR,
+        )
+        _, proj_mask = cv2.threshold(proj_mask, 127, 255, cv2.THRESH_BINARY)
+
         if not proj_mask.any():
             return None, None
         py, px = np.where(proj_mask > 0)

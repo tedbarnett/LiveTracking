@@ -257,11 +257,32 @@ intensitySlider.addEventListener('change', () => {
 // Detector backend dropdown ---------------------------------------------
 const detectorSelect = document.getElementById('detectorSelect');
 let _detectorInflight = false;
+// Pretty names for the API-supplied choice ids. Anything not in this
+// map falls back to the raw id so adding a new backend server-side
+// only requires updating the server's VALID_DETECTORS tuple.
+const DETECTOR_LABELS = {
+  'dino':       'DINO (open-vocab)',
+  'yoloworld':  'YOLO-World (open-vocab)',
+  'yolo':       'YOLO (COCO 80)',
+  'mediapipe':  'MediaPipe (COCO 80)',
+};
+let _detectorChoicesRendered = '';
+function renderDetectorOptions(choices) {
+  const key = choices.join('|');
+  if (key === _detectorChoicesRendered) return;
+  _detectorChoicesRendered = key;
+  const cur = detectorSelect.value;
+  detectorSelect.innerHTML = choices.map(c =>
+    `<option value="${c}">${DETECTOR_LABELS[c] || c}</option>`
+  ).join('');
+  if (choices.includes(cur)) detectorSelect.value = cur;
+}
 async function refreshDetector() {
   try {
     const r = await fetch('/detector');
     const j = await r.json();
     if (!j.ok) return;
+    if (Array.isArray(j.choices)) renderDetectorOptions(j.choices);
     // Show the *live* daemon value when known, else the persisted value.
     const cur = j.live || j.persisted;
     if (cur && detectorSelect.value !== cur && !_detectorInflight) {

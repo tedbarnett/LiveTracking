@@ -479,8 +479,13 @@ class PerceptionDaemon:
                 print(f"[perception] frame {self.frame_idx} [{kind}] "
                       f"total={t['total_ms']:.0f}ms "
                       f"(s1={t['stage1_ms']:.0f} dino={t['dino_ms']:.0f} "
-                      f"sam={t['sam_ms']:.0f}) "
-                      f"dino={t['n_dino_raw']}->{t['n_dino_kept']} "
+                      f"sam={t['sam_ms']:.0f} stageD={t.get('stageD_ms',0):.0f}"
+                      f" [clip={t.get('d_clip_ms',0):.0f}"
+                      f" dband={t.get('d_depthband_ms',0):.0f}"
+                      f" morph={t.get('d_morph_ms',0):.0f}"
+                      f" cc={t.get('d_cc_ms',0):.0f}"
+                      f" warp={t.get('d_warp_ms',0):.0f}])"
+                      f" dino={t['n_dino_raw']}->{t['n_dino_kept']} "
                       f"objects={t['n_objects']}")
                 last_print = now
 
