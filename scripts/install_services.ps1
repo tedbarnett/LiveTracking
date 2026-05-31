@@ -135,6 +135,30 @@ $cTask = New-ScheduledTask `
     -Description "LiveTracking on-demand calibration: stops perception+projector, re-runs camera->projector homography calibration, restarts them."
 Register-ScheduledTask -TaskName "LiveTrackingCalibrate" -InputObject $cTask -Force | Out-Null
 
+# ---- 5) LiveTrackingParallaxCalibrate (Scheduled task, on-demand) ----------
+# Manual two-plane parallax alignment. Flask UI invokes
+#   schtasks /run /tn LiveTrackingParallaxCalibrate
+# which fires this task in the user's desktop session. Operator drives the
+# alignment with arrow keys / + - / [ ] on the laptop keyboard while the
+# projector shows the live camera feed. ExecutionTimeLimit is generous
+# (30 min) because this is a human-paced UI.
+Remove-IfPresent -Name "LiveTrackingParallaxCalibrate" -Kind 'task'
+Write-Host "installing LiveTrackingParallaxCalibrate (scheduled task, on-demand, as $User)"
+$pAction = New-ScheduledTaskAction `
+    -Execute $Venv `
+    -Argument "-u $RepoRoot\scripts\run_parallax_calibration.py" `
+    -WorkingDirectory $RepoRoot
+$pSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+$pPrincipal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
+$pTask = New-ScheduledTask `
+    -Action $pAction -Settings $pSettings -Principal $pPrincipal `
+    -Description "LiveTracking parallax calibration: stops perception+projector, runs manual two-plane alignment, restarts them."
+Register-ScheduledTask -TaskName "LiveTrackingParallaxCalibrate" -InputObject $pTask -Force | Out-Null
+
 Write-Host ""
 Write-Host "[done] installed:"
 Write-Host "  * LiveTrackingFlameWeb       (service, auto-start on boot)"

@@ -349,6 +349,52 @@ def create_app() -> Flask:
         except Exception as e:
             return jsonify({"ok": False, "reason": repr(e)})
 
+    PARALLAX_STATUS_FILE = os.path.join(
+        RUNTIME_DIR, "parallax_calibration_status.json"
+    )
+
+    @app.route("/parallax_calibrate", methods=["POST"])
+    def parallax_calibrate():
+        """Kick off scripts/run_parallax_calibration.py via the
+        LiveTrackingParallaxCalibrate scheduled task (Interactive, Highest).
+
+        The task itself stops perception+projector, runs the manual two-
+        plane alignment UI on the projector, writes H_wall.npy / H_near.npy
+        / parallax_depths.json under runtime/calibration/, and restarts the
+        daemons.
+        """
+        try:
+            os.makedirs(os.path.dirname(PARALLAX_STATUS_FILE), exist_ok=True)
+            with open(PARALLAX_STATUS_FILE, "w") as f:
+                json.dump({"phase": "starting", "ok": None,
+                           "detail": "", "t": time.time()}, f)
+            r = subprocess.run(
+                ["schtasks", "/run", "/tn", "LiveTrackingParallaxCalibrate"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0:
+                err = (r.stdout + r.stderr).strip()
+                # Friendly hint when the task hasn't been registered yet.
+                if ("cannot find" in err.lower()
+                        or "not found" in err.lower()):
+                    err = ("LiveTrackingParallaxCalibrate task is not "
+                           "registered. Run scripts/install_services.ps1 "
+                           "from an admin PowerShell to register it.")
+                return jsonify({"ok": False, "reason": err[-400:]})
+            return jsonify({"ok": True, "started": True})
+        except Exception as e:
+            return jsonify({"ok": False, "reason": repr(e)})
+
+    @app.route("/parallax_status")
+    def parallax_status():
+        try:
+            with open(PARALLAX_STATUS_FILE) as f:
+                return jsonify({"ok": True, "status": json.load(f)})
+        except FileNotFoundError:
+            return jsonify({"ok": True, "status": None})
+        except Exception as e:
+            return jsonify({"ok": False, "reason": repr(e)})
+
     @app.route("/hide", methods=["POST"])
     def hide():
         data = request.get_json(silent=True) or {}

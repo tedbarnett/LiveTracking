@@ -66,6 +66,7 @@
     <button id="btnClear" title="Turn off all projector washes.">Clear</button>
     <button id="btnWhite" title="Project a solid white frame — useful for checking projector coverage and for ambient room light.">☀ White Light</button>
     <button id="btnRecalibrate" title="Stop perception, project the ArUco calibration grid, re-solve the camera→projector homography, then restart. Use after moving the camera or projector.">⟳ Re-calibrate</button>
+    <button id="btnParallax" title="Two-plane parallax calibration. Stops perception+projector, then projects the live camera image on the wall and lets you manually align it to (1) the wall and (2) a near target (bodhran). Per-object projection then becomes depth-correct.">◑ Parallax</button>
     <button id="btnUnhide" style="display:none;" title="Bring back any objects you previously hid with the ✕ button.">Unhide all</button>
   </div>
   <div class="meta"><span id="frameTimings">…</span></div>
@@ -241,6 +242,63 @@ btnRecalibrate.addEventListener('click', async () => {
   if (calibPollTimer) clearInterval(calibPollTimer);
   calibPollTimer = setInterval(pollCalibStatus, 800);
   pollCalibStatus();
+});
+
+// Parallax calibration (two-plane manual alignment) --------------------
+const btnParallax = document.getElementById('btnParallax');
+let parallaxPollTimer = null;
+function setParallaxLabel(text, disabled) {
+  btnParallax.textContent = text;
+  btnParallax.disabled = !!disabled;
+}
+async function pollParallaxStatus() {
+  try {
+    const r = await fetch('/parallax_status');
+    const j = await r.json();
+    const s = j.status;
+    if (!s) return;
+    const phase = s.phase || '';
+    if (phase === 'done') {
+      if (parallaxPollTimer) clearInterval(parallaxPollTimer);
+      parallaxPollTimer = null;
+      if (s.ok) {
+        setParallaxLabel('◑ Parallax', false);
+        alert('Parallax calibration complete. New H_wall and H_near saved; perception restarted.');
+      } else {
+        setParallaxLabel('◑ Parallax', false);
+        alert('Parallax calibration failed: ' + (s.detail || 'unknown'));
+      }
+    } else {
+      setParallaxLabel('◑ ' + phase + '…', true);
+    }
+  } catch (e) { /* ignore */ }
+}
+btnParallax.addEventListener('click', async () => {
+  const ok = confirm(
+    'Parallax calibration:\n\n' +
+    '1. Perception + projector will be stopped (~5 s).\n' +
+    '2. The projector will show the live camera image. On the laptop:\n' +
+    '   PASS 1 (WALL): use arrow / + / - / [ / ] keys to align the\n' +
+    '   projected image to the BACK WALL features.\n' +
+    '   Press Enter to commit.\n' +
+    '   PASS 2 (NEAR): hold a flat target (bodhran) at instrument depth\n' +
+    '   in the camera centre. Repeat the keyboard alignment.\n' +
+    '   Press Enter to commit.\n' +
+    '3. Perception restarts and uses the new two-plane interpolation.\n\n' +
+    'Continue?'
+  );
+  if (!ok) return;
+  setParallaxLabel('◑ starting…', true);
+  const r = await fetch('/parallax_calibrate', { method: 'POST' });
+  const j = await r.json();
+  if (!j.ok) {
+    alert('Could not start parallax calibration: ' + (j.reason || 'unknown'));
+    setParallaxLabel('◑ Parallax', false);
+    return;
+  }
+  if (parallaxPollTimer) clearInterval(parallaxPollTimer);
+  parallaxPollTimer = setInterval(pollParallaxStatus, 800);
+  pollParallaxStatus();
 });
 
 intensitySlider.addEventListener('input', () => {

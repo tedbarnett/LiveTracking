@@ -27,6 +27,7 @@ region representing where the projector can reach.
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
 from dataclasses import dataclass, field
@@ -142,6 +143,38 @@ class Pipeline:
                           f"{[round(x, 4) for x in self.wall_plane]}")
         except Exception as _e:  # noqa: BLE001
             print(f"[pipeline] wall_plane.npy load failed: {_e}")
+
+        # Load two-plane parallax calibration if present. These are written
+        # by scripts/calibrate_parallax.py. When both H_wall and H_near are
+        # available we replace the constant-K x-shift parallax with a per-
+        # object lerp between H_wall and H_near in inverse-depth space.
+        # See _warp_with_parallax_image_first for the math.
+        self.H_wall_calib: Optional[np.ndarray] = None
+        self.H_near_calib: Optional[np.ndarray] = None
+        self.z_near_calib: float = 0.0
+        self.z_wall_calib: float = 0.0
+        try:
+            calib_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))))),
+                "runtime", "calibration",
+            )
+            hw_path = os.path.join(calib_dir, "H_wall.npy")
+            hn_path = os.path.join(calib_dir, "H_near.npy")
+            dz_path = os.path.join(calib_dir, "parallax_depths.json")
+            if (os.path.exists(hw_path) and os.path.exists(hn_path)
+                    and os.path.exists(dz_path)):
+                self.H_wall_calib = np.load(hw_path)
+                self.H_near_calib = np.load(hn_path)
+                with open(dz_path) as f:
+                    dz = json.load(f)
+                self.z_near_calib = float(dz.get("z_near_m", 0.0))
+                self.z_wall_calib = float(dz.get("z_wall_m", 0.0))
+                print(f"[pipeline] two-plane parallax calib loaded: "
+                      f"z_near={self.z_near_calib:.2f}m, "
+                      f"z_wall={self.z_wall_calib:.2f}m")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[pipeline] two-plane parallax load failed: {_e}")
 
         self.tracker = ObjectTracker(
             iou_match_threshold=self.cfg.iou_match_threshold,
@@ -497,43 +530,76 @@ class Pipeline:
     def _warp_with_parallax_image_first(
         self, cam_mask: np.ndarray, med_z: float,
     ) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]]]:
-        """Parallax-shift cam_mask then warp into projector pixels.
+        """Warp cam_mask into projector pixels with depth-correct parallax.
 
-        Performance: we fold the parallax x-shift into a single 3x3
-        homography (T · H) so we run cv2.warpPerspective exactly ONCE
-        instead of warpPerspective+warpAffine. Each warp writes the full
-        proj_w × proj_h = 8.3 MP output buffer, so cutting the count in
-        half is worth ~50% of stage-D wall time when many objects are
-        visible. Behaviour is identical to the prior two-step pipeline:
-        T is a 2D translation in projector pixels, applied AFTER H.
+        Two parallax modes, chosen automatically:
+
+        1) Two-plane interpolation (PREFERRED, used when H_wall/H_near were
+           captured by scripts/calibrate_parallax.py). For an object at
+           median depth z_obj we lerp between H_wall and H_near in inverse-
+           depth space because parallax disparity is linear in 1/z:
+
+               alpha = (1/z_obj - 1/z_wall) / (1/z_near - 1/z_wall)
+               H(z)  = (1 - alpha) * H_wall + alpha * H_near
+
+           alpha is clamped to [0, 1.5] — slight overshoot is allowed for
+           objects closer than the NEAR plane (extrapolation), but we cap
+           at 1.5 so a hand right in front of the camera doesn't blow up.
+
+        2) Constant-K x-shift (FALLBACK, used when no two-plane calib
+           exists). Same logic the pipeline used before manual parallax
+           calibration: shift_x = K * (1/z_obj - 1/z_wall), all wrapped
+           into a single warpPerspective via T @ H.
+
+        Folding the x-shift into one homography (instead of doing
+        warpPerspective + warpAffine) is the key perf win: warpPerspective
+        writes a full proj_w * proj_h = 8.3 MP output buffer per call.
         """
-        fx, fy, cx, cy = self.cfg.intrinsics
         ys_m, xs_m = np.where(cam_mask > 0)
         if ys_m.size == 0:
             return None, None
 
-        # Compute the parallax x-shift in projector pixels (if any).
-        shift_x = 0.0
-        if (self.cfg.parallax_compensate
-                and self.wall_plane is not None
+        M = self.H  # default to the legacy wall-target H
+
+        if (self.H_wall_calib is not None
+                and self.H_near_calib is not None
+                and self.z_near_calib > 0.1
+                and self.z_wall_calib > self.z_near_calib + 0.1
+                and self.cfg.parallax_compensate
                 and med_z > 0.1):
+            # --- two-plane interpolation ---
+            inv_zo = 1.0 / med_z
+            inv_zw = 1.0 / self.z_wall_calib
+            inv_zn = 1.0 / self.z_near_calib
+            denom = inv_zn - inv_zw
+            if abs(denom) > 1e-9:
+                alpha = (inv_zo - inv_zw) / denom
+                alpha = float(np.clip(alpha, 0.0, 1.5))
+                # Lerp the 3x3s element-wise. This is geometrically a
+                # straight-line homotopy in homography space — valid here
+                # because both H_wall and H_near map the SAME camera plane
+                # to the SAME projector frame; only the depth of the
+                # alignment target differs.
+                M = (1.0 - alpha) * self.H_wall_calib + alpha * self.H_near_calib
+
+        elif (self.cfg.parallax_compensate
+              and self.wall_plane is not None
+              and med_z > 0.1):
+            # --- fallback constant-K x-shift ---
             cx_m = float(xs_m.mean()); cy_m = float(ys_m.mean())
             z_wall = self._wall_z_at(cx_m, cy_m)
+            shift_x = 0.0
             if z_wall > 0.1 and med_z < z_wall - 0.05:
-                disparity = (1.0 / med_z) - (1.0 / z_wall)  # 1/m, positive
+                disparity = (1.0 / med_z) - (1.0 / z_wall)
                 shift_x = (self.cfg.parallax_sign
                            * self.cfg.parallax_scale
                            * self.cfg.parallax_k_px_m
                            * disparity)
-
-        # Single warpPerspective with (translation ∘ H) as the matrix.
-        if abs(shift_x) > 0.5:
-            T = np.array([[1.0, 0.0, shift_x],
-                          [0.0, 1.0, 0.0],
-                          [0.0, 0.0, 1.0]], dtype=np.float64)
-            M = T @ self.H
-        else:
-            M = self.H
+            if abs(shift_x) > 0.5:
+                T = np.array([[1.0, 0.0, shift_x],
+                              [0.0, 1.0, 0.0],
+                              [0.0, 0.0, 1.0]], dtype=np.float64)
+                M = T @ self.H
 
         proj_mask = cv2.warpPerspective(
             cam_mask, M,
