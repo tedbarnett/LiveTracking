@@ -406,14 +406,34 @@ def create_app() -> Flask:
             write_active_detector(name)
         except Exception as e:
             return jsonify({"ok": False, "reason": repr(e)}), 500
-        # Bounce the perception task. /end then /run; if /end fails (e.g.
-        # task wasn't running) we still try /run so we end up in the right
-        # state. The task itself loads runtime/active_detector.json on
-        # startup, so by the time it's back up it has the new backend.
+        # Bounce the perception task. The Windows reality is uglier than
+        # `schtasks /end` would suggest: /end reports SUCCESS but routinely
+        # leaves the python child orphaned (still holding the D455 + the
+        # ctrl socket, but no longer tracked by Task Scheduler — Status:
+        # Ready). The next /run then either no-ops or starts a second
+        # daemon that immediately fails to bind. To make the switch
+        # reliable we explicitly hunt down any python.exe whose command
+        # line invokes the perception daemon and taskkill /F /T it before
+        # re-running the task.
         try:
             subprocess.run(
                 ["schtasks", "/end", "/tn", "LiveTrackingPerception"],
                 capture_output=True, text=True, timeout=10,
+            )
+            # Kill any orphaned perception python.exe by command-line
+            # match. We pull the list via PowerShell's CIM (wmic is
+            # deprecated on modern Windows) and pipe each PID through
+            # taskkill /F /T so the whole tree dies.
+            ps_cmd = (
+                "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" "
+                "| Where-Object { $_.CommandLine -like "
+                "'*livetracking.daemon.perception*' } "
+                "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+                "-ErrorAction SilentlyContinue }"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=15,
             )
             time.sleep(2)
             r = subprocess.run(
