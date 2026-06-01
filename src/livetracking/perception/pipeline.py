@@ -37,6 +37,11 @@ import cv2
 import numpy as np
 
 from .footprint import footprint_mask_in_camera
+from .parallax import (
+    constant_k_shift_px,
+    homography_for_depth,
+    shift_matrix,
+)
 from .recognize import DEFAULT_DINO_PROMPT, Recognizer
 from .tracker import FreshDetection, ObjectTracker
 from .types import DetectedObject
@@ -568,19 +573,14 @@ class Pipeline:
                 and self.cfg.parallax_compensate
                 and med_z > 0.1):
             # --- two-plane interpolation ---
-            inv_zo = 1.0 / med_z
-            inv_zw = 1.0 / self.z_wall_calib
-            inv_zn = 1.0 / self.z_near_calib
-            denom = inv_zn - inv_zw
-            if abs(denom) > 1e-9:
-                alpha = (inv_zo - inv_zw) / denom
-                alpha = float(np.clip(alpha, 0.0, 1.5))
-                # Lerp the 3x3s element-wise. This is geometrically a
-                # straight-line homotopy in homography space — valid here
-                # because both H_wall and H_near map the SAME camera plane
-                # to the SAME projector frame; only the depth of the
-                # alignment target differs.
-                M = (1.0 - alpha) * self.H_wall_calib + alpha * self.H_near_calib
+            M = homography_for_depth(
+                self.H_wall_calib,
+                self.H_near_calib,
+                self.z_wall_calib,
+                self.z_near_calib,
+                med_z,
+                alpha_max=1.5,
+            )
 
         elif (self.cfg.parallax_compensate
               and self.wall_plane is not None
@@ -588,18 +588,15 @@ class Pipeline:
             # --- fallback constant-K x-shift ---
             cx_m = float(xs_m.mean()); cy_m = float(ys_m.mean())
             z_wall = self._wall_z_at(cx_m, cy_m)
-            shift_x = 0.0
-            if z_wall > 0.1 and med_z < z_wall - 0.05:
-                disparity = (1.0 / med_z) - (1.0 / z_wall)
-                shift_x = (self.cfg.parallax_sign
-                           * self.cfg.parallax_scale
-                           * self.cfg.parallax_k_px_m
-                           * disparity)
+            shift_x = constant_k_shift_px(
+                z_obj=med_z,
+                z_wall=z_wall,
+                k_px_m=self.cfg.parallax_k_px_m,
+                sign=self.cfg.parallax_sign,
+                scale=self.cfg.parallax_scale,
+            )
             if abs(shift_x) > 0.5:
-                T = np.array([[1.0, 0.0, shift_x],
-                              [0.0, 1.0, 0.0],
-                              [0.0, 0.0, 1.0]], dtype=np.float64)
-                M = T @ self.H
+                M = shift_matrix(shift_x) @ self.H
 
         proj_mask = cv2.warpPerspective(
             cam_mask, M,
