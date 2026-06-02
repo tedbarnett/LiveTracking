@@ -67,6 +67,10 @@ from livetracking.paths import (  # noqa: E402
     CALIB_DIR, DISPLAY_INDEX, describe,
 )
 from livetracking.perception.capture import RealSenseCapture  # noqa: E402
+from livetracking.perception.depth_probe import (  # noqa: E402
+    median_depth_in_centerbox,
+    nearest_depth_in_centerbox,
+)
 from livetracking.perception.footprint import load_homography  # noqa: E402
 
 
@@ -132,20 +136,8 @@ def composed_H(H: np.ndarray, nudge: Nudge) -> np.ndarray:
     return nudge.to_matrix() @ H
 
 
-# ---- depth median at mask centroid --------------------------------------
-def median_depth_in_centerbox(depth_m: np.ndarray, half: int = 60) -> float:
-    """Return median depth in a 2*half x 2*half window at the camera center
-    (where the operator was instructed to hold the NEAR target).
-    Ignores zero/invalid pixels.
-    """
-    h, w = depth_m.shape[:2]
-    cx, cy = w // 2, h // 2
-    win = depth_m[max(0, cy - half):cy + half,
-                  max(0, cx - half):cx + half]
-    vals = win[win > 0]
-    if vals.size < 50:
-        return 0.0
-    return float(np.median(vals))
+# ---- depth probes are imported from livetracking.perception.depth_probe -
+# (median_depth_in_centerbox, nearest_depth_in_centerbox) -- see imports above.
 
 
 # ---- single-pass interactive alignment ----------------------------------
@@ -295,7 +287,8 @@ def _interstitial_prompt(pygame, screen, font, font_small,
                 if ev.key in (pygame.K_RETURN, pygame.K_SPACE):
                     return True
         frame = cap.read()
-        depth_m = median_depth_in_centerbox(frame.depth_m)
+        depth_median = median_depth_in_centerbox(frame.depth_m)
+        depth_near = nearest_depth_in_centerbox(frame.depth_m, pct=10.0)
         # Dim background.
         screen.fill((10, 10, 20))
         # Title.
@@ -307,10 +300,17 @@ def _interstitial_prompt(pygame, screen, font, font_small,
             s = font_small.render(ln, True, (255, 255, 255))
             screen.blit(s, ((PW - s.get_width()) // 2, y))
             y += 56
-        # Live depth read so operator sees they've aimed the camera right.
-        dcol = (120, 255, 120) if 0.5 < depth_m < 2.5 else (255, 120, 120)
-        dsurf = font.render(f"camera-center depth: {depth_m:.2f} m",
-                            True, dcol)
+        # Live depth reads so operator sees they've aimed the camera right.
+        # The "nearest" probe is what we'll actually save as z_near, so it
+        # drives the traffic light. The median is shown so the operator can
+        # diagnose a noisy/empty foreground (median >> nearest = foreground
+        # is small in the box; near both = uniform target).
+        dcol = (120, 255, 120) if 0.5 < depth_near < 2.5 else (255, 120, 120)
+        dsurf = font.render(
+            f"camera-center depth — nearest: {depth_near:.2f} m   "
+            f"median: {depth_median:.2f} m",
+            True, dcol,
+        )
         screen.blit(dsurf, ((PW - dsurf.get_width()) // 2, y + 40))
         pygame.display.flip()
         clock.tick(15)
@@ -399,7 +399,14 @@ def main() -> int:
             return 2
         H_near, depth_near_arr = res2
         np.save(H_NEAR_FILE, H_near)
-        z_near = median_depth_in_centerbox(depth_near_arr)
+        # Use nearest-decile probe so foreground objects (bodhran on couch)
+        # win over background pixels (back wall) inside the centerbox. The
+        # bare median was getting swamped by wall when the NEAR target was
+        # smaller than the box.
+        z_near = nearest_depth_in_centerbox(depth_near_arr, pct=10.0)
+        z_near_median = median_depth_in_centerbox(depth_near_arr)
+        print(f"[parallax_calib] z_near probe: nearest-decile={z_near:.2f} m, "
+              f"median={z_near_median:.2f} m")
         # Also pull z_wall: prefer the existing wall_plane.npy if present,
         # else fall back to a frame-average over a back-of-room patch.
         z_wall = _estimate_z_wall()
