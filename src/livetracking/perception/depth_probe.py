@@ -42,6 +42,30 @@ def median_depth_in_centerbox(depth_m: np.ndarray, half: int = 60) -> float:
     return float(np.median(vals))
 
 
+def depth_at_point(depth_m: np.ndarray, x: int, y: int,
+                   half: int = 20) -> float:
+    """Median depth (meters) in a 2*half x 2*half box centered at (x, y).
+
+    Used for click-probe depth sampling during NEAR-pass calibration: the
+    operator clicks the projector image, the click is inverse-mapped to
+    camera space, and we read depth in a small window around that pixel.
+    A small window (half=20 -> 41x41 = 1681 px) is right for hand-clicked
+    targets because tight localization beats large smoothing here.
+
+    Returns 0.0 when fewer than 20 valid pixels in the box (lower bar than
+    the centerbox probe because the operator chose this point — we trust
+    them more than the geometric center).
+    """
+    h, w = depth_m.shape[:2]
+    x0 = max(0, x - half); x1 = min(w, x + half)
+    y0 = max(0, y - half); y1 = min(h, y + half)
+    win = depth_m[y0:y1, x0:x1]
+    vals = win[win > 0]
+    if vals.size < 20:
+        return 0.0
+    return float(np.median(vals))
+
+
 def nearest_depth_in_centerbox(depth_m: np.ndarray, half: int = 60,
                                 pct: float = 10.0) -> float:
     """`pct`-th percentile of valid depths in a 2*half centerbox.

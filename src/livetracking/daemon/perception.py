@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 import zmq
 
+from livetracking.config.env import parse_bool, parse_float, parse_str
 from livetracking.paths import (
     RUNTIME_DIR,
     ZMQ_OBJECTS_PUB,
@@ -44,7 +45,7 @@ from livetracking.perception.footprint import (
     load_homography,
 )
 from livetracking.perception.pipeline import Pipeline, PipelineConfig
-from livetracking.perception.recognize import create_recognizer, read_active_detector
+from livetracking.perception.recognize import create_recognizer, read_active_detector, VALID_DETECTORS
 from livetracking.perception.types import DetectedObject
 
 
@@ -124,20 +125,22 @@ class PerceptionDaemon:
         self.cap = RealSenseCapture()
         cw, ch = self.cap.size()
         # Per-object parallax compensation knobs (env overrides for live tuning
-        # without code edits).
+        # without code edits). All parsed via livetracking.config.env so a
+        # garbage value in the environment (e.g. LIVETRACKING_PARALLAX_K=1200x
+        # from a fat-fingered shell command) warns + keeps default instead of
+        # crashing the daemon at startup.
         cfg = PipelineConfig(proj_w=PW, proj_h=PH)
-        env_compensate = os.environ.get("LIVETRACKING_PARALLAX_COMPENSATE")
-        if env_compensate is not None:
-            cfg.parallax_compensate = env_compensate.lower() not in ("0", "false", "no", "off")
-        env_sign = os.environ.get("LIVETRACKING_PARALLAX_SIGN")
-        if env_sign:
-            cfg.parallax_sign = float(env_sign)
-        env_scale = os.environ.get("LIVETRACKING_PARALLAX_SCALE")
-        if env_scale:
-            cfg.parallax_scale = float(env_scale)
-        env_k = os.environ.get("LIVETRACKING_PARALLAX_K")
-        if env_k:
-            cfg.parallax_k_px_m = float(env_k)
+        cfg.parallax_compensate = parse_bool(
+            "LIVETRACKING_PARALLAX_COMPENSATE", cfg.parallax_compensate)
+        cfg.parallax_sign = parse_float(
+            "LIVETRACKING_PARALLAX_SIGN", cfg.parallax_sign,
+            min_value=-1.0, max_value=1.0)
+        cfg.parallax_scale = parse_float(
+            "LIVETRACKING_PARALLAX_SCALE", cfg.parallax_scale,
+            min_value=0.0, max_value=10.0)
+        cfg.parallax_k_px_m = parse_float(
+            "LIVETRACKING_PARALLAX_K", cfg.parallax_k_px_m,
+            min_value=0.0, max_value=10000.0)
         print(f"[perception] parallax: compensate={cfg.parallax_compensate} "
               f"sign={cfg.parallax_sign} scale={cfg.parallax_scale} "
               f"k_px_m={cfg.parallax_k_px_m}")
@@ -145,8 +148,10 @@ class PerceptionDaemon:
         # Detector backend: persisted in runtime/active_detector.json.
         # An env override is honored so we can spin up an alternate detector
         # without touching the file (mostly useful from a smoke-test shell).
-        detector_name = (os.environ.get("LIVETRACKING_DETECTOR")
-                         or read_active_detector())
+        # parse_str with choices=VALID_DETECTORS rejects typos cleanly.
+        env_detector = parse_str("LIVETRACKING_DETECTOR", "",
+                                 choices=list(VALID_DETECTORS))
+        detector_name = env_detector or read_active_detector()
         print(f"[perception] detector backend: {detector_name}")
         self.detector_name = detector_name
         recognizer = create_recognizer(detector_name)

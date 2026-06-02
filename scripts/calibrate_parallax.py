@@ -68,6 +68,7 @@ from livetracking.paths import (  # noqa: E402
 )
 from livetracking.perception.capture import RealSenseCapture  # noqa: E402
 from livetracking.perception.depth_probe import (  # noqa: E402
+    depth_at_point,
     median_depth_in_centerbox,
     nearest_depth_in_centerbox,
 )
@@ -148,15 +149,32 @@ def run_alignment_pass(
     starting_H: np.ndarray,
     pass_label: str,
     instructions: list[str],
-) -> Optional[tuple[np.ndarray, np.ndarray]]:
-    """Returns (final_H, last_depth_m) on commit, None on skip/quit."""
+    allow_click_probe: bool = False,
+) -> Optional[tuple[np.ndarray, np.ndarray, Optional[tuple[int, int]]]]:
+    """Returns (final_H, last_depth_m, probed_xy_cam) on commit, None on skip/quit.
+
+    When ``allow_click_probe`` is True (NEAR pass), a left-click on the
+    projector screen drops a depth probe at the corresponding CAMERA pixel
+    — found by inverse-mapping the click through the current composed H.
+    Useful when the NEAR target is off-center (off-axis bodhran on couch).
+
+    ``probed_xy_cam`` is (x, y) in camera coords or None if no click was
+    placed. The caller decides whether to use it (NEAR pass does;
+    WALL pass ignores it).
+    """
     nudge = Nudge(pivot=(PW / 2.0, PH / 2.0))
     show_help = True
     last_depth_m = np.zeros((480, 848), dtype=np.float32)
+    probed_xy_cam: Optional[tuple[int, int]] = None
+    probed_xy_proj: Optional[tuple[int, int]] = None
     # Brightness multiplier applied to the projected camera image so the
     # operator can SEE the real bodhran/wall through the projection.
     # 0.7 default (-30%). B/V keys adjust live.
     brightness = float(os.environ.get("LIVETRACKING_CALIB_BRIGHTNESS", "0.7"))
+    # Make the mouse cursor visible during the NEAR pass so the operator
+    # knows where they're clicking. Hidden by main() for the WALL pass.
+    if allow_click_probe:
+        pygame.mouse.set_visible(True)
 
     clock = pygame.time.Clock()
     while True:
@@ -164,6 +182,25 @@ def run_alignment_pass(
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 return None
+            if (ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1
+                    and allow_click_probe):
+                # Inverse-map click from projector coords -> camera coords.
+                px, py = ev.pos
+                Hc = composed_H(starting_H, nudge)
+                try:
+                    Hc_inv = np.linalg.inv(Hc)
+                except np.linalg.LinAlgError:
+                    continue
+                vec = Hc_inv @ np.array([px, py, 1.0])
+                if abs(vec[2]) < 1e-9:
+                    continue
+                cx = int(vec[0] / vec[2])
+                cy = int(vec[1] / vec[2])
+                # Reject clicks that land outside the camera frame.
+                if 0 <= cx < last_depth_m.shape[1] and 0 <= cy < last_depth_m.shape[0]:
+                    probed_xy_cam = (cx, cy)
+                    probed_xy_proj = (px, py)
+                continue
             if ev.type != pygame.KEYDOWN:
                 continue
             mods = pygame.key.get_mods()
@@ -175,13 +212,17 @@ def run_alignment_pass(
                 return None
             if ev.key in (pygame.K_RETURN, pygame.K_SPACE):
                 final_H = composed_H(starting_H, nudge)
-                return final_H, last_depth_m
+                return final_H, last_depth_m, probed_xy_cam
             if ev.key == pygame.K_n:
                 return None
             if ev.key == pygame.K_h:
                 show_help = not show_help
             if ev.key == pygame.K_r:
                 nudge.reset()
+            if ev.key == pygame.K_c and allow_click_probe:
+                # Clear the click probe; fall back to centerbox sampling.
+                probed_xy_cam = None
+                probed_xy_proj = None
             if ev.key == pygame.K_LEFT:
                 nudge.tx -= step
             if ev.key == pygame.K_RIGHT:
@@ -223,20 +264,46 @@ def run_alignment_pass(
         surf = pygame.surfarray.make_surface(np.transpose(proj_rgb, (1, 0, 2)))
         screen.blit(surf, (0, 0))
 
+        # If a click probe is placed, draw a crosshair at the projector-
+        # space location so the operator can confirm it followed the
+        # target after a nudge.
+        if probed_xy_proj is not None:
+            pygame.draw.circle(screen, (0, 255, 0), probed_xy_proj, 20, 3)
+            pygame.draw.line(screen, (0, 255, 0),
+                              (probed_xy_proj[0] - 30, probed_xy_proj[1]),
+                              (probed_xy_proj[0] + 30, probed_xy_proj[1]), 2)
+            pygame.draw.line(screen, (0, 255, 0),
+                              (probed_xy_proj[0], probed_xy_proj[1] - 30),
+                              (probed_xy_proj[0], probed_xy_proj[1] + 30), 2)
+
         if show_help:
+            # Probed depth: centerbox by default; click-probed if available.
+            if probed_xy_cam is not None:
+                probed_depth = depth_at_point(frame.depth_m, *probed_xy_cam,
+                                               half=20)
+            else:
+                probed_depth = median_depth_in_centerbox(frame.depth_m)
             _draw_overlay(
                 screen, font, font_small,
                 pass_label, instructions, nudge,
-                center_depth=median_depth_in_centerbox(frame.depth_m),
+                center_depth=probed_depth,
                 brightness=brightness,
+                probed_xy_cam=probed_xy_cam,
+                allow_click_probe=allow_click_probe,
             )
 
         pygame.display.flip()
         clock.tick(20)
 
 
+# ---- depth probes are imported from livetracking.perception.depth_probe -
+# (median_depth_in_centerbox, nearest_depth_in_centerbox, depth_at_point)
+
+
 def _draw_overlay(screen, font, font_small, pass_label, instructions,
-                  nudge: Nudge, center_depth: float, brightness: float = 1.0):
+                  nudge: Nudge, center_depth: float, brightness: float = 1.0,
+                  probed_xy_cam: Optional[tuple[int, int]] = None,
+                  allow_click_probe: bool = False):
     import pygame  # local import: this is only called from inside main()
     pad = 30
     lines = [
@@ -244,17 +311,32 @@ def _draw_overlay(screen, font, font_small, pass_label, instructions,
         "",
     ]
     lines.extend(instructions)
-    lines.extend([
+    extras = [
         "",
         "Arrows: translate (Shift = x10)   + / - : scale (Shift = x5)",
         "[ / ]: rotate (Shift = x10)       R: reset nudge",
         "B / V: brightness up / down       H: toggle help",
-        "Enter/Space: COMMIT this pass     N: skip/next     Esc: ABORT",
+    ]
+    if allow_click_probe:
+        extras.append(
+            "CLICK on the NEAR target to set probe   C: clear probe"
+        )
+    extras.append(
+        "Enter/Space: COMMIT this pass     N: skip/next     Esc: ABORT"
+    )
+    if probed_xy_cam is not None:
+        probe_str = (f"PROBED at cam ({probed_xy_cam[0]}, "
+                     f"{probed_xy_cam[1]})   depth: {center_depth:.2f} m")
+    else:
+        probe_str = (f"depth at camera center: {center_depth:.2f} m    "
+                     f"brightness: {brightness:.0%}")
+    extras.extend([
         "",
         (f"nudge: tx={nudge.tx:+.0f}px ty={nudge.ty:+.0f}px "
          f"scale={nudge.scale:.3f} angle={nudge.angle:+.2f}deg"),
-        f"depth at camera center: {center_depth:.2f} m    brightness: {brightness:.0%}",
+        probe_str,
     ])
+    lines.extend(extras)
     # Translucent backing for readability.
     h = len(lines) * 42 + pad * 2
     bg = pygame.Surface((screen.get_width() - 2 * pad, h))
@@ -362,7 +444,7 @@ def main() -> int:
         if res1 is None:
             print("[parallax_calib] WALL pass aborted; nothing saved.")
             return 1
-        H_wall, _depth_wall = res1
+        H_wall, _depth_wall, _probe_wall = res1
         np.save(H_WALL_FILE, H_wall)
         print(f"[parallax_calib] saved {H_WALL_FILE}")
 
@@ -373,8 +455,11 @@ def main() -> int:
             [
                 "Next: NEAR pass.",
                 "1. Place the BODHRAN on the couch (or held at ~1-2 m).",
-                "2. AIM THE REALSENSE CAMERA so the bodhran fills frame-center.",
-                "3. Watch the depth readout — it should drop to ~1-2 m, NOT ~3 m.",
+                "2. CLICK directly on the bodhran in the projected image",
+                "   to set a depth probe at that exact pixel (best for",
+                "   off-center targets). Or center the camera on it and",
+                "   skip the click (centerbox fallback).",
+                "3. Depth readout should drop to ~1-2 m, NOT ~3 m.",
                 "",
                 "Press ENTER when ready to start PASS 2.   Esc to abort.",
             ],
@@ -386,27 +471,33 @@ def main() -> int:
         # ---- PASS 2: NEAR ----
         near_instr = [
             "Goal: align the projected CAMERA image to a FLAT TARGET",
-            "held at INSTRUMENT depth (e.g. the BODHRAN on a stand,",
-            "or a poster held up at ~1.5-2.5 m). Centre the target in",
-            "the camera view so the depth readout below reflects it.",
+            "at INSTRUMENT depth (BODHRAN on couch, or any object",
+            "1-2 m from camera). LEFT-CLICK on the target in the",
+            "projected image to set the depth probe — works even when",
+            "the target is OFF-CENTER. C clears the probe.",
         ]
         res2 = run_alignment_pass(
             pygame, screen, font, font_small, cap, PW, PH,
             H_wall, "PASS 2 / 2  —  NEAR  (bodhran)", near_instr,
+            allow_click_probe=True,
         )
         if res2 is None:
             print("[parallax_calib] NEAR pass aborted; only H_wall saved.")
             return 2
-        H_near, depth_near_arr = res2
+        H_near, depth_near_arr, probe_xy = res2
         np.save(H_NEAR_FILE, H_near)
-        # Use nearest-decile probe so foreground objects (bodhran on couch)
-        # win over background pixels (back wall) inside the centerbox. The
-        # bare median was getting swamped by wall when the NEAR target was
-        # smaller than the box.
-        z_near = nearest_depth_in_centerbox(depth_near_arr, pct=10.0)
-        z_near_median = median_depth_in_centerbox(depth_near_arr)
-        print(f"[parallax_calib] z_near probe: nearest-decile={z_near:.2f} m, "
-              f"median={z_near_median:.2f} m")
+        # z_near sampling: click-probe wins (operator explicitly aimed),
+        # else fall back to nearest-decile centerbox (resilient to small
+        # foreground targets but assumes camera is aimed roughly right).
+        if probe_xy is not None:
+            z_near = depth_at_point(depth_near_arr, *probe_xy, half=20)
+            print(f"[parallax_calib] z_near from click probe at "
+                  f"cam({probe_xy[0]}, {probe_xy[1]}): {z_near:.2f} m")
+        else:
+            z_near = nearest_depth_in_centerbox(depth_near_arr, pct=10.0)
+            z_near_median = median_depth_in_centerbox(depth_near_arr)
+            print(f"[parallax_calib] z_near centerbox: nearest-decile="
+                  f"{z_near:.2f} m, median={z_near_median:.2f} m")
         # Also pull z_wall: prefer the existing wall_plane.npy if present,
         # else fall back to a frame-average over a back-of-room patch.
         z_wall = _estimate_z_wall()
