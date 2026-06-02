@@ -259,3 +259,95 @@ class TestCalibrationFilesPresent:
         # Bottom-right corner of a valid homography normalized to 1.0.
         assert abs(H[2, 2] - 1.0) < 1e-6, (
             f"H[2,2] should normalize to 1.0, got {H[2, 2]}")
+
+
+class TestRemoteOpsEndpoints:
+    """The remote-ops endpoints added 2026-06-02 so Ted can run the rig
+    without being home. If Flask hasn't been reloaded since the commit
+    that added these, individual tests skip with 404 rather than fail."""
+
+    def _endpoint_exists(self, path: str) -> bool:
+        """Return True if Flask routes this path (any non-404 status)."""
+        try:
+            if _HAS_REQUESTS:
+                r = requests.get(f"{FLAME_WEB}{path}", timeout=HTTP_TIMEOUT)
+                return r.status_code != 404
+            from urllib.request import urlopen
+            from urllib.error import HTTPError
+            try:
+                with urlopen(f"{FLAME_WEB}{path}", timeout=HTTP_TIMEOUT):
+                    return True
+            except HTTPError as e:
+                return e.code != 404
+        except Exception:  # noqa: BLE001
+            return True  # don't skip on transient errors; let the real test fail
+
+    def test_parallax_get(self):
+        if not self._endpoint_exists("/parallax"):
+            pytest.skip("/parallax not yet live — restart Flask")
+        cfg = _get_json("/parallax")
+        assert cfg.get("ok") is True
+        # All four knobs must come back.
+        for k in ("compensate", "sign", "scale", "k_px_m"):
+            assert k in cfg, f"/parallax missing {k}"
+        assert -1.0 <= cfg["sign"] <= 1.0
+        assert 0.0 <= cfg["scale"] <= 10.0
+        assert 0.0 <= cfg["k_px_m"] <= 10000.0
+
+    def test_parallax_tune_round_trip(self):
+        if not self._endpoint_exists("/parallax"):
+            pytest.skip("/parallax not yet live — restart Flask")
+        before = _get_json("/parallax")
+        new_k = 1500.0 if before["k_px_m"] != 1500.0 else 800.0
+        try:
+            resp = _post_json("/parallax", {"k_px_m": new_k})
+            assert resp.get("ok") is True
+            assert resp.get("current", {}).get("k_px_m") == new_k
+            # Verify it stuck via a fresh GET.
+            time.sleep(0.3)
+            after = _get_json("/parallax")
+            assert after["k_px_m"] == new_k
+        finally:
+            _post_json("/parallax", {"k_px_m": before["k_px_m"]})
+
+    def test_parallax_tune_clamps_out_of_range(self):
+        if not self._endpoint_exists("/parallax"):
+            pytest.skip("/parallax not yet live — restart Flask")
+        before = _get_json("/parallax")
+        try:
+            resp = _post_json("/parallax", {"k_px_m": 99999.0})
+            assert resp.get("ok") is True
+            assert resp.get("current", {}).get("k_px_m") == 10000.0
+        finally:
+            _post_json("/parallax", {"k_px_m": before["k_px_m"]})
+
+    def test_services_status(self):
+        if not self._endpoint_exists("/services/status"):
+            pytest.skip("/services/status not yet live — restart Flask")
+        data = _get_json("/services/status")
+        assert data.get("ok") is True
+        tasks = data.get("tasks", {})
+        assert "LiveTrackingPerception" in tasks
+        assert "LiveTrackingProjector" in tasks
+        # Perception should at least be present.
+        assert tasks["LiveTrackingPerception"].get("present") is True
+
+    def test_logs_tail_perception(self):
+        if not self._endpoint_exists("/logs/perception"):
+            pytest.skip("/logs not yet live — restart Flask")
+        data = _get_json("/logs/perception?n=20")
+        # Service may not have a log file yet; if not, expect 404 ok=False.
+        if data.get("ok") is False:
+            pytest.skip(f"no log yet: {data.get('reason')}")
+        assert "content" in data
+        assert data.get("lines", 0) <= 20
+
+    def test_logs_tail_rejects_unknown_service(self):
+        if not self._endpoint_exists("/logs/perception"):
+            pytest.skip("/logs not yet live — restart Flask")
+        if _HAS_REQUESTS:
+            r = requests.get(f"{FLAME_WEB}/logs/tensorflow",
+                              timeout=HTTP_TIMEOUT)
+            assert r.status_code == 400
+            assert r.json().get("ok") is False
+        # urllib path: not worth duplicating for this edge.

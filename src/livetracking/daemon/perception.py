@@ -421,6 +421,42 @@ class PerceptionDaemon:
             return {"ok": True, "objects": _objects_to_payload(
                 act, self.pipeline.last_timings_ms
             )["objects"]}
+        if cmd == "parallax_get":
+            cfg = self.pipeline.cfg
+            return {"ok": True,
+                    "compensate": cfg.parallax_compensate,
+                    "sign": cfg.parallax_sign,
+                    "scale": cfg.parallax_scale,
+                    "k_px_m": cfg.parallax_k_px_m}
+        if cmd == "parallax_tune":
+            # Live-mutate the pipeline config from a remote HTTP request.
+            # Pipeline reads cfg on every frame, so changes take effect on
+            # the next frame — no restart needed. Bounds match the
+            # daemon-boot env-parse clamps so we can't push a value that
+            # would be rejected on next restart.
+            cfg = self.pipeline.cfg
+            changed = {}
+            if "compensate" in msg:
+                cfg.parallax_compensate = bool(msg["compensate"])
+                changed["compensate"] = cfg.parallax_compensate
+            if "sign" in msg:
+                v = float(msg["sign"])
+                cfg.parallax_sign = max(-1.0, min(1.0, v))
+                changed["sign"] = cfg.parallax_sign
+            if "scale" in msg:
+                v = float(msg["scale"])
+                cfg.parallax_scale = max(0.0, min(10.0, v))
+                changed["scale"] = cfg.parallax_scale
+            if "k_px_m" in msg:
+                v = float(msg["k_px_m"])
+                cfg.parallax_k_px_m = max(0.0, min(10000.0, v))
+                changed["k_px_m"] = cfg.parallax_k_px_m
+            print(f"[perception] parallax_tune applied: {changed}")
+            return {"ok": True, "changed": changed,
+                    "current": {"compensate": cfg.parallax_compensate,
+                                "sign": cfg.parallax_sign,
+                                "scale": cfg.parallax_scale,
+                                "k_px_m": cfg.parallax_k_px_m}}
         return {"ok": False, "reason": f"unknown cmd {cmd!r}"}
 
     def run(self):

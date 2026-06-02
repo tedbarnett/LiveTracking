@@ -510,6 +510,143 @@ def create_app() -> Flask:
             "has_frame": STATE.get_jpeg() is not None,
         })
 
+    # ---- remote-ops endpoints ---------------------------------------
+    # Added 2026-06-02 because Ted is away from the rig for a week and
+    # needs to tune K live, restart a hung daemon, and tail logs without
+    # being physically present.
+
+    @app.route("/parallax", methods=["GET"])
+    def parallax_get():
+        """Return the live parallax config from the perception pipeline."""
+        return jsonify(_send_ctrl({"cmd": "parallax_get"}))
+
+    @app.route("/parallax", methods=["POST"])
+    def parallax_tune():
+        """Mutate the live parallax config WITHOUT restarting perception.
+        Body: {compensate?: bool, sign?: float[-1,1], scale?: float[0,10],
+               k_px_m?: float[0,10000]}. All keys optional; missing keys
+        are left untouched. Returns {ok, changed, current}."""
+        data = request.get_json(silent=True) or {}
+        payload = {"cmd": "parallax_tune"}
+        for k in ("compensate", "sign", "scale", "k_px_m"):
+            if k in data:
+                payload[k] = data[k]
+        return jsonify(_send_ctrl(payload))
+
+    @app.route("/perception/restart", methods=["POST"])
+    def perception_restart():
+        """End + re-run the LiveTrackingPerception scheduled task. The
+        existing detector-change endpoint already does this dance; we
+        expose it standalone for remote 'kick the daemon' moments."""
+        try:
+            subprocess.run(
+                ["schtasks", "/end", "/tn", "LiveTrackingPerception"],
+                capture_output=True, text=True, timeout=10,
+            )
+            time.sleep(2)
+            r = subprocess.run(
+                ["schtasks", "/run", "/tn", "LiveTrackingPerception"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0:
+                return jsonify({
+                    "ok": False,
+                    "reason": (r.stdout + r.stderr).strip()[-400:],
+                })
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"ok": False, "reason": repr(e)})
+        return jsonify({"ok": True, "restarted": True})
+
+    @app.route("/logs/<service>")
+    def logs_tail(service: str):
+        """Tail the last ?n=200 lines of a service log. Allowed services:
+        perception, projector, flame_web. Reads from runtime/service-logs/.
+        Capped at 1000 lines / 200 KB to keep responses sane over Cloudflare."""
+        import os
+        from livetracking.paths import RUNTIME_DIR
+        ALLOWED = {
+            "perception": "perception.log",
+            "projector": "projector.log",
+            "flame_web": "flame_web.log",
+            "calibrate": "calibrate.log",
+            "parallax_calibrate": "parallax_calibrate.log",
+        }
+        if service not in ALLOWED:
+            return jsonify({"ok": False,
+                            "reason": f"unknown service; allowed: "
+                                       f"{sorted(ALLOWED)}"}), 400
+        try:
+            n = min(int(request.args.get("n", 200)), 1000)
+        except ValueError:
+            n = 200
+        log_dir = os.path.join(RUNTIME_DIR, "service-logs")
+        log_path = os.path.join(log_dir, ALLOWED[service])
+        if not os.path.exists(log_path):
+            # Fall back to the most-recent stderr-dated log for this service
+            # (NSSM rotates with timestamps for flame_web).
+            cands = []
+            try:
+                for fn in os.listdir(log_dir):
+                    if fn.startswith(service):
+                        cands.append((os.path.getmtime(
+                            os.path.join(log_dir, fn)),
+                            os.path.join(log_dir, fn)))
+            except OSError:
+                cands = []
+            if not cands:
+                return jsonify({"ok": False,
+                                "reason": f"no log file for {service}"}), 404
+            cands.sort(reverse=True)
+            log_path = cands[0][1]
+        # Read last n lines (capped at 200 KB).
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                chunk_size = min(size, 200_000)
+                f.seek(max(0, size - chunk_size))
+                tail = f.read().decode("utf-8", errors="replace")
+            lines = tail.splitlines()[-n:]
+        except OSError as e:
+            return jsonify({"ok": False, "reason": repr(e)}), 500
+        return jsonify({
+            "ok": True,
+            "service": service,
+            "path": log_path,
+            "lines": len(lines),
+            "content": "\n".join(lines),
+        })
+
+    @app.route("/services/status")
+    def services_status():
+        """Compact view of the three scheduled-task lifecycles + Flask itself.
+        Useful for a remote dashboard: hit one URL, see what's running."""
+        out = {}
+        for task in ("LiveTrackingPerception", "LiveTrackingProjector",
+                     "LiveTrackingCalibrate", "LiveTrackingParallaxCalibrate"):
+            try:
+                r = subprocess.run(
+                    ["schtasks", "/query", "/tn", task, "/fo", "LIST", "/v"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode != 0:
+                    out[task] = {"present": False}
+                    continue
+                lines = (r.stdout or "").splitlines()
+                info = {"present": True}
+                for ln in lines:
+                    if ":" not in ln:
+                        continue
+                    k, _, v = ln.partition(":")
+                    k = k.strip()
+                    if k in ("Status", "Last Result", "Last Run Time"):
+                        info[k.lower().replace(" ", "_")] = v.strip()
+                out[task] = info
+            except Exception as e:  # noqa: BLE001
+                out[task] = {"present": False, "error": repr(e)}
+        out["flame_web"] = {"ok": True}
+        return jsonify({"ok": True, "tasks": out})
+
     return app
 
 
