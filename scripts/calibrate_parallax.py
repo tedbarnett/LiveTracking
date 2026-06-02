@@ -161,6 +161,10 @@ def run_alignment_pass(
     nudge = Nudge(pivot=(PW / 2.0, PH / 2.0))
     show_help = True
     last_depth_m = np.zeros((480, 848), dtype=np.float32)
+    # Brightness multiplier applied to the projected camera image so the
+    # operator can SEE the real bodhran/wall through the projection.
+    # 0.7 default (-30%). B/V keys adjust live.
+    brightness = float(os.environ.get("LIVETRACKING_CALIB_BRIGHTNESS", "0.7"))
 
     clock = pygame.time.Clock()
     while True:
@@ -202,6 +206,10 @@ def run_alignment_pass(
                 nudge.angle -= rstep
             if ev.key == pygame.K_RIGHTBRACKET:
                 nudge.angle += rstep
+            if ev.key == pygame.K_b:
+                brightness = min(1.0, brightness + 0.05)
+            if ev.key == pygame.K_v:
+                brightness = max(0.05, brightness - 0.05)
 
         # Grab a fresh camera frame.
         frame = cap.read()
@@ -213,6 +221,10 @@ def run_alignment_pass(
             frame.color, Hc, (PW, PH),
             flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0),
         )
+        # Apply brightness multiplier so the real scene is visible behind
+        # the projection during alignment.
+        if brightness < 0.999:
+            proj_img = cv2.convertScaleAbs(proj_img, alpha=brightness, beta=0)
         # pygame expects RGB.
         proj_rgb = cv2.cvtColor(proj_img, cv2.COLOR_BGR2RGB)
         # Surface from array (swap axes to get (W, H, 3) for pygame).
@@ -224,6 +236,7 @@ def run_alignment_pass(
                 screen, font, font_small,
                 pass_label, instructions, nudge,
                 center_depth=median_depth_in_centerbox(frame.depth_m),
+                brightness=brightness,
             )
 
         pygame.display.flip()
@@ -231,7 +244,7 @@ def run_alignment_pass(
 
 
 def _draw_overlay(screen, font, font_small, pass_label, instructions,
-                  nudge: Nudge, center_depth: float):
+                  nudge: Nudge, center_depth: float, brightness: float = 1.0):
     import pygame  # local import: this is only called from inside main()
     pad = 30
     lines = [
@@ -243,12 +256,12 @@ def _draw_overlay(screen, font, font_small, pass_label, instructions,
         "",
         "Arrows: translate (Shift = x10)   + / - : scale (Shift = x5)",
         "[ / ]: rotate (Shift = x10)       R: reset nudge",
+        "B / V: brightness up / down       H: toggle help",
         "Enter/Space: COMMIT this pass     N: skip/next     Esc: ABORT",
-        "H: toggle help",
         "",
         (f"nudge: tx={nudge.tx:+.0f}px ty={nudge.ty:+.0f}px "
          f"scale={nudge.scale:.3f} angle={nudge.angle:+.2f}deg"),
-        f"depth at camera center: {center_depth:.2f} m",
+        f"depth at camera center: {center_depth:.2f} m    brightness: {brightness:.0%}",
     ])
     # Translucent backing for readability.
     h = len(lines) * 42 + pad * 2
@@ -263,6 +276,44 @@ def _draw_overlay(screen, font, font_small, pass_label, instructions,
         surf = f.render(line, True, col)
         screen.blit(surf, (pad + 16, y))
         y += 42
+
+
+def _interstitial_prompt(pygame, screen, font, font_small,
+                          title: str, lines: list[str], cap) -> bool:
+    """Big banner between passes. Shows live depth so the operator can verify
+    they've actually aimed the camera at the NEAR target before pressing Enter.
+    Returns True on Enter, False on Esc/quit."""
+    clock = pygame.time.Clock()
+    PW, PH = screen.get_width(), screen.get_height()
+    while True:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return False
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    return False
+                if ev.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    return True
+        frame = cap.read()
+        depth_m = median_depth_in_centerbox(frame.depth_m)
+        # Dim background.
+        screen.fill((10, 10, 20))
+        # Title.
+        title_surf = font.render(title, True, (255, 220, 0))
+        screen.blit(title_surf, ((PW - title_surf.get_width()) // 2, 120))
+        # Body lines.
+        y = 240
+        for ln in lines:
+            s = font_small.render(ln, True, (255, 255, 255))
+            screen.blit(s, ((PW - s.get_width()) // 2, y))
+            y += 56
+        # Live depth read so operator sees they've aimed the camera right.
+        dcol = (120, 255, 120) if 0.5 < depth_m < 2.5 else (255, 120, 120)
+        dsurf = font.render(f"camera-center depth: {depth_m:.2f} m",
+                            True, dcol)
+        screen.blit(dsurf, ((PW - dsurf.get_width()) // 2, y + 40))
+        pygame.display.flip()
+        clock.tick(15)
 
 
 # ---- main ----------------------------------------------------------------
@@ -314,6 +365,23 @@ def main() -> int:
         H_wall, _depth_wall = res1
         np.save(H_WALL_FILE, H_wall)
         print(f"[parallax_calib] saved {H_WALL_FILE}")
+
+        # ---- INTERSTITIAL BANNER between passes ----
+        if not _interstitial_prompt(
+            pygame, screen, font, font_small,
+            "PASS 1 / 2 COMPLETE  —  WALL saved",
+            [
+                "Next: NEAR pass.",
+                "1. Place the BODHRAN on the couch (or held at ~1-2 m).",
+                "2. AIM THE REALSENSE CAMERA so the bodhran fills frame-center.",
+                "3. Watch the depth readout — it should drop to ~1-2 m, NOT ~3 m.",
+                "",
+                "Press ENTER when ready to start PASS 2.   Esc to abort.",
+            ],
+            cap,
+        ):
+            print("[parallax_calib] aborted between passes; only H_wall saved.")
+            return 2
 
         # ---- PASS 2: NEAR ----
         near_instr = [
