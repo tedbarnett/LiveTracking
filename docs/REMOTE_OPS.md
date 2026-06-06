@@ -69,6 +69,10 @@ curl -X POST -H 'Content-Type: application/json' \
 to SAM masks BEFORE the warp to projector space. Clamped to [0, 25].
 Browser UI exposes the same control as the "Edge softness" slider.
 
+Both `/mask` and `/parallax` POSTs trigger an immediate re-warp + re-push
+of the currently-shown highlight, so the projected wash updates on the
+slider release rather than waiting for the next user hover.
+
 ## Tail a service log
 
 ```bash

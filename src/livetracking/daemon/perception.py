@@ -178,6 +178,11 @@ class PerceptionDaemon:
         self.running = True
         self.paused = False
         self._pinned_id: Optional[int] = None
+        # Track what we last told the projector to draw, so a live config
+        # tune (e.g. /mask edge softness) can re-push with the updated
+        # mask without waiting for the next user hover. None = nothing
+        # shown. {"kind":"single","id":N} or {"kind":"all"}.
+        self._last_highlight: Optional[dict] = None
         # When > current time, suppress perception's own projector messages
         # so a `test_point` highlight from /test_light stays on screen.
         self._test_hold_until: float = 0.0
@@ -206,6 +211,103 @@ class PerceptionDaemon:
     def _stop(self, *_):
         self.running = False
 
+    def _push_highlight(self, obj_id: int, pinned: bool = False) -> bool:
+        """Look up an object, warp its current cam_mask through the
+        pipeline (so live cfg changes like mask_smooth_px take effect),
+        and push the highlight to the projector. Returns True on success.
+        """
+        with self.pipeline.tracker_lock:
+            tracked = self.pipeline.tracker.visible()
+        target = next((o for o in tracked if o.object_id == obj_id), None)
+        if target is None or target.cam_mask is None:
+            return False
+        # Re-warp from raw cam_mask using the LIVE cfg so a slider tweak
+        # is reflected immediately. Falls back to the cached proj_mask
+        # if re-warp fails (shouldn't, but safety net).
+        try:
+            new_proj, new_centroid = (
+                self.pipeline._warp_with_parallax_image_first(
+                    target.cam_mask, target.median_depth_m
+                )
+            )
+            if new_proj is not None:
+                target.proj_mask = new_proj
+                target.centroid_proj = new_centroid
+        except Exception as e:  # noqa: BLE001
+            print(f"[perception] _push_highlight rewarp failed: {e!r}")
+        if target.proj_mask is None:
+            return False
+        payload = {
+            "type": "highlight",
+            "id": obj_id,
+            "name": target.name,
+            "color": list(target.color_rgb),
+            "proj_centroid": (
+                list(target.centroid_proj) if target.centroid_proj else None
+            ),
+            "mask_path": _save_mask_png(target),
+        }
+        if pinned:
+            payload["pinned"] = True
+        self.proj_push.send_json(payload)
+        return True
+
+    def _push_highlight_all(self) -> int:
+        """Like _push_highlight but for the 'illuminate everything'
+        broadcast. Returns the count actually pushed."""
+        with self.pipeline.tracker_lock:
+            tracked = self.pipeline.tracker.visible()
+        # Re-warp every visible object from its raw cam_mask so live
+        # cfg changes apply on the rebroadcast.
+        objects: List[dict] = []
+        for o in tracked:
+            if o.cam_mask is None:
+                continue
+            try:
+                new_proj, new_centroid = (
+                    self.pipeline._warp_with_parallax_image_first(
+                        o.cam_mask, o.median_depth_m
+                    )
+                )
+                if new_proj is not None:
+                    o.proj_mask = new_proj
+                    o.centroid_proj = new_centroid
+            except Exception:
+                pass
+            if o.proj_mask is None:
+                continue
+            objects.append({
+                "id": o.object_id,
+                "name": o.name,
+                "color": list(o.color_rgb),
+                "proj_centroid": (
+                    list(o.centroid_proj) if o.centroid_proj else None
+                ),
+                "mask_path": _save_mask_png(o),
+            })
+        self.proj_push.send_json({
+            "type": "highlight_all", "objects": objects,
+        })
+        return len(objects)
+
+    def _refresh_active_highlight(self) -> None:
+        """Re-emit whatever is currently shown on the projector. Called
+        after a live cfg tune so the user sees the change without
+        having to re-hover."""
+        last = self._last_highlight
+        if not last:
+            return
+        try:
+            if last.get("kind") == "single":
+                self._push_highlight(
+                    int(last["id"]),
+                    pinned=bool(last.get("pinned", False)),
+                )
+            elif last.get("kind") == "all":
+                self._push_highlight_all()
+        except Exception as e:  # noqa: BLE001
+            print(f"[perception] refresh failed: {e!r}")
+
     def _handle_ctrl_message(self, msg: dict):
         """Web-app -> daemon control: rename, highlight, clear, snapshot."""
         cmd = msg.get("cmd")
@@ -229,29 +331,19 @@ class PerceptionDaemon:
             return {"ok": True, "ids": self.pipeline.tracker.hidden_ids()}
         if cmd == "highlight":
             obj_id = int(msg["id"])
-            with self.pipeline.tracker_lock:
-                tracked = self.pipeline.tracker.visible()
-            target = next((o for o in tracked if o.object_id == obj_id), None)
-            if target is None or target.proj_mask is None:
+            ok = self._push_highlight(obj_id)
+            if not ok:
                 self.proj_push.send_json({"type": "clear"})
+                self._last_highlight = None
                 return {"ok": False, "reason": "object not found or no proj_mask"}
-            self.proj_push.send_json({
-                "type": "highlight",
-                "id": obj_id,
-                "name": target.name,
-                "color": list(target.color_rgb),
-                "proj_centroid": (
-                    list(target.centroid_proj) if target.centroid_proj else None
-                ),
-                # mask bytes are sent as a separate side-channel via masks/ dir
-                "mask_path": _save_mask_png(target),
-            })
+            self._last_highlight = {"kind": "single", "id": obj_id}
             return {"ok": True}
         if cmd == "clear":
             # Don't clear if something is pinned.
             if self._pinned_id is not None:
                 return {"ok": True, "ignored": "pinned"}
             self.proj_push.send_json({"type": "clear"})
+            self._last_highlight = None
             return {"ok": True}
         if cmd == "cycle_color":
             new = self.pipeline.tracker.cycle_color(int(msg["id"]))
@@ -261,26 +353,16 @@ class PerceptionDaemon:
         if cmd == "pin":
             # Like highlight but doesn't auto-clear on mouseleave.
             obj_id = int(msg["id"])
-            with self.pipeline.tracker_lock:
-                tracked = self.pipeline.tracker.visible()
-            target = next((o for o in tracked if o.object_id == obj_id), None)
-            if target is None or target.proj_mask is None:
+            ok = self._push_highlight(obj_id, pinned=True)
+            if not ok:
                 return {"ok": False, "reason": "no such object / no proj_mask"}
-            self.proj_push.send_json({
-                "type": "highlight",
-                "id": obj_id,
-                "name": target.name,
-                "color": list(target.color_rgb),
-                "proj_centroid": (list(target.centroid_proj)
-                                  if target.centroid_proj else None),
-                "mask_path": _save_mask_png(target),
-                "pinned": True,
-            })
             self._pinned_id = obj_id
+            self._last_highlight = {"kind": "single", "id": obj_id, "pinned": True}
             return {"ok": True}
         if cmd == "unpin":
             self._pinned_id = None
             self.proj_push.send_json({"type": "clear"})
+            self._last_highlight = None
             return {"ok": True}
         if cmd == "test_point":
             # Project a fixed-size white square at the projector coordinates
@@ -386,23 +468,9 @@ class PerceptionDaemon:
             self.proj_push.send_json({"type": "set_white_light", "value": v})
             return {"ok": True, "value": v}
         if cmd == "highlight_all":
-            with self.pipeline.tracker_lock:
-                tracked = self.pipeline.tracker.visible()
-            self.proj_push.send_json({
-                "type": "highlight_all",
-                "objects": [
-                    {
-                        "id": o.object_id,
-                        "name": o.name,
-                        "color": list(o.color_rgb),
-                        "proj_centroid": (list(o.centroid_proj)
-                                          if o.centroid_proj else None),
-                        "mask_path": _save_mask_png(o),
-                    }
-                    for o in tracked if o.proj_mask is not None
-                ],
-            })
-            return {"ok": True, "count": sum(1 for o in tracked if o.proj_mask is not None)}
+            n = self._push_highlight_all()
+            self._last_highlight = {"kind": "all"}
+            return {"ok": True, "count": n}
         if cmd == "pause":
             self.paused = True
             self.proj_push.send_json({"type": "clear"})
@@ -440,6 +508,11 @@ class PerceptionDaemon:
                 cfg.mask_smooth_px = max(0, min(25, v))
                 changed["smooth_px"] = cfg.mask_smooth_px
             print(f"[perception] mask_tune applied: {changed}")
+            # Re-push the currently-shown highlight so the user sees the
+            # softness change immediately, without having to mouse-off
+            # and mouse-back-on the object row.
+            if changed:
+                self._refresh_active_highlight()
             return {"ok": True, "changed": changed,
                     "current": {"smooth_px": int(cfg.mask_smooth_px)}}
         if cmd == "parallax_tune":
@@ -466,6 +539,8 @@ class PerceptionDaemon:
                 cfg.parallax_k_px_m = max(0.0, min(10000.0, v))
                 changed["k_px_m"] = cfg.parallax_k_px_m
             print(f"[perception] parallax_tune applied: {changed}")
+            if changed:
+                self._refresh_active_highlight()
             return {"ok": True, "changed": changed,
                     "current": {"compensate": cfg.parallax_compensate,
                                 "sign": cfg.parallax_sign,

@@ -90,7 +90,10 @@ into one giant blob labeled "sofa couch."
 - **Edge softness** slider — Gaussian kernel half-width applied to SAM
   masks before warping to the projector. 0 = sharp/pixelated, 3 = soft
   (default), 7+ = airy glow. Compensates for the ~5× upscale from
-  848×480 camera to 3840×2160 projector. Live-tunable, no restart.
+  848×480 camera to 3840×2160 projector. Live-tunable, no restart;
+  changes the active highlight immediately (the perception daemon
+  re-warps and re-pushes the current object on slider release, so you
+  don't have to re-hover).
 
 ## Calibration
 
