@@ -242,3 +242,53 @@ class TestHidden:
     def test_hidden_unknown_id_returns_false(self, trk):
         assert trk.hide(999) is False
         assert trk.unhide(999) is False
+
+
+# ---- label-class soft match (rename portability across prompt edits) ---
+
+class TestLabelsOverlap:
+    """``_labels_overlap`` is the gate for inheriting a saved name onto a
+    fresh track. It must allow common DINO label drift (same physical
+    object, slightly different label string) while still rejecting
+    unrelated classes -- a rename saved on a couch must not get applied
+    to a guitar that happens to occupy the same coordinates after the
+    furniture moved.
+    """
+    from livetracking.perception.tracker import ObjectTracker as Tracker
+
+    def test_exact_match(self):
+        assert self.Tracker._labels_overlap("couch", "couch") is True
+
+    def test_case_insensitive(self):
+        assert self.Tracker._labels_overlap("Couch", "couch") is True
+
+    def test_token_overlap_couch(self):
+        # Common drift: prompt "sofa couch" -> single word "couch"
+        assert self.Tracker._labels_overlap("sofa couch", "couch") is True
+        assert self.Tracker._labels_overlap("couch", "sofa couch") is True
+
+    def test_token_overlap_guitar(self):
+        assert self.Tracker._labels_overlap(
+            "guitar acoustic guitar", "acoustic guitar"
+        ) is True
+
+    def test_disjoint_classes_reject(self):
+        assert self.Tracker._labels_overlap("couch", "guitar") is False
+        assert self.Tracker._labels_overlap(
+            "picture frame", "bottle wine"
+        ) is False
+
+    def test_empty_string_is_unconstrained(self):
+        # Empty label = "no class constraint" so legacy rows without
+        # label still match.
+        assert self.Tracker._labels_overlap("", "guitar") is True
+        assert self.Tracker._labels_overlap("guitar", "") is True
+
+    def test_stale_label_drift_does_not_poach(self):
+        # The exact bug we hit: a guitar was once saved with label
+        # "teddy bear" from an old prompt. A real teddy bear later
+        # appearing nearby would match by exact equality but NOT match
+        # any token in the current "acoustic guitar" prompt.
+        assert self.Tracker._labels_overlap(
+            "teddy bear", "acoustic guitar"
+        ) is False

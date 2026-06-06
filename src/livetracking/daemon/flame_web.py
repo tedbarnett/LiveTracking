@@ -533,6 +533,25 @@ def create_app() -> Flask:
                 payload[k] = data[k]
         return jsonify(_send_ctrl(payload))
 
+    @app.route("/mask", methods=["GET"])
+    def mask_get():
+        """Return the live mask-smoothing config from the perception
+        pipeline."""
+        return jsonify(_send_ctrl({"cmd": "mask_get"}))
+
+    @app.route("/mask", methods=["POST"])
+    def mask_tune():
+        """Mutate the live mask-smoothing config WITHOUT restarting
+        perception. Body: {smooth_px?: int[0,25]}. smooth_px controls
+        the Gaussian kernel half-width applied to SAM masks before
+        warping; 0 = sharp/pixelated, 3 = soft, 7 = very soft, 12+ =
+        airy glow. Returns {ok, changed, current}."""
+        data = request.get_json(silent=True) or {}
+        payload = {"cmd": "mask_tune"}
+        if "smooth_px" in data:
+            payload["smooth_px"] = data["smooth_px"]
+        return jsonify(_send_ctrl(payload))
+
     @app.route("/perception/restart", methods=["POST"])
     def perception_restart():
         """End + re-run the LiveTrackingPerception scheduled task. The

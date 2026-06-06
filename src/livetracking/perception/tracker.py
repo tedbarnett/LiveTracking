@@ -138,8 +138,30 @@ class ObjectTracker:
     #                     (label class + camera centroid within FP_XY_TOL_PX
     #                     + depth within FP_DEPTH_TOL_M) and inherit the name.
     # Old schema (v1) ({id_str: name}) is still read and treated as by_id.
-    _FP_XY_TOL_PX = 60.0
-    _FP_DEPTH_TOL_M = 0.40
+    _FP_XY_TOL_PX = 120.0
+    _FP_DEPTH_TOL_M = 0.60
+
+    @staticmethod
+    def _labels_overlap(a: str, b: str) -> bool:
+        """Soft label-class match. Two labels match if either string is
+        empty (no constraint), they are exactly equal (legacy behavior),
+        or any whitespace-separated token of one appears in the other.
+
+        Rationale: DINO's label for the same physical object drifts with
+        the prompt. A couch saved as ``"sofa couch"`` should still match
+        a fresh detection labelled ``"couch"`` or ``"sofa"``. A guitar
+        saved under an old ``"teddy bear"`` prompt should NOT match a
+        couch — token overlap handles both.
+        """
+        sa = (a or "").strip().lower()
+        sb = (b or "").strip().lower()
+        if not sa or not sb:
+            return True
+        if sa == sb:
+            return True
+        ta = set(sa.split())
+        tb = set(sb.split())
+        return bool(ta & tb)
 
     def _load_names(self) -> Dict[str, str]:
         """Load fingerprint renames (v2). Legacy by_id entries on disk are
@@ -185,9 +207,9 @@ class ObjectTracker:
         best_score: float = -1.0
         cx, cy = cam_xy
         for fp in self._fp_renames:
-            # Require same label class (so a couch rename doesn't poach a
-            # pillow at the same coords).
-            if (fp.get("label") or "").lower() != (label or "").lower():
+            # Soft label-class match — DINO labels drift with the prompt,
+            # so we allow token overlap. See _labels_overlap docstring.
+            if not self._labels_overlap(fp.get("label") or "", label or ""):
                 continue
             fcx, fcy = fp.get("cam_xy") or (0, 0)
             dx, dy = cx - float(fcx), cy - float(fcy)

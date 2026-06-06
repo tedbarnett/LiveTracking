@@ -87,6 +87,10 @@ into one giant blob labeled "sofa couch."
   restarting_projector → restarting_perception → done`. The whole cycle is
   ~30 s.
 - **Projector intensity** slider — alpha on the highlight wash (0–100 %).
+- **Edge softness** slider — Gaussian kernel half-width applied to SAM
+  masks before warping to the projector. 0 = sharp/pixelated, 3 = soft
+  (default), 7+ = airy glow. Compensates for the ~5× upscale from
+  848×480 camera to 3840×2160 projector. Live-tunable, no restart.
 
 ## Calibration
 

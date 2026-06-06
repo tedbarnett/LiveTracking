@@ -48,11 +48,20 @@ class ProjectorDaemon:
         self.font_big = pygame.font.SysFont(None, 115)
         self.font_lbl = pygame.font.SysFont(None, 58)
 
+        # Banner font: ~3x the number font for full-room legibility.
+        self.font_banner = pygame.font.SysFont(None, 340)
+
         self.state_lock = threading.Lock()
         self.current = None        # single highlight
         self.current_many = None   # highlight_all payload
         self.intensity = 0.78      # alpha multiplier (0..1)
         self.white_light = False   # if True, paint full white over everything
+        # When non-empty, the render loop paints a full-screen banner on top
+        # of (or in place of) everything else. Used by flame_web/perception
+        # to signal "Rebuilding…" during a detector switch or recalibrate
+        # cycle while the model is reloading. Cleared by a set_busy with an
+        # empty/None text, or by clear_busy.
+        self.busy_text: Optional[str] = None
 
         ctx = zmq.Context.instance()
         self.pull = ctx.socket(zmq.PULL)
@@ -87,6 +96,13 @@ class ProjectorDaemon:
                     self.intensity = float(msg.get("value", 0.78))
                 elif t == "set_white_light":
                     self.white_light = bool(msg.get("value", False))
+                elif t == "set_busy":
+                    txt = msg.get("text")
+                    self.busy_text = (
+                        str(txt).strip() if txt else None
+                    ) or None
+                elif t == "clear_busy":
+                    self.busy_text = None
             time.sleep(0)
 
     def _paint_one(self, cur: dict):
@@ -96,12 +112,19 @@ class ProjectorDaemon:
         if mask_path and os.path.exists(mask_path):
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is not None and mask.shape == (self.PH, self.PW):
-            alpha_val = int(255 * max(0.0, min(1.0, self.intensity)))
+            intensity = max(0.0, min(1.0, self.intensity))
             tint = np.zeros((self.PH, self.PW, 4), dtype=np.uint8)
             tint[..., 0] = color[0]
             tint[..., 1] = color[1]
             tint[..., 2] = color[2]
-            tint[..., 3] = (mask > 0).astype(np.uint8) * alpha_val
+            # Use the mask's grayscale value directly as alpha (scaled by
+            # the user's intensity setting). The mask is the upstream
+            # warp's anti-aliased output — soft edges here = soft edges
+            # on the wall. The old (mask > 0) * alpha_val binarized this
+            # and produced hard pixelated boundaries.
+            tint[..., 3] = (
+                mask.astype(np.float32) * intensity
+            ).clip(0, 255).astype(np.uint8)
             surf = self.pygame.image.frombuffer(
                 tint.tobytes(), (self.PW, self.PH), "RGBA"
             )

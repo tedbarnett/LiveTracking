@@ -94,6 +94,16 @@ class PipelineConfig:
     parallax_scale: float = 1.0
     parallax_k_px_m: float = 1200.0
 
+    # Camera-space Gaussian blur kernel half-width applied to SAM masks
+    # BEFORE warpPerspective. The warp from 848x480 camera space to
+    # 3840x2160 projector space is a ~5x upscale, which without
+    # smoothing leaves visible stair-step jaggies on the projected
+    # edge. Setting this to N produces a (2N+1) x (2N+1) Gaussian
+    # kernel with cv2-default sigma. 0 disables the blur entirely
+    # (sharp/pixelated edges). 3 = soft, 7 = very soft, 12 = airy
+    # glow. Live-tunable via /mask POST.
+    mask_smooth_px: int = 3
+
     # Wall-plane depth gating. Drop SAM masks whose median depth is more
     # than this many meters DEEPER than the calibrated wall plane at the
     # mask centroid. Catches detections seen through a doorway, in a
@@ -598,12 +608,31 @@ class Pipeline:
             if abs(shift_x) > 0.5:
                 M = shift_matrix(shift_x) @ self.H
 
+        # Smooth the camera-space mask before the big upscale warp. SAM
+        # masks are 848x480 binary blobs; the warp to 3840x2160 is a ~5x
+        # zoom, which turns every stair-step edge into a 5px jaggy block.
+        # A cheap Gaussian softens the boundary so the linear-interpolated
+        # warp can produce a true anti-aliased edge. Kernel size is
+        # live-tunable via cfg.mask_smooth_px (0 disables).
+        if cam_mask.dtype != np.uint8:
+            cam_mask = cam_mask.astype(np.uint8)
+        smooth_px = max(0, int(self.cfg.mask_smooth_px))
+        if smooth_px > 0:
+            k = 2 * smooth_px + 1
+            cam_mask_soft = cv2.GaussianBlur(cam_mask, (k, k), 0)
+        else:
+            cam_mask_soft = cam_mask
+
         proj_mask = cv2.warpPerspective(
-            cam_mask, M,
+            cam_mask_soft, M,
             (self.cfg.proj_w, self.cfg.proj_h),
             flags=cv2.INTER_LINEAR,
         )
-        _, proj_mask = cv2.threshold(proj_mask, 127, 255, cv2.THRESH_BINARY)
+        # Do NOT threshold back to binary. The grayscale edge is the
+        # anti-aliasing — the projector reads `proj_mask` directly as the
+        # alpha channel of the highlight tint, so a soft falloff here
+        # becomes a soft falloff on the wall. (Old binary-mask code is
+        # preserved in git history if we ever need it back.)
 
         if not proj_mask.any():
             return None, None

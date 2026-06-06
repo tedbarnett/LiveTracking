@@ -47,6 +47,28 @@ curl -X POST -H 'Content-Type: application/json' \
 Values are clamped to safe ranges (k_px_m ∈ [0, 10000], sign ∈ [-1, 1],
 scale ∈ [0, 10]). Changes take effect on the next frame, no restart.
 
+## Tune mask edge softness LIVE (no restart)
+
+```bash
+# See current value
+curl -s https://livetracking.barnettlabs.tech/mask
+# -> {"ok":true,"smooth_px":3}
+
+# Sharper (pixelated; SAM mask edges raw)
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"smooth_px": 0}' \
+     https://livetracking.barnettlabs.tech/mask
+
+# Softer / glowy
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"smooth_px": 10}' \
+     https://livetracking.barnettlabs.tech/mask
+```
+
+`smooth_px` is the Gaussian kernel half-width (`(2N+1)²` kernel) applied
+to SAM masks BEFORE the warp to projector space. Clamped to [0, 25].
+Browser UI exposes the same control as the "Edge softness" slider.
+
 ## Tail a service log
 
 ```bash

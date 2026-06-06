@@ -428,6 +428,20 @@ class PerceptionDaemon:
                     "sign": cfg.parallax_sign,
                     "scale": cfg.parallax_scale,
                     "k_px_m": cfg.parallax_k_px_m}
+        if cmd == "mask_get":
+            cfg = self.pipeline.cfg
+            return {"ok": True,
+                    "smooth_px": int(cfg.mask_smooth_px)}
+        if cmd == "mask_tune":
+            cfg = self.pipeline.cfg
+            changed = {}
+            if "smooth_px" in msg:
+                v = int(msg["smooth_px"])
+                cfg.mask_smooth_px = max(0, min(25, v))
+                changed["smooth_px"] = cfg.mask_smooth_px
+            print(f"[perception] mask_tune applied: {changed}")
+            return {"ok": True, "changed": changed,
+                    "current": {"smooth_px": int(cfg.mask_smooth_px)}}
         if cmd == "parallax_tune":
             # Live-mutate the pipeline config from a remote HTTP request.
             # Pipeline reads cfg on every frame, so changes take effect on

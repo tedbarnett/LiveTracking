@@ -91,6 +91,13 @@
         <span>bright</span>
         <span id="intensityVal">78</span>
       </div>
+      <h2 style="margin-top:12px;">Edge softness</h2>
+      <div class="slider-row" title="Gaussian blur applied to the mask before warping. 0 = sharp pixelated edges, higher = softer anti-aliased glow.">
+        <span>sharp</span>
+        <input id="smoothSlider" type="range" min="0" max="20" value="3">
+        <span>soft</span>
+        <span id="smoothVal">3</span>
+      </div>
     </div>
     <div id="status">connecting…</div>
   </aside>
@@ -311,6 +318,34 @@ intensitySlider.addEventListener('change', () => {
     body: JSON.stringify({ value: intensitySlider.value / 100 })
   });
 });
+
+// Edge softness slider --------------------------------------------------
+const smoothSlider = document.getElementById('smoothSlider');
+const smoothVal = document.getElementById('smoothVal');
+smoothSlider.addEventListener('input', () => {
+  smoothVal.textContent = smoothSlider.value;
+});
+smoothSlider.addEventListener('change', () => {
+  fetch('/mask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ smooth_px: parseInt(smoothSlider.value, 10) })
+  });
+});
+// Pull initial value from the daemon so the slider reflects reality
+// after a perception restart (it lives in pipeline cfg, not in the
+// browser).
+(async () => {
+  try {
+    const r = await fetch('/mask');
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j && j.ok && typeof j.smooth_px === 'number') {
+      smoothSlider.value = j.smooth_px;
+      smoothVal.textContent = j.smooth_px;
+    }
+  } catch (_e) { /* daemon not ready yet — slider keeps its HTML default */ }
+})();
 
 // Detector backend dropdown ---------------------------------------------
 const detectorSelect = document.getElementById('detectorSelect');
