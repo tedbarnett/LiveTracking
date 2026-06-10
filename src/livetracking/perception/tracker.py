@@ -228,29 +228,80 @@ class ObjectTracker:
         return best.get("name") if best else None
 
     # ---- hidden persistence ----
+    # Same poisoning problem as names (see _save_names): ids are reassigned
+    # from 1 on every restart, so persisting raw ids stamps last session's
+    # hide onto whatever object lands on that id this session (hide the
+    # couch today -> the guitar is invisible tomorrow). v2 schema persists
+    # fingerprints (label + cam_xy + depth) instead; raw-id files (v1,
+    # a JSON list of ints) are discarded on load.
     def _load_hidden(self) -> set:
+        """Returns the (empty) session id-set; populates _fp_hidden."""
+        self._fp_hidden: List[dict] = []
         if not os.path.exists(self.hidden_path):
             return set()
         try:
             with open(self.hidden_path) as f:
-                return set(int(x) for x in json.load(f))
+                data = json.load(f)
+            if isinstance(data, dict) and "by_fingerprint" in data:
+                self._fp_hidden = list(data.get("by_fingerprint") or [])
+            # v1 flat list of ids on disk: discard, ids are stale.
         except Exception:
-            return set()
+            pass
+        return set()
 
     def _save_hidden(self) -> None:
         os.makedirs(os.path.dirname(self.hidden_path), exist_ok=True)
         with open(self.hidden_path, "w") as f:
-            json.dump(sorted(self._hidden_ids), f, indent=2)
+            json.dump({"by_fingerprint": self._fp_hidden}, f, indent=2)
+
+    def _fingerprint_of(self, obj: DetectedObject) -> dict:
+        return {
+            "label": obj.dino_label or obj.name,
+            "cam_xy": [float(obj.centroid_cam[0]),
+                       float(obj.centroid_cam[1])],
+            "depth_m": float(obj.median_depth_m),
+            "last_seen": time.time(),
+        }
+
+    def _fp_matches(self, fp: dict, label: str,
+                    cam_xy: Tuple[float, float], depth_m: float) -> bool:
+        """Shared fingerprint match: label token-overlap + xy + depth tol."""
+        if not self._labels_overlap(fp.get("label") or "", label or ""):
+            return False
+        fcx, fcy = fp.get("cam_xy") or (0, 0)
+        dx, dy = cam_xy[0] - float(fcx), cam_xy[1] - float(fcy)
+        if (dx * dx + dy * dy) ** 0.5 > self._FP_XY_TOL_PX:
+            return False
+        fd = float(fp.get("depth_m") or 0.0)
+        if depth_m > 0.1 and fd > 0.1 \
+                and abs(depth_m - fd) > self._FP_DEPTH_TOL_M:
+            return False
+        return True
+
+    def _is_hidden_by_fingerprint(
+        self, label: str, cam_xy: Tuple[float, float], depth_m: float,
+    ) -> bool:
+        return any(self._fp_matches(fp, label, cam_xy, depth_m)
+                   for fp in self._fp_hidden)
 
     def hide(self, object_id: int) -> bool:
         """Mark a track hidden — it stays in the matcher (so Stage-1 blobs at
         its location don't keep promoting fresh duplicates) but is excluded
-        from active()/visible() and from the projector wash."""
+        from active()/visible() and from the projector wash. Persisted as a
+        fingerprint so the hide survives restarts without id poisoning."""
         tr = self._tracks.get(object_id)
         if tr is None:
             return False
         tr.obj.hidden = True
         self._hidden_ids.add(object_id)
+        fp = self._fingerprint_of(tr.obj)
+        # Replace any prior hidden-fingerprint at this location/label.
+        self._fp_hidden = [
+            f for f in self._fp_hidden
+            if not self._fp_matches(f, fp["label"], tuple(fp["cam_xy"]),
+                                    fp["depth_m"])
+        ]
+        self._fp_hidden.append(fp)
         self._save_hidden()
         return True
 
@@ -258,9 +309,27 @@ class ObjectTracker:
         tr = self._tracks.get(object_id)
         if tr is not None:
             tr.obj.hidden = False
+            # Drop any persisted fingerprint matching this object.
+            obj = tr.obj
+            self._fp_hidden = [
+                f for f in self._fp_hidden
+                if not self._fp_matches(
+                    f, obj.dino_label or obj.name,
+                    obj.centroid_cam, obj.median_depth_m)
+            ]
+            self._save_hidden()
         self._hidden_ids.discard(object_id)
-        self._save_hidden()
         return tr is not None
+
+    def unhide_all(self) -> int:
+        """Clear every hide — live tracks AND persisted fingerprints."""
+        n = len(self._hidden_ids) + len(self._fp_hidden)
+        for tr in self._tracks.values():
+            tr.obj.hidden = False
+        self._hidden_ids.clear()
+        self._fp_hidden = []
+        self._save_hidden()
+        return n
 
     def hidden_ids(self) -> List[int]:
         return sorted(self._hidden_ids)
@@ -453,8 +522,15 @@ class ObjectTracker:
                     if fp_name:
                         self._names[str(new_id)] = fp_name
                     self._tracks[new_id] = _Track(obj=obj, age_frames=cand.consecutive_hits, misses=0)
-                    if new_id in self._hidden_ids:
+                    # Re-apply a persisted hide if this object's fingerprint
+                    # matches one the user hid in a previous session.
+                    if self._is_hidden_by_fingerprint(
+                        cand.last_label or "",
+                        cand.last_centroid,
+                        cand.last_depth_m,
+                    ):
                         obj.hidden = True
+                        self._hidden_ids.add(new_id)
                     self._candidates.pop(best_cand_idx)
             else:
                 self._candidates.append(_Candidate(
@@ -603,6 +679,8 @@ class ObjectTracker:
             label_score=0.0,  # no DINO confidence yet
         )
         self._tracks[new_id] = _Track(obj=obj, age_frames=1, misses=0)
-        if new_id in self._hidden_ids:
-            obj.hidden = True
+        # No label yet, so fingerprint hide-matching can't apply here; the
+        # async recognizer attaches a label on its next pass and the normal
+        # promote path handles hides. (Raw new_id check removed — ids are
+        # reassigned every restart, matching on them poisons fresh objects.)
         return new_id
