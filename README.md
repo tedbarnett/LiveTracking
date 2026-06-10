@@ -127,6 +127,34 @@ markers**:
    `aX+bY+cZ+d=0` for points on the wall in camera 3D), plus a synthesized
    `footprint_measured.png` and diagnostic PNGs to `scripts/out/`.
 
+### Two-plane parallax calibration — must be re-run after any rig move
+
+`scripts/calibrate_parallax.py` (UI: **Parallax calibrate**) writes
+`H_wall.npy`, `H_near.npy`, and `parallax_depths.json`. When all three
+exist, the pipeline **prefers** the two-plane interpolation over the
+constant-K fallback — even if they were captured against an old camera/
+projector pose.
+
+**Pitfall (hit 2026-06-10):** after the rig moved, re-running the ArUco
+homography calibration fixed `H.npy` + `wall_plane.npy` but left stale
+June-6 `H_wall`/`H_near` in place — and the pipeline kept lerping toward
+the old geometry, washing every object off to one side. Re-calibrating H
+alone is NOT enough.
+
+Rules of thumb:
+
+- Moved the camera or projector? Re-run **both** calibrations, or delete
+  `runtime/calibration/H_wall.npy` / `H_near.npy` /
+  `parallax_depths.json` to drop back to the constant-K fallback (which
+  follows the fresh wall plane automatically).
+- Check the perception startup log: `two-plane parallax calib loaded`
+  means the lerp is active; only `loaded calibrated wall plane` means
+  constant-K. If washes are uniformly offset after a recalibration,
+  suspect stale two-plane files first.
+- Stale sets from past poses are parked in
+  `runtime/calibration/stale-<date>/` rather than deleted, in case a
+  pose is restored.
+
 Why time-multiplexed ArUco (not white dots or a single grid frame):
 
 - ArUco detection is shape+code based — robust against ambient daylight
