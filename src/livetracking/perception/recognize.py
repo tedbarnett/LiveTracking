@@ -45,8 +45,6 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .types import Blob
-
 
 DEFAULT_DINO_PROMPT = (
     "guitar. acoustic guitar. electric guitar. bass guitar. ukulele. "
@@ -74,11 +72,10 @@ def _prompt_to_classes(prompt: str) -> List[str]:
 
 
 def _runtime_dir() -> str:
-    return os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.abspath(__file__))))),
-        "runtime",
-    )
+    # Single source of truth lives in livetracking.paths (env-overridable
+    # via LIVETRACKING_RUNTIME_DIR). Late import to keep module import cheap.
+    from livetracking.paths import RUNTIME_DIR
+    return RUNTIME_DIR
 
 
 def _active_detector_path() -> str:
@@ -115,6 +112,9 @@ def write_active_detector(name: str) -> None:
 
 @dataclass
 class RecognitionResult:
+    # Legacy result shape from the depth-first Stage-1 era. The dataclass
+    # is retained because external probe scripts may still construct it,
+    # but the blob-driven recognize() that produced it was removed 2026-06.
     sam_mask_cam: np.ndarray          # uint8 {0,255}, camera-space, refined mask
     label: str                        # best detector label
     label_score: float                # 0..1
@@ -248,38 +248,9 @@ class _BaseRecognizer:
     def label_image(self, color_bgr: np.ndarray, **kwargs) -> List[dict]:
         raise NotImplementedError("subclass must implement label_image()")
 
-    # ----- combined (kept for any callers; not used by the live pipeline) ----
-    def recognize(
-        self,
-        color_bgr: np.ndarray,
-        blobs: List[Blob],
-        prompt: str = DEFAULT_DINO_PROMPT,
-    ) -> List[RecognitionResult]:
-        results: List[RecognitionResult] = []
-        if not blobs:
-            return results
-        sam_out = self.segment_with_points(
-            color_bgr, [b.centroid_cam for b in blobs]
-        )
-        dets = self.label_image(color_bgr, prompt=prompt)
-        for blob, (sam_mask, sam_score) in zip(blobs, sam_out):
-            bx, by, bw, bh = _mask_bbox(sam_mask)
-            best_label = "object"
-            best_score = 0.0
-            for det in dets:
-                iou = _bbox_iou((bx, by, bw, bh), det["bbox"])
-                weighted = iou * det["score"]
-                if weighted > best_score:
-                    best_score = weighted
-                    best_label = det["label"] or "object"
-            results.append(RecognitionResult(
-                sam_mask_cam=sam_mask,
-                label=best_label,
-                label_score=best_score,
-                sam_score=sam_score,
-                source_blob_id=blob.blob_id,
-            ))
-        return results
+    # NOTE: the old blob-driven `recognize()` entry point (depth-first
+    # Stage-1 era) was removed 2026-06 — the live pipeline calls
+    # label_image() + segment_with_points() directly.
 
 
 # =========================================================================

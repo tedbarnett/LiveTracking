@@ -36,6 +36,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+from livetracking.paths import CALIB_DIR, RUNTIME_DIR
 from .footprint import footprint_mask_in_camera
 from .parallax import (
     constant_k_shift_px,
@@ -145,11 +146,7 @@ class Pipeline:
         # scripts/calibrate_homography.py.
         self.wall_plane: Optional[List[float]] = None
         try:
-            wp_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(
-                    os.path.dirname(os.path.abspath(__file__))))),
-                "runtime", "calibration", "wall_plane.npy",
-            )
+            wp_path = os.path.join(CALIB_DIR, "wall_plane.npy")
             if os.path.exists(wp_path):
                 wp = np.load(wp_path)
                 if wp.size == 4:
@@ -169,11 +166,7 @@ class Pipeline:
         self.z_near_calib: float = 0.0
         self.z_wall_calib: float = 0.0
         try:
-            calib_dir = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(
-                    os.path.dirname(os.path.abspath(__file__))))),
-                "runtime", "calibration",
-            )
+            calib_dir = CALIB_DIR
             hw_path = os.path.join(calib_dir, "H_wall.npy")
             hn_path = os.path.join(calib_dir, "H_near.npy")
             dz_path = os.path.join(calib_dir, "parallax_depths.json")
@@ -362,10 +355,8 @@ class Pipeline:
                 if not os.environ.get("LIVETRACKING_TRACE"):
                     return
                 try:
-                    p = os.path.join(
-                        os.path.dirname(os.path.dirname(os.path.dirname(
-                            os.path.dirname(os.path.abspath(__file__))))),
-                        "runtime", "logs", "detection_trace.log")
+                    p = os.path.join(RUNTIME_DIR, "logs",
+                                     "detection_trace.log")
                     os.makedirs(os.path.dirname(p), exist_ok=True)
                     with open(p, "a", encoding="utf-8") as f:
                         f.write(msg + "\n")
@@ -394,7 +385,6 @@ class Pipeline:
             area = int((cam_mask > 0).sum())
             _prof["clip"] += time.perf_counter() - _ts
             if area < self.cfg.min_obj_area_px:
-                print(_trace + f" -> DROP bbox_clip area={area}", flush=True)
                 _log(_trace + f" -> DROP bbox_clip area={area}")
                 continue
 
@@ -491,8 +481,6 @@ class Pipeline:
             if dropped_by_nms:
                 _log(_trace + " -> DROP same_label_nms")
                 continue
-            _winners.append((det.get("label", "").lower(),
-                             det_bbox_xywh, area))
             _log(_trace + f" -> KEEP area={area} z={med_z:.2f}")
 
             # Wall-depth gate: drop masks that sit BEHIND the wall plane.
@@ -513,6 +501,13 @@ class Pipeline:
             _prof["warp"] += time.perf_counter() - _ts
             if proj_mask is None:
                 continue
+
+            # Register as an NMS winner only now that every downstream
+            # gate (wall-depth, warp) has passed. Registering earlier let
+            # a detection suppress its same-label competitor and THEN get
+            # dropped itself — the object vanished for the whole pass.
+            _winners.append((det.get("label", "").lower(),
+                             det_bbox_xywh, area))
 
             fresh.append(FreshDetection(
                 cam_mask=cam_mask,

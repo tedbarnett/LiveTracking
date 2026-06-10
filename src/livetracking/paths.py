@@ -50,6 +50,9 @@ MEASURED_FOOTPRINT_FILE: str = os.path.join(CALIB_DIR, "footprint_measured.png")
 OBJECT_NAMES_FILE: str = os.path.join(RUNTIME_DIR, "object_names.json")
 HIDDEN_OBJECTS_FILE: str = os.path.join(RUNTIME_DIR, "object_hidden.json")
 
+# Web-UI auth token (shared secret for the public Cloudflare tunnel)
+AUTH_TOKEN_FILE: str = os.path.join(RUNTIME_DIR, "auth_token.txt")
+
 
 def _env_int(name: str, default: int) -> int:
     v = os.environ.get(name)
@@ -81,8 +84,12 @@ RS_WIDTH: int = _env_int("LIVETRACKING_RS_WIDTH", 848)
 RS_HEIGHT: int = _env_int("LIVETRACKING_RS_HEIGHT", 480)
 RS_FPS: int = _env_int("LIVETRACKING_RS_FPS", 30)
 
-# Web UI port (Cloudflare tunnel `livetracking-laptop` targets this)
-WEB_UI_PORT: int = _env_int("LIVETRACKING_WEB_PORT", 5070)
+# Web UI port (Cloudflare tunnel `livetracking-laptop` targets this).
+# README historically documented LIVETRACKING_WEB_UI_PORT while the code
+# read LIVETRACKING_WEB_PORT — accept both, prefer the documented name.
+WEB_UI_PORT: int = _env_int(
+    "LIVETRACKING_WEB_UI_PORT", _env_int("LIVETRACKING_WEB_PORT", 5070)
+)
 
 # ZMQ endpoints (localhost IPC between the three daemons)
 ZMQ_OBJECTS_PUB: str = os.environ.get(
@@ -90,6 +97,9 @@ ZMQ_OBJECTS_PUB: str = os.environ.get(
 )
 ZMQ_PROJECTOR_PULL: str = os.environ.get(
     "LIVETRACKING_ZMQ_PROJECTOR", "tcp://127.0.0.1:5572"
+)
+ZMQ_CTRL_ENDPOINT: str = os.environ.get(
+    "LIVETRACKING_ZMQ_CTRL", "tcp://127.0.0.1:5573"
 )
 
 

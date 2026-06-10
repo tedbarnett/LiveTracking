@@ -72,6 +72,15 @@ into one giant blob labeled "sofa couch."
 
 `https://livetracking.barnettlabs.tech` (or `http://localhost:5070`):
 
+**Auth:** every route except `/healthz` requires a shared-secret token
+(the tunnel is public internet). First browser visit:
+`https://livetracking.barnettlabs.tech/?token=<token>` — sets a 180-day
+cookie and redirects to a clean URL. The token lives in
+`runtime/auth_token.txt` on the rig (auto-generated on first run;
+override with `LIVETRACKING_AUTH_TOKEN`). For curl / remote-ops, send
+header `X-LiveTracking-Token: <token>`. Set
+`LIVETRACKING_AUTH_DISABLED=1` to turn the gate off (LAN-only dev).
+
 - **Live MJPEG** of the perception camera.
 - **Object list** (numbered, color-swatched). Hover a row → projector
   illuminates that physical object. Click a row → pin. Click the swatch →
@@ -117,6 +126,34 @@ markers**:
    `dot_proj_pts.npy`, `wall_plane.npy` (a 4-vector `(a, b, c, d)` so
    `aX+bY+cZ+d=0` for points on the wall in camera 3D), plus a synthesized
    `footprint_measured.png` and diagnostic PNGs to `scripts/out/`.
+
+### Two-plane parallax calibration — must be re-run after any rig move
+
+`scripts/calibrate_parallax.py` (UI: **Parallax calibrate**) writes
+`H_wall.npy`, `H_near.npy`, and `parallax_depths.json`. When all three
+exist, the pipeline **prefers** the two-plane interpolation over the
+constant-K fallback — even if they were captured against an old camera/
+projector pose.
+
+**Pitfall (hit 2026-06-10):** after the rig moved, re-running the ArUco
+homography calibration fixed `H.npy` + `wall_plane.npy` but left stale
+June-6 `H_wall`/`H_near` in place — and the pipeline kept lerping toward
+the old geometry, washing every object off to one side. Re-calibrating H
+alone is NOT enough.
+
+Rules of thumb:
+
+- Moved the camera or projector? Re-run **both** calibrations, or delete
+  `runtime/calibration/H_wall.npy` / `H_near.npy` /
+  `parallax_depths.json` to drop back to the constant-K fallback (which
+  follows the fresh wall plane automatically).
+- Check the perception startup log: `two-plane parallax calib loaded`
+  means the lerp is active; only `loaded calibrated wall plane` means
+  constant-K. If washes are uniformly offset after a recalibration,
+  suspect stale two-plane files first.
+- Stale sets from past poses are parked in
+  `runtime/calibration/stale-<date>/` rather than deleted, in case a
+  pose is restored.
 
 Why time-multiplexed ArUco (not white dots or a single grid frame):
 
@@ -219,7 +256,10 @@ runtime/                    # H.npy, wall_plane.npy, calib.json, masks, logs (gi
 | `LIVETRACKING_DISPLAY_INDEX` | Pin the projector to a specific pygame display index | auto (biggest desktop) |
 | `LIVETRACKING_RUNTIME_DIR` | Where to write H, masks, logs | `<repo>/runtime` |
 | `LIVETRACKING_RS_EXPOSURE` | RealSense color exposure (locked) | `700` |
-| `LIVETRACKING_WEB_UI_PORT` | Flask port | `5070` |
+| `LIVETRACKING_WEB_UI_PORT` | Flask port (`LIVETRACKING_WEB_PORT` also accepted) | `5070` |
+| `LIVETRACKING_AUTH_TOKEN` | Web-UI auth token override (default: auto-generated `runtime/auth_token.txt`) | — |
+| `LIVETRACKING_AUTH_DISABLED` | `1` disables web auth entirely (LAN-only dev) | — |
+| `LIVETRACKING_ZMQ_CTRL` | Perception control REP endpoint | `tcp://127.0.0.1:5573` |
 | `LIVETRACKING_PARALLAX_COMPENSATE` | Enable per-object parallax shift before warp (`0`/`false` to disable) | `1` |
 | `LIVETRACKING_PARALLAX_SIGN` | Baseline direction. `+1` = projector RIGHT of camera (default, shifts mask RIGHT in projector pixels for near objects); `-1` = projector LEFT of camera. | `+1.0` |
 | `LIVETRACKING_PARALLAX_SCALE` | Final multiplier on the parallax shift (live tuning). | `1.0` |

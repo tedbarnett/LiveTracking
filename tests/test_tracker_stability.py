@@ -243,6 +243,82 @@ class TestHidden:
         assert trk.hide(999) is False
         assert trk.unhide(999) is False
 
+    def test_hide_survives_restart_via_fingerprint(self, tmp_path, fake_time):
+        """Hide an object, simulate a daemon restart (new tracker, same
+        persistence files), re-detect the SAME object (same label/pos/
+        depth) -> it must come back hidden."""
+        hp = str(tmp_path / "hidden.json")
+        np_ = str(tmp_path / "names.json")
+        t1 = ObjectTracker(names_path=np_, hidden_path=hp,
+                           promote_after_frames=3, stale_after_s=2.0)
+        for _ in range(3):
+            t1.update([_det(400, 240, label="bodhran", depth=1.5)])
+            fake_time.advance(0.1)
+        assert t1.hide(1) is True
+
+        # "Restart": fresh tracker instance reads the same files.
+        t2 = ObjectTracker(names_path=np_, hidden_path=hp,
+                           promote_after_frames=3, stale_after_s=2.0)
+        for _ in range(3):
+            t2.update([_det(400, 240, label="bodhran", depth=1.5)])
+            fake_time.advance(0.1)
+        assert t2.visible() == []           # re-hidden by fingerprint
+        assert len(t2.active()) == 1
+
+    def test_hide_does_not_poison_different_object(self, tmp_path,
+                                                   fake_time):
+        """The old raw-id bug: hide id=1 (couch), restart, a GUITAR gets
+        id=1 -> it must NOT be hidden (different label + position)."""
+        hp = str(tmp_path / "hidden.json")
+        np_ = str(tmp_path / "names.json")
+        t1 = ObjectTracker(names_path=np_, hidden_path=hp,
+                           promote_after_frames=3, stale_after_s=2.0)
+        for _ in range(3):
+            t1.update([_det(400, 240, label="couch", depth=2.5)])
+            fake_time.advance(0.1)
+        assert t1.hide(1) is True
+
+        t2 = ObjectTracker(names_path=np_, hidden_path=hp,
+                           promote_after_frames=3, stale_after_s=2.0)
+        for _ in range(3):
+            t2.update([_det(150, 100, label="guitar", depth=1.2)])
+            fake_time.advance(0.1)
+        vis = t2.visible()
+        assert len(vis) == 1                # new id=1 guitar stays visible
+        assert vis[0].object_id == 1
+
+    def test_unhide_all_clears_fingerprints(self, tmp_path, fake_time):
+        hp = str(tmp_path / "hidden.json")
+        np_ = str(tmp_path / "names.json")
+        t1 = ObjectTracker(names_path=np_, hidden_path=hp,
+                           promote_after_frames=3, stale_after_s=2.0)
+        for _ in range(3):
+            t1.update([_det(400, 240, label="bodhran", depth=1.5)])
+            fake_time.advance(0.1)
+        t1.hide(1)
+        assert t1.unhide_all() >= 1
+        # Restart: object must NOT come back hidden.
+        t2 = ObjectTracker(names_path=np_, hidden_path=hp,
+                           promote_after_frames=3, stale_after_s=2.0)
+        for _ in range(3):
+            t2.update([_det(400, 240, label="bodhran", depth=1.5)])
+            fake_time.advance(0.1)
+        assert len(t2.visible()) == 1
+
+    def test_legacy_v1_id_list_discarded(self, tmp_path, fake_time):
+        """Old-format hidden file (flat id list) must be ignored, not
+        applied to fresh ids."""
+        import json as _json
+        hp = tmp_path / "hidden.json"
+        hp.write_text(_json.dumps([1, 2, 3]))
+        t = ObjectTracker(names_path=str(tmp_path / "names.json"),
+                          hidden_path=str(hp),
+                          promote_after_frames=3, stale_after_s=2.0)
+        for _ in range(3):
+            t.update([_det(400, 240)])
+            fake_time.advance(0.1)
+        assert len(t.visible()) == 1        # id 1 NOT hidden by stale list
+
 
 # ---- label-class soft match (rename portability across prompt edits) ---
 

@@ -21,13 +21,49 @@ import threading
 import time
 from typing import Optional
 
+import hmac
+import secrets
+
 import zmq
-from flask import Flask, Response, jsonify, render_template, request
+from flask import (
+    Flask, Response, jsonify, make_response, redirect, render_template,
+    request,
+)
 
-from livetracking.paths import RUNTIME_DIR, WEB_UI_PORT, ZMQ_OBJECTS_PUB
+from livetracking.paths import (
+    AUTH_TOKEN_FILE,
+    RUNTIME_DIR,
+    WEB_UI_PORT,
+    ZMQ_CTRL_ENDPOINT,
+    ZMQ_OBJECTS_PUB,
+)
 
 
-CTRL_ENDPOINT = "tcp://127.0.0.1:5573"
+CTRL_ENDPOINT = ZMQ_CTRL_ENDPOINT
+
+AUTH_COOKIE = "lt_token"
+
+
+def _load_or_create_token() -> str:
+    """Shared-secret token for the public tunnel. Priority:
+    $LIVETRACKING_AUTH_TOKEN > runtime/auth_token.txt > generate+persist.
+    Set LIVETRACKING_AUTH_DISABLED=1 to turn the gate off (LAN-only dev)."""
+    env = os.environ.get("LIVETRACKING_AUTH_TOKEN", "").strip()
+    if env:
+        return env
+    try:
+        with open(AUTH_TOKEN_FILE) as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(32)
+    os.makedirs(os.path.dirname(AUTH_TOKEN_FILE), exist_ok=True)
+    with open(AUTH_TOKEN_FILE, "w") as f:
+        f.write(tok + "\n")
+    print(f"[web] generated auth token -> {AUTH_TOKEN_FILE}")
+    return tok
 
 
 # ---- shared latest state ---------------------------------------------------
@@ -36,6 +72,7 @@ class LatestState:
         self._lock = threading.Lock()
         self._objects_payload: Optional[dict] = None
         self._jpeg: Optional[bytes] = None
+        self._jpeg_seq: int = 0
         self._subscribers: list[queue.Queue] = []
 
     def update_objects(self, payload: dict):
@@ -56,6 +93,7 @@ class LatestState:
     def update_frame(self, jpeg: bytes):
         with self._lock:
             self._jpeg = jpeg
+            self._jpeg_seq += 1
 
     def get_objects(self) -> Optional[dict]:
         with self._lock:
@@ -64,6 +102,12 @@ class LatestState:
     def get_jpeg(self) -> Optional[bytes]:
         with self._lock:
             return self._jpeg
+
+    def get_jpeg_seq(self) -> tuple[Optional[bytes], int]:
+        """Frame + monotonic sequence number (for new-frame detection;
+        comparing id() of the bytes object is unreliable after GC reuse)."""
+        with self._lock:
+            return self._jpeg, self._jpeg_seq
 
     def subscribe(self) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=8)
@@ -136,6 +180,48 @@ def create_app() -> Flask:
     def index():
         return render_template("index.html")
 
+    # ---- auth gate ------------------------------------------------------
+    # The Cloudflare tunnel makes every route on this app world-reachable.
+    # Gate ALL routes (the MJPEG stream shows the inside of a home) behind
+    # a shared-secret token, EXCEPT /healthz (uptime probes). Accepted as:
+    #   * X-LiveTracking-Token: <tok>   header  (curl / remote-ops)
+    #   * ?token=<tok>                  query   (first visit; sets cookie)
+    #   * lt_token cookie               (browser, set by ?token= redirect)
+    _TOKEN = _load_or_create_token()
+    _AUTH_EXEMPT = {"healthz"}
+
+    @app.before_request
+    def _check_auth():  # noqa: ANN202
+        if os.environ.get("LIVETRACKING_AUTH_DISABLED") == "1":
+            return None
+        if (request.endpoint or "") in _AUTH_EXEMPT:
+            return None
+        supplied = (
+            request.headers.get("X-LiveTracking-Token", "")
+            or request.args.get("token", "")
+            or request.cookies.get(AUTH_COOKIE, "")
+        )
+        if supplied and hmac.compare_digest(supplied, _TOKEN):
+            # First visit via ?token= -> set the cookie and strip the
+            # token from the address bar so it isn't shoulder-surfable.
+            if request.args.get("token") and request.method == "GET":
+                clean = request.base_url
+                resp = make_response(redirect(clean))
+                resp.set_cookie(
+                    AUTH_COOKIE, _TOKEN, max_age=180 * 24 * 3600,
+                    httponly=True, samesite="Lax",
+                    secure=request.is_secure,
+                )
+                return resp
+            return None
+        if request.endpoint == "index":
+            return Response(
+                "<!doctype html><title>LiveTracking</title>"
+                "<p>Unauthorized. Open <code>/?token=&lt;token&gt;</code> "
+                "(token is in <code>runtime/auth_token.txt</code> on the "
+                "rig).</p>", status=401, mimetype="text/html")
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
     @app.route("/snapshot.jpg")
     def snapshot_jpg():
         """One-shot JPEG of the latest annotated frame — finite response."""
@@ -147,11 +233,11 @@ def create_app() -> Flask:
     @app.route("/stream.mjpg")
     def stream_mjpg():
         def gen():
-            last_id = id(None)
+            last_seq = -1
             while True:
-                jpeg = STATE.get_jpeg()
-                if jpeg is not None and id(jpeg) != last_id:
-                    last_id = id(jpeg)
+                jpeg, seq = STATE.get_jpeg_seq()
+                if jpeg is not None and seq != last_seq:
+                    last_seq = seq
                     yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
                            b"Content-Length: " + str(len(jpeg)).encode()
                            + b"\r\n\r\n" + jpeg + b"\r\n")
@@ -181,19 +267,32 @@ def create_app() -> Flask:
     def objects_json():
         return jsonify(STATE.get_objects() or {"objects": []})
 
+    def _require_int(data: dict, key: str):
+        """Parse data[key] as int or return (None, 400-response)."""
+        try:
+            return int(data[key]), None
+        except (KeyError, TypeError, ValueError):
+            return None, (jsonify(
+                {"ok": False, "reason": f"missing/invalid {key!r}"}), 400)
+
     @app.route("/rename", methods=["POST"])
     def rename():
         data = request.get_json(silent=True) or {}
-        return jsonify(_send_ctrl({
-            "cmd": "rename",
-            "id": int(data["id"]),
-            "name": str(data["name"]),
-        }))
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        name = str(data.get("name", "")).strip()
+        if not name:
+            return jsonify({"ok": False, "reason": "missing 'name'"}), 400
+        return jsonify(_send_ctrl({"cmd": "rename", "id": oid, "name": name}))
 
     @app.route("/highlight", methods=["POST"])
     def highlight():
         data = request.get_json(silent=True) or {}
-        return jsonify(_send_ctrl({"cmd": "highlight", "id": int(data["id"])}))
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        return jsonify(_send_ctrl({"cmd": "highlight", "id": oid}))
 
     @app.route("/clear", methods=["POST"])
     def clear():
@@ -218,12 +317,18 @@ def create_app() -> Flask:
     @app.route("/cycle_color", methods=["POST"])
     def cycle_color():
         data = request.get_json(silent=True) or {}
-        return jsonify(_send_ctrl({"cmd": "cycle_color", "id": int(data["id"])}))
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        return jsonify(_send_ctrl({"cmd": "cycle_color", "id": oid}))
 
     @app.route("/pin", methods=["POST"])
     def pin():
         data = request.get_json(silent=True) or {}
-        return jsonify(_send_ctrl({"cmd": "pin", "id": int(data["id"])}))
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        return jsonify(_send_ctrl({"cmd": "pin", "id": oid}))
 
     @app.route("/unpin", methods=["POST"])
     def unpin():
@@ -273,9 +378,11 @@ def create_app() -> Flask:
         # Grab the latest annotated frame via our own /snapshot.jpg route.
         import urllib.request as _ur
         try:
-            jpeg_bytes = _ur.urlopen(
-                "http://127.0.0.1:5070/snapshot.jpg", timeout=3,
-            ).read()
+            req = _ur.Request(
+                f"http://127.0.0.1:{WEB_UI_PORT}/snapshot.jpg",
+                headers={"X-LiveTracking-Token": _TOKEN},
+            )
+            jpeg_bytes = _ur.urlopen(req, timeout=3).read()
         except Exception as e:  # noqa: BLE001
             return jsonify({"ok": True, "test_point": rep, "target": target,
                             "no_snapshot": True,
@@ -398,12 +505,18 @@ def create_app() -> Flask:
     @app.route("/hide", methods=["POST"])
     def hide():
         data = request.get_json(silent=True) or {}
-        return jsonify(_send_ctrl({"cmd": "hide", "id": int(data["id"])}))
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        return jsonify(_send_ctrl({"cmd": "hide", "id": oid}))
 
     @app.route("/unhide", methods=["POST"])
     def unhide():
         data = request.get_json(silent=True) or {}
-        return jsonify(_send_ctrl({"cmd": "unhide", "id": int(data["id"])}))
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        return jsonify(_send_ctrl({"cmd": "unhide", "id": oid}))
 
     @app.route("/unhide_all", methods=["POST"])
     def unhide_all():
