@@ -35,6 +35,7 @@ import zmq
 from livetracking.config.env import parse_bool, parse_float, parse_str
 from livetracking.paths import (
     RUNTIME_DIR,
+    ZMQ_CTRL_ENDPOINT,
     ZMQ_OBJECTS_PUB,
     ZMQ_PROJECTOR_PULL,
     describe,
@@ -172,7 +173,7 @@ class PerceptionDaemon:
         # Served from a dedicated thread so the slow perception loop never
         # holds it back — hover -> highlight is < 100 ms.
         self.ctrl = ctx.socket(zmq.REP)
-        self.ctrl.bind("tcp://127.0.0.1:5573")
+        self.ctrl.bind(ZMQ_CTRL_ENDPOINT)
         self._ctrl_lock = threading.Lock()
 
         self.running = True
@@ -196,7 +197,12 @@ class PerceptionDaemon:
         while self.running:
             try:
                 msg = self.ctrl.recv_json(flags=0)
-            except Exception:
+            except Exception as e:
+                # A dead ctrl socket means every UI hover/POST times out
+                # while the daemon looks healthy. Be loud about it.
+                print(f"[perception] FATAL: ctrl socket recv failed: {e!r} "
+                      f"— control plane is DOWN, restart the daemon",
+                      flush=True)
                 break
             try:
                 with self._ctrl_lock:
@@ -205,7 +211,10 @@ class PerceptionDaemon:
                 reply = {"ok": False, "reason": repr(e)}
             try:
                 self.ctrl.send_json(reply)
-            except Exception:
+            except Exception as e:
+                print(f"[perception] FATAL: ctrl socket send failed: {e!r} "
+                      f"— control plane is DOWN, restart the daemon",
+                      flush=True)
                 break
 
     def _stop(self, *_):
@@ -323,10 +332,8 @@ class PerceptionDaemon:
             ok = self.pipeline.tracker.unhide(int(msg["id"]))
             return {"ok": ok}
         if cmd == "unhide_all":
-            ids = self.pipeline.tracker.hidden_ids()
-            for oid in ids:
-                self.pipeline.tracker.unhide(oid)
-            return {"ok": True, "count": len(ids)}
+            n = self.pipeline.tracker.unhide_all()
+            return {"ok": True, "count": n}
         if cmd == "hidden_list":
             return {"ok": True, "ids": self.pipeline.tracker.hidden_ids()}
         if cmd == "highlight":
@@ -397,16 +404,11 @@ class PerceptionDaemon:
                 # Synthesize a depth array that says "depth_m at the disc".
                 fake_depth = np.zeros((CH, CW), dtype=np.float32)
                 fake_depth[disc > 0] = depth_m_val
-                # Plane: prefer the last Stage-1 plane if available.
-                plane = None
-                try:
-                    plane = self.pipeline.last_stage1_debug.get("plane")
-                except Exception:
-                    plane = None
-                if plane is None:
-                    plane = [0.0, 0.0, -1.0, 3.7]  # fallback flat wall @ 3.7m
+                # The compat shim ignores `plane` — the pipeline uses its
+                # own calibrated self.wall_plane. (The old last_stage1_debug
+                # plane lookup was dead code from the depth-first era.)
                 pm, pc, _med = self.pipeline._warp_with_parallax(
-                    disc, fake_depth, plane,
+                    disc, fake_depth, None,
                 )
                 if pm is not None and pc is not None:
                     # Re-render as a centered square at the parallax-shifted
@@ -626,12 +628,15 @@ class PerceptionDaemon:
 
 def _save_mask_png(obj: DetectedObject) -> str:
     """Write the projector-space mask as a PNG to runtime/masks/ for the
-    projector daemon to pick up. Filename is keyed by object id."""
+    projector daemon to pick up. Filename is keyed by object id. Written
+    via tmp+rename so the projector never reads a torn file."""
     import os
     path = os.path.join(RUNTIME_DIR, "masks", f"obj_{obj.object_id:03d}.png")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if obj.proj_mask is not None:
-        cv2.imwrite(path, obj.proj_mask)
+        tmp = path + ".tmp.png"
+        if cv2.imwrite(tmp, obj.proj_mask):
+            os.replace(tmp, path)
     return path
 
 

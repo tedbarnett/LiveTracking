@@ -72,6 +72,15 @@ into one giant blob labeled "sofa couch."
 
 `https://livetracking.barnettlabs.tech` (or `http://localhost:5070`):
 
+**Auth:** every route except `/healthz` requires a shared-secret token
+(the tunnel is public internet). First browser visit:
+`https://livetracking.barnettlabs.tech/?token=<token>` — sets a 180-day
+cookie and redirects to a clean URL. The token lives in
+`runtime/auth_token.txt` on the rig (auto-generated on first run;
+override with `LIVETRACKING_AUTH_TOKEN`). For curl / remote-ops, send
+header `X-LiveTracking-Token: <token>`. Set
+`LIVETRACKING_AUTH_DISABLED=1` to turn the gate off (LAN-only dev).
+
 - **Live MJPEG** of the perception camera.
 - **Object list** (numbered, color-swatched). Hover a row → projector
   illuminates that physical object. Click a row → pin. Click the swatch →
@@ -219,7 +228,10 @@ runtime/                    # H.npy, wall_plane.npy, calib.json, masks, logs (gi
 | `LIVETRACKING_DISPLAY_INDEX` | Pin the projector to a specific pygame display index | auto (biggest desktop) |
 | `LIVETRACKING_RUNTIME_DIR` | Where to write H, masks, logs | `<repo>/runtime` |
 | `LIVETRACKING_RS_EXPOSURE` | RealSense color exposure (locked) | `700` |
-| `LIVETRACKING_WEB_UI_PORT` | Flask port | `5070` |
+| `LIVETRACKING_WEB_UI_PORT` | Flask port (`LIVETRACKING_WEB_PORT` also accepted) | `5070` |
+| `LIVETRACKING_AUTH_TOKEN` | Web-UI auth token override (default: auto-generated `runtime/auth_token.txt`) | — |
+| `LIVETRACKING_AUTH_DISABLED` | `1` disables web auth entirely (LAN-only dev) | — |
+| `LIVETRACKING_ZMQ_CTRL` | Perception control REP endpoint | `tcp://127.0.0.1:5573` |
 | `LIVETRACKING_PARALLAX_COMPENSATE` | Enable per-object parallax shift before warp (`0`/`false` to disable) | `1` |
 | `LIVETRACKING_PARALLAX_SIGN` | Baseline direction. `+1` = projector RIGHT of camera (default, shifts mask RIGHT in projector pixels for near objects); `-1` = projector LEFT of camera. | `+1.0` |
 | `LIVETRACKING_PARALLAX_SCALE` | Final multiplier on the parallax shift (live tuning). | `1.0` |

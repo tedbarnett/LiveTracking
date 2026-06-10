@@ -4,6 +4,25 @@ For when Ted is away from the rig. All commands hit
 `https://livetracking.barnettlabs.tech/` (or `http://127.0.0.1:5070`
 when on the laptop).
 
+## Auth (required on every route except /healthz)
+
+The tunnel is public internet, so all routes need the shared-secret
+token from `runtime/auth_token.txt` on the rig
+(`LIVETRACKING_AUTH_TOKEN` env overrides; `LIVETRACKING_AUTH_DISABLED=1`
+turns the gate off for LAN-only dev).
+
+```bash
+# Convenient pattern for a remote shell session:
+export LT_TOKEN='<contents of runtime/auth_token.txt>'
+alias ltcurl="curl -s -H \"X-LiveTracking-Token: $LT_TOKEN\""
+
+# Browser: visit once with ?token=<token> — sets a 180-day cookie.
+```
+
+All examples below assume the `X-LiveTracking-Token` header is attached
+(or use `ltcurl` in place of `curl -s`).
+
+
 ## Status / health
 
 ```bash
