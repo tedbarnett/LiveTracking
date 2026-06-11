@@ -51,7 +51,14 @@ from livetracking.perception.footprint import save_homography
 # projector cone (a half-marker outside the edge would clip).
 GRID_N = 4
 GRID_FRACS = np.linspace(0.18, 0.82, GRID_N)
-MARKER_SIZE_FRAC = 0.22   # 22% of min(PW,PH) = ~475 proj px at 2160 vertical
+MARKER_SIZE_FRAC = 0.30   # 30% of min(PW,PH) = ~648 proj px at 2160 vertical.
+                          # Was 0.22 — at the dim cone edges (DLP brightness
+                          # falloff) 22% (~105 cam px) had marginal contrast and
+                          # edge markers failed DETECTION, collapsing the
+                          # footprint to ~half the real cone.
+RETRY_SCALE = 1.5         # second-chance pass: missed markers retried at
+                          # this multiple of marker_px (more camera pixels =
+                          # detectable at lower contrast).
 ARUCO_DICT_NAME = cv2.aruco.DICT_4X4_50
 SETTLE_S = 0.35           # time between projector flip and capture
 CAPTURE_DRAIN = 4         # discard this many frames after settle
@@ -192,50 +199,60 @@ def main() -> int:
         overview = baseline.color.copy()
 
         for marker_id, cx, cy in cells:
-            frame_bgr, corners_proj = build_marker_frame(
-                PW, PH, marker_id, marker_px, cx, cy, dictionary
-            )
-            show_bgr(frame_bgr)
-            time.sleep(SETTLE_S)
-            for _ in range(CAPTURE_DRAIN):
-                cap.read()
-            shot = cap.read()
-            gray = cv2.cvtColor(shot.color, cv2.COLOR_BGR2GRAY)
-            det_corners, det_ids, _ = detector.detectMarkers(gray)
             found = False
-            if det_ids is not None:
-                ids_flat = det_ids.flatten().tolist()
-                if marker_id in ids_flat:
-                    idx = ids_flat.index(marker_id)
-                    cam4 = det_corners[idx].reshape(4, 2)
-                    for k in range(4):
-                        cam_pts.append([float(cam4[k, 0]), float(cam4[k, 1])])
-                        proj_pts.append([float(corners_proj[k, 0]),
-                                         float(corners_proj[k, 1])])
-                    # Sample wall depth at this marker's center for plane fit.
-                    cxm, cym = cam4.mean(axis=0)
-                    ix, iy = int(round(cxm)), int(round(cym))
-                    if 0 <= ix < shot.depth_m.shape[1] and \
-                       0 <= iy < shot.depth_m.shape[0]:
-                        # 5x5 median for robustness against missing pixels.
-                        x0 = max(0, ix - 2); x1 = min(shot.depth_m.shape[1], ix + 3)
-                        y0 = max(0, iy - 2); y1 = min(shot.depth_m.shape[0], iy + 3)
-                        patch = shot.depth_m[y0:y1, x0:x1]
-                        valid = patch[patch > 0.1]
-                        if valid.size >= 4:
-                            cam_depth_samples.append(
-                                [float(cxm), float(cym),
-                                 float(np.median(valid))]
-                            )
-                    cv2.polylines(overview,
-                                  [cam4.astype(np.int32)], True,
-                                  (0, 255, 0), 2)
-                    centroid = cam4.mean(axis=0).astype(int)
-                    cv2.putText(overview, str(marker_id),
-                                tuple(centroid),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    found = True
-                    n_detected += 1
+            cam4 = None
+            shot = None
+            corners_proj = None
+            retry_px = int(round(marker_px * RETRY_SCALE))
+            for attempt_i, attempt_px in enumerate((marker_px, retry_px)):
+                frame_bgr, corners_proj = build_marker_frame(
+                    PW, PH, marker_id, attempt_px, cx, cy, dictionary
+                )
+                show_bgr(frame_bgr)
+                time.sleep(SETTLE_S)
+                for _ in range(CAPTURE_DRAIN):
+                    cap.read()
+                shot = cap.read()
+                gray = cv2.cvtColor(shot.color, cv2.COLOR_BGR2GRAY)
+                det_corners, det_ids, _ = detector.detectMarkers(gray)
+                if det_ids is not None:
+                    ids_flat = det_ids.flatten().tolist()
+                    if marker_id in ids_flat:
+                        idx = ids_flat.index(marker_id)
+                        cam4 = det_corners[idx].reshape(4, 2)
+                        found = True
+                        if attempt_i > 0:
+                            print(f"[calib] marker {marker_id:2d} recovered "
+                                  f"on 2nd pass ({attempt_px}px)")
+                        break
+            if found:
+                for k in range(4):
+                    cam_pts.append([float(cam4[k, 0]), float(cam4[k, 1])])
+                    proj_pts.append([float(corners_proj[k, 0]),
+                                     float(corners_proj[k, 1])])
+                # Sample wall depth at this marker's center for plane fit.
+                cxm, cym = cam4.mean(axis=0)
+                ix, iy = int(round(cxm)), int(round(cym))
+                if 0 <= ix < shot.depth_m.shape[1] and \
+                   0 <= iy < shot.depth_m.shape[0]:
+                    # 5x5 median for robustness against missing pixels.
+                    x0 = max(0, ix - 2); x1 = min(shot.depth_m.shape[1], ix + 3)
+                    y0 = max(0, iy - 2); y1 = min(shot.depth_m.shape[0], iy + 3)
+                    patch = shot.depth_m[y0:y1, x0:x1]
+                    valid = patch[patch > 0.1]
+                    if valid.size >= 4:
+                        cam_depth_samples.append(
+                            [float(cxm), float(cym),
+                             float(np.median(valid))]
+                        )
+                cv2.polylines(overview,
+                              [cam4.astype(np.int32)], True,
+                              (0, 255, 0), 2)
+                centroid = cam4.mean(axis=0).astype(int)
+                cv2.putText(overview, str(marker_id),
+                            tuple(centroid),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                n_detected += 1
             tag = "OK " if found else "MISS"
             print(f"[calib] marker {marker_id:2d} proj=({cx},{cy}) {tag}")
             if not found:
