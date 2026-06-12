@@ -684,6 +684,31 @@ def create_app() -> Flask:
             payload["smooth_px"] = data["smooth_px"]
         return jsonify(_send_ctrl(payload))
 
+    @app.route("/dino", methods=["GET"])
+    def dino_get():
+        """Return the live DINO detection config from the perception
+        pipeline: thresholds, min object area, and the open-vocab prompt."""
+        return jsonify(_send_ctrl({"cmd": "dino_get"}))
+
+    @app.route("/dino", methods=["POST"])
+    def dino_tune():
+        """Mutate the live DINO detection config WITHOUT restarting
+        perception. Body (all keys optional):
+          box_thresh:  float[0.01,0.95] — min confidence to report a box
+          text_thresh: float[0.01,0.95] — min image↔word match for labels
+          min_score:   float[0.01,0.95] — pipeline Stage-B score cut
+          min_area_px: int[50,50000]    — min mask area in camera pixels
+          prompt:      str              — 'guitar. drum. chair.' vocab
+        Changes apply on the next DINO pass (~1 s). Returns
+        {ok, changed, current}."""
+        data = request.get_json(silent=True) or {}
+        payload = {"cmd": "dino_tune"}
+        for k in ("box_thresh", "text_thresh", "min_score",
+                  "min_area_px", "prompt"):
+            if k in data:
+                payload[k] = data[k]
+        return jsonify(_send_ctrl(payload))
+
     @app.route("/perception/restart", methods=["POST"])
     def perception_restart():
         """End + re-run the LiveTrackingPerception scheduled task. The

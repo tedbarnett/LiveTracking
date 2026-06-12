@@ -32,7 +32,7 @@ import cv2
 import numpy as np
 import zmq
 
-from livetracking.config.env import parse_bool, parse_float, parse_str
+from livetracking.config.env import parse_bool, parse_float, parse_int, parse_str
 from livetracking.paths import (
     RUNTIME_DIR,
     ZMQ_CTRL_ENDPOINT,
@@ -149,6 +149,27 @@ class PerceptionDaemon:
         print(f"[perception] parallax: compensate={cfg.parallax_compensate} "
               f"sign={cfg.parallax_sign} scale={cfg.parallax_scale} "
               f"k_px_m={cfg.parallax_k_px_m}")
+
+        # DINO detection knobs (env overrides for boot-time tuning; the web
+        # UI's Detection panel live-mutates the same fields via dino_tune).
+        cfg.dino_box_thresh = parse_float(
+            "LIVETRACKING_DINO_BOX_THRESH", cfg.dino_box_thresh,
+            min_value=0.01, max_value=0.95)
+        cfg.dino_text_thresh = parse_float(
+            "LIVETRACKING_DINO_TEXT_THRESH", cfg.dino_text_thresh,
+            min_value=0.01, max_value=0.95)
+        cfg.min_dino_score = parse_float(
+            "LIVETRACKING_DINO_MIN_SCORE", cfg.min_dino_score,
+            min_value=0.01, max_value=0.95)
+        cfg.min_obj_area_px = parse_int(
+            "LIVETRACKING_MIN_OBJ_AREA_PX", cfg.min_obj_area_px,
+            min_value=50, max_value=50000)
+        env_prompt = parse_str("LIVETRACKING_DINO_PROMPT", "")
+        if env_prompt.strip():
+            cfg.dino_prompt = env_prompt.strip()
+        print(f"[perception] dino: box={cfg.dino_box_thresh} "
+              f"text={cfg.dino_text_thresh} min_score={cfg.min_dino_score} "
+              f"min_area={cfg.min_obj_area_px}")
 
         # Detector backend: persisted in runtime/active_detector.json.
         # An env override is honored so we can spin up an alternate detector
@@ -535,6 +556,53 @@ class PerceptionDaemon:
             cfg = self.pipeline.cfg
             return {"ok": True,
                     "smooth_px": int(cfg.mask_smooth_px)}
+        if cmd == "dino_get":
+            cfg = self.pipeline.cfg
+            return {"ok": True,
+                    "box_thresh": cfg.dino_box_thresh,
+                    "text_thresh": cfg.dino_text_thresh,
+                    "min_score": cfg.min_dino_score,
+                    "min_area_px": int(cfg.min_obj_area_px),
+                    "prompt": cfg.dino_prompt}
+        if cmd == "dino_tune":
+            # Live-mutate DINO detection knobs. Pipeline reads cfg on every
+            # recognize pass, so changes apply on the next DINO frame (~1 s)
+            # without a restart. Bounds match the boot-time env clamps.
+            cfg = self.pipeline.cfg
+            changed = {}
+            if "box_thresh" in msg:
+                v = float(msg["box_thresh"])
+                cfg.dino_box_thresh = max(0.01, min(0.95, v))
+                changed["box_thresh"] = cfg.dino_box_thresh
+            if "text_thresh" in msg:
+                v = float(msg["text_thresh"])
+                cfg.dino_text_thresh = max(0.01, min(0.95, v))
+                changed["text_thresh"] = cfg.dino_text_thresh
+            if "min_score" in msg:
+                v = float(msg["min_score"])
+                cfg.min_dino_score = max(0.01, min(0.95, v))
+                changed["min_score"] = cfg.min_dino_score
+            if "min_area_px" in msg:
+                v = int(msg["min_area_px"])
+                cfg.min_obj_area_px = max(50, min(50000, v))
+                changed["min_area_px"] = cfg.min_obj_area_px
+            if "prompt" in msg:
+                p = str(msg["prompt"]).strip()
+                if p:
+                    # DINO wants 'a. b. c.' — make sure it ends with a dot,
+                    # otherwise the last class silently scores near zero.
+                    if not p.endswith("."):
+                        p += "."
+                    cfg.dino_prompt = p
+                    changed["prompt"] = cfg.dino_prompt
+            print(f"[perception] dino_tune applied: "
+                  f"{ {k: (v[:60] + '…' if isinstance(v, str) and len(v) > 60 else v) for k, v in changed.items()} }")
+            return {"ok": True, "changed": changed,
+                    "current": {"box_thresh": cfg.dino_box_thresh,
+                                "text_thresh": cfg.dino_text_thresh,
+                                "min_score": cfg.min_dino_score,
+                                "min_area_px": int(cfg.min_obj_area_px),
+                                "prompt": cfg.dino_prompt}}
         if cmd == "mask_tune":
             cfg = self.pipeline.cfg
             changed = {}

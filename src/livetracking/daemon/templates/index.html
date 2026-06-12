@@ -54,6 +54,36 @@
   #status { font-size: 11px; color: #555; padding-top: 8px; border-top: 1px solid #222; }
   .slider-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
   .slider-row input[type=range] { flex: 1; }
+  /* Floating Detection tuner ------------------------------------------- */
+  #dinoPanel { position: fixed; top: 70px; right: 24px; width: 320px; z-index: 50;
+               background: #1d1f24; border: 1px solid #3a3f4a; border-radius: 10px;
+               box-shadow: 0 12px 32px rgba(0,0,0,0.7); display: none;
+               flex-direction: column; }
+  #dinoPanel.open { display: flex; }
+  #dinoPanel header { cursor: move; padding: 8px 12px; border-bottom: 1px solid #2c2f36;
+                      display: flex; align-items: center; justify-content: space-between;
+                      gap: 8px; user-select: none; border-radius: 10px 10px 0 0; background: #23262d; }
+  #dinoPanel header h3 { margin: 0; font-size: 13px; font-weight: 600; color: #cdd3de; }
+  #dinoPanel header .x { background: transparent; border: none; color: #888; font-size: 16px;
+                         cursor: pointer; padding: 0 4px; }
+  #dinoPanel header .x:hover { color: #fff; }
+  #dinoPanel .body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 10px;
+                     max-height: 70vh; overflow-y: auto; }
+  .tune-row { display: flex; flex-direction: column; gap: 3px; }
+  .tune-row .lbl { display: flex; justify-content: space-between; font-size: 11px; color: #9aa3b2; }
+  .tune-row .lbl b { color: #dfe5ee; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .tune-row input[type=range] { width: 100%; margin: 0; }
+  #dinoPrompt { background: #14161a; color: #dfe5ee; border: 1px solid #3a3f4a; border-radius: 6px;
+                font-size: 12px; font-family: inherit; padding: 7px 8px; min-height: 88px;
+                resize: vertical; box-sizing: border-box; line-height: 1.45; }
+  #dinoPrompt:focus { outline: none; border-color: #5a8ac4; }
+  #dinoPanel .foot { display: flex; gap: 8px; align-items: center; }
+  #dinoPanel .foot button { flex: 1; font-size: 12px; padding: 6px 8px; }
+  #dinoStatus { font-size: 11px; color: #6f7884; min-height: 14px; }
+  @media (max-width: 720px) {
+    #dinoPanel { left: 8px; right: 8px; top: auto; bottom: 8px; width: auto; }
+    #dinoPanel header { cursor: default; }
+  }
   /* Narrow / mobile: stack vertically — live video pinned on top, object
      list + controls scroll underneath it. */
   @media (max-width: 720px) {
@@ -105,6 +135,7 @@
         <button id="btnWhite" title="Project a solid white frame — useful for checking projector coverage and for ambient room light.">☀ White Light</button>
         <button id="btnRecalibrate" title="Stop perception, project the calibration pattern, re-solve the camera→projector homography, then restart. Use after moving the camera or projector.">⟳ Re-calibrate</button>
         <button id="btnParallax" title="Two-plane parallax calibration. Stops perception+projector, then projects the live camera image on the wall and lets you manually align it to (1) the wall and (2) a near target (bodhran). Per-object projection then becomes depth-correct.">◑ Parallax</button>
+        <button id="btnDino" title="Open the live detection tuner: DINO confidence thresholds, minimum object size, and the open-vocabulary prompt. Changes apply within ~1 s, no restart.">⚙ Detection</button>
         <button id="btnUnhide" style="display:none;" title="Bring back any objects you previously hid with the ✕ button.">Unhide all</button>
       </div>
     </div>
@@ -127,6 +158,39 @@
     <div id="status">connecting…</div>
   </aside>
 </main>
+<div id="dinoPanel">
+  <header id="dinoDrag">
+    <h3>⚙ Detection tuner</h3>
+    <button class="x" id="dinoClose" title="Close">✕</button>
+  </header>
+  <div class="body">
+    <div class="tune-row" title="Minimum confidence for DINO to report a detection at all. Lower = more objects + more junk; higher = fewer, surer objects.">
+      <div class="lbl"><span>Box confidence (precision ↔ recall)</span><b id="dinoBoxVal">0.30</b></div>
+      <input id="dinoBox" type="range" min="5" max="80" value="30">
+    </div>
+    <div class="tune-row" title="How strongly an image region must match a word in the prompt before that word becomes the label. Mostly affects label quality.">
+      <div class="lbl"><span>Label match</span><b id="dinoTextVal">0.25</b></div>
+      <input id="dinoText" type="range" min="5" max="80" value="25">
+    </div>
+    <div class="tune-row" title="Second score cut applied by the pipeline after detection (Stage B).">
+      <div class="lbl"><span>Min score (pipeline cut)</span><b id="dinoScoreVal">0.30</b></div>
+      <input id="dinoScore" type="range" min="5" max="80" value="30">
+    </div>
+    <div class="tune-row" title="Minimum mask size in camera pixels. ~800 px ≈ a 10 cm object at 2.5 m. Raise to ignore small clutter, lower to catch small things.">
+      <div class="lbl"><span>Min object size (camera px)</span><b id="dinoAreaVal">800</b></div>
+      <input id="dinoArea" type="range" min="50" max="5000" step="50" value="800">
+    </div>
+    <div class="tune-row" title="The open-vocabulary prompt: DINO only finds what's listed here. Separate classes with periods, e.g. 'guitar. drum. chair.'">
+      <div class="lbl"><span>Prompt (classes, period-separated)</span></div>
+      <textarea id="dinoPrompt" spellcheck="false"></textarea>
+    </div>
+    <div class="foot">
+      <button id="dinoApplyPrompt" class="primary" title="Send the edited prompt to the detector. Sliders apply instantly on release; the prompt only applies when you click this.">Apply prompt</button>
+      <button id="dinoReset" title="Restore all values (including the prompt) to the built-in defaults.">Reset defaults</button>
+    </div>
+    <div id="dinoStatus"></div>
+  </div>
+</div>
 <script>
 const objList = document.getElementById('objList');
 const statusEl = document.getElementById('status');
@@ -417,6 +481,117 @@ smoothSlider.addEventListener('change', () => {
       smoothVal.textContent = j.smooth_px;
     }
   } catch (_e) { /* daemon not ready yet — slider keeps its HTML default */ }
+})();
+
+// Detection tuner (floating panel) ---------------------------------------
+const dinoPanel = document.getElementById('dinoPanel');
+const dinoStatusEl = document.getElementById('dinoStatus');
+const dinoPromptEl = document.getElementById('dinoPrompt');
+const DINO_DEFAULTS = { box_thresh: 0.30, text_thresh: 0.25, min_score: 0.30,
+                        min_area_px: 800 };
+// Slider <-> value plumbing. Range inputs use ints (x100 for the
+// 0.01-resolution floats) because fractional step + live label is fiddly.
+const dinoSliders = [
+  { el: 'dinoBox',   val: 'dinoBoxVal',   key: 'box_thresh',  scale: 100 },
+  { el: 'dinoText',  val: 'dinoTextVal',  key: 'text_thresh', scale: 100 },
+  { el: 'dinoScore', val: 'dinoScoreVal', key: 'min_score',   scale: 100 },
+  { el: 'dinoArea',  val: 'dinoAreaVal',  key: 'min_area_px', scale: 1 },
+];
+function dinoSetStatus(msg, ok = true) {
+  dinoStatusEl.textContent = msg;
+  dinoStatusEl.style.color = ok ? '#6f7884' : '#c66';
+}
+async function dinoPost(body) {
+  try {
+    const r = await fetch('/dino', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!j.ok) { dinoSetStatus('apply failed: ' + (j.reason || '?'), false); return null; }
+    dinoSetStatus('applied — takes effect on next detection pass (~1 s)');
+    return j;
+  } catch (e) {
+    dinoSetStatus('apply failed: ' + e, false);
+    return null;
+  }
+}
+function dinoRenderValues(cfg) {
+  dinoSliders.forEach(s => {
+    const input = document.getElementById(s.el);
+    const label = document.getElementById(s.val);
+    const v = cfg[s.key];
+    if (typeof v !== 'number') return;
+    input.value = Math.round(v * s.scale);
+    label.textContent = s.scale === 1 ? String(Math.round(v)) : v.toFixed(2);
+  });
+  if (typeof cfg.prompt === 'string') dinoPromptEl.value = cfg.prompt;
+}
+dinoSliders.forEach(s => {
+  const input = document.getElementById(s.el);
+  const label = document.getElementById(s.val);
+  input.addEventListener('input', () => {
+    const v = input.value / s.scale;
+    label.textContent = s.scale === 1 ? String(Math.round(v)) : v.toFixed(2);
+  });
+  input.addEventListener('change', () => {
+    dinoPost({ [s.key]: input.value / s.scale });
+  });
+});
+document.getElementById('dinoApplyPrompt').addEventListener('click', async () => {
+  const p = dinoPromptEl.value.trim();
+  if (!p) { dinoSetStatus('prompt is empty — not applied', false); return; }
+  const j = await dinoPost({ prompt: p });
+  if (j && j.current) dinoPromptEl.value = j.current.prompt;
+});
+document.getElementById('dinoReset').addEventListener('click', async () => {
+  const j = await dinoPost({ ...DINO_DEFAULTS, prompt: dinoDefaultPrompt });
+  if (j && j.current) dinoRenderValues(j.current);
+});
+let dinoDefaultPrompt = '';   // captured from the daemon on first open
+let dinoLoaded = false;
+async function dinoRefresh() {
+  try {
+    const r = await fetch('/dino');
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j && j.ok) {
+      dinoRenderValues(j);
+      if (!dinoLoaded) { dinoDefaultPrompt = j.prompt; dinoLoaded = true; }
+    }
+  } catch (_e) { /* daemon not up yet */ }
+}
+document.getElementById('btnDino').addEventListener('click', () => {
+  const opening = !dinoPanel.classList.contains('open');
+  dinoPanel.classList.toggle('open');
+  if (opening) { dinoSetStatus(''); dinoRefresh(); }
+});
+document.getElementById('dinoClose').addEventListener('click', () => {
+  dinoPanel.classList.remove('open');
+});
+// Drag-to-move (desktop). On mobile the panel is fixed to the bottom.
+(() => {
+  const drag = document.getElementById('dinoDrag');
+  let sx = 0, sy = 0, ox = 0, oy = 0, moving = false;
+  drag.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.x')) return;
+    if (window.matchMedia('(max-width: 720px)').matches) return;
+    moving = true;
+    const r = dinoPanel.getBoundingClientRect();
+    sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+    drag.setPointerCapture(e.pointerId);
+  });
+  drag.addEventListener('pointermove', (e) => {
+    if (!moving) return;
+    const nx = Math.max(0, Math.min(window.innerWidth - 80, ox + e.clientX - sx));
+    const ny = Math.max(0, Math.min(window.innerHeight - 40, oy + e.clientY - sy));
+    dinoPanel.style.left = nx + 'px';
+    dinoPanel.style.top = ny + 'px';
+    dinoPanel.style.right = 'auto';
+    dinoPanel.style.bottom = 'auto';
+  });
+  drag.addEventListener('pointerup', () => { moving = false; });
 })();
 
 // Detector backend dropdown ---------------------------------------------
