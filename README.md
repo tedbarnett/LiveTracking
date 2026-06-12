@@ -81,13 +81,18 @@ override with `LIVETRACKING_AUTH_TOKEN`). For curl / remote-ops, send
 header `X-LiveTracking-Token: <token>`. Set
 `LIVETRACKING_AUTH_DISABLED=1` to turn the gate off (LAN-only dev).
 
-- **Live MJPEG** of the perception camera.
-- **Object list** (numbered, color-swatched). Hover a row → projector
-  illuminates that physical object. Click a row → pin. Click the swatch →
-  cycle color. ✕ → hide (won't reappear until "Unhide all").
+- **Live MJPEG** of the perception camera. Click an object's outline →
+  toggle its highlight (same as its checkbox).
+- **Object list** (numbered, color-swatched, checkboxed). Check a row →
+  projector illuminates that physical object; multiple checks light
+  multiple objects at once. **Select all** checkbox at the top washes
+  everything (new detections join automatically while it's on).
+  Double-click the swatch → pin. Click the swatch → cycle color.
+  ✎ → rename. ✕ → hide (won't reappear until "Unhide all").
 - **⏸ Pause / ▶ Run** — freeze the pipeline.
-- **Highlight all** — wash all detected objects at once.
-- **Clear** — projector to black.
+- **Controls panel** (below the object list): detector backend dropdown,
+  Clear, White Light, Re-calibrate, Parallax, Unhide all.
+- **Clear** — projector to black, all checkboxes off.
 - **☀ White Light** — projector throws full white at the scene (toggle).
   Useful for verifying cone position, lighting the room, or smoke-testing
   the projector pipeline.

@@ -28,10 +28,17 @@
   .panel h2 { margin: 0 0 4px 0; font-size: 12px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.05em; }
   .row { display: flex; gap: 8px; align-items: center; }
   #help { font-size: 11px; color: #666; }
-  .obj { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 4px; margin-bottom: 4px; cursor: pointer; transition: background 0.1s; }
-  .obj:hover { background: #2a2a2a; }
-  .obj.hovered { background: #333; outline: 1px solid #555; }
+  .obj { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 4px; margin-bottom: 4px; transition: background 0.1s; }
+  .obj:hover { background: #222; }
+  .obj.selected { background: #20262e; }
   .obj.pinned  { background: #2b2b3a; outline: 2px solid #88a; }
+  input[type=checkbox] { width: 15px; height: 15px; accent-color: #4a8ac4; cursor: pointer; flex-shrink: 0; margin: 0; }
+  .chk { display: flex; align-items: center; gap: 7px; cursor: pointer; font-size: 13px; color: #ddd; user-select: none; }
+  #controlPanel { background: #202020; border: 1px solid #2e2e2e; border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+  .ctl-row { display: flex; align-items: center; gap: 10px; font-size: 12px; color: #aaa; flex-wrap: wrap; }
+  .ctl-row select { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 4px 6px; border-radius: 4px; flex: 1; min-width: 0; font-size: 12px; }
+  .ctl-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+  .ctl-grid button { flex: 1 1 calc(50% - 6px); font-size: 12px; padding: 5px 8px; white-space: nowrap; }
   .swatch { width: 18px; height: 18px; border-radius: 4px; flex-shrink: 0; border: 1px solid #000; box-shadow: 0 0 0 1px #444; }
   .hide-btn { background: transparent; border: 1px solid #444; color: #888; width: 22px; height: 22px; border-radius: 4px; padding: 0; font-size: 12px; cursor: pointer; flex-shrink: 0; }
   .hide-btn:hover { background: #4a1f1f; border-color: #c44; color: #fff; }
@@ -53,21 +60,6 @@
   <h1>LiveTracking</h1>
   <div class="controls">
     <button id="btnPause" class="primary" title="Freeze/resume tracking. While paused the projector keeps showing the last frame's washes but perception stops detecting new objects.">⏸ Pause</button>
-    <label style="font-size:12px;color:#aaa;display:flex;align-items:center;gap:4px;" title="Switch the object detector backend. Switching restarts perception (~30 s).">
-      Detector:
-      <select id="detectorSelect" style="background:#222;color:#eee;border:1px solid #444;padding:2px 4px;border-radius:3px;">
-        <option value="dino">DINO (open-vocab)</option>
-        <option value="yoloworld">YOLO-World (open-vocab)</option>
-        <option value="yolo">YOLO (COCO 80)</option>
-        <option value="mediapipe">MediaPipe (COCO 80)</option>
-      </select>
-    </label>
-    <button id="btnAll" title="Illuminate every visible object on the wall at once.">Highlight all</button>
-    <button id="btnClear" title="Turn off all projector washes.">Clear</button>
-    <button id="btnWhite" title="Project a solid white frame — useful for checking projector coverage and for ambient room light.">☀ White Light</button>
-    <button id="btnRecalibrate" title="Stop perception, project the ArUco calibration grid, re-solve the camera→projector homography, then restart. Use after moving the camera or projector.">⟳ Re-calibrate</button>
-    <button id="btnParallax" title="Two-plane parallax calibration. Stops perception+projector, then projects the live camera image on the wall and lets you manually align it to (1) the wall and (2) a near target (bodhran). Per-object projection then becomes depth-correct.">◑ Parallax</button>
-    <button id="btnUnhide" style="display:none;" title="Bring back any objects you previously hid with the ✕ button.">Unhide all</button>
   </div>
   <div class="meta"><span id="frameTimings">…</span></div>
 </header>
@@ -80,8 +72,30 @@
   <aside id="side">
     <div class="panel">
       <h2>Objects</h2>
-      <div id="help">Hover an item to illuminate it on the wall. Click name to rename.</div>
+      <label class="chk" style="padding:4px 8px;" title="Toggle highlight on every visible object at once.">
+        <input type="checkbox" id="chkSelectAll"> Select all
+      </label>
       <div id="objList"></div>
+      <div id="help">Check an object to illuminate it on the wall. Click ✎ to rename.</div>
+    </div>
+    <div class="panel" id="controlPanel">
+      <h2 style="margin:0;">Controls</h2>
+      <div class="ctl-row" title="Switch the object detector backend. Switching restarts perception (~30 s).">
+        <span>Detector</span>
+        <select id="detectorSelect">
+          <option value="dino">DINO (open-vocab)</option>
+          <option value="yoloworld">YOLO-World (open-vocab)</option>
+          <option value="yolo">YOLO (COCO 80)</option>
+          <option value="mediapipe">MediaPipe (COCO 80)</option>
+        </select>
+      </div>
+      <div class="ctl-grid">
+        <button id="btnClear" title="Turn off all projector washes and uncheck everything.">Clear</button>
+        <button id="btnWhite" title="Project a solid white frame — useful for checking projector coverage and for ambient room light.">☀ White Light</button>
+        <button id="btnRecalibrate" title="Stop perception, project the calibration pattern, re-solve the camera→projector homography, then restart. Use after moving the camera or projector.">⟳ Re-calibrate</button>
+        <button id="btnParallax" title="Two-plane parallax calibration. Stops perception+projector, then projects the live camera image on the wall and lets you manually align it to (1) the wall and (2) a near target (bodhran). Per-object projection then becomes depth-correct.">◑ Parallax</button>
+        <button id="btnUnhide" style="display:none;" title="Bring back any objects you previously hid with the ✕ button.">Unhide all</button>
+      </div>
     </div>
     <div class="panel">
       <h2>Projector intensity</h2>
@@ -141,13 +155,11 @@ function renderOverlay(objs) {
       rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
       rect.setAttribute('class', 'hit');
       rect.dataset.id = o.id;
-      rect.addEventListener('mouseenter', () => {
-        fetch('/highlight', { method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: o.id }) });
-      });
-      rect.addEventListener('mouseleave', () => {
-        fetch('/clear', { method: 'POST' });
+      // Click on the video toggles the object's highlight, mirroring the
+      // checkbox in the list (hover-highlight is gone — it fought the
+      // persistent checkbox selection).
+      rect.addEventListener('click', () => {
+        setSelected(o.id, !selected.has(o.id));
       });
       streamOverlay.appendChild(rect);
     }
@@ -163,7 +175,7 @@ function renderOverlay(objs) {
 const timingsEl = document.getElementById('frameTimings');
 const pausedOverlay = document.getElementById('paused-overlay');
 const btnPause = document.getElementById('btnPause');
-const btnAll = document.getElementById('btnAll');
+const chkSelectAll = document.getElementById('chkSelectAll');
 const btnClear = document.getElementById('btnClear');
 const btnWhite = document.getElementById('btnWhite');
 const btnRecalibrate = document.getElementById('btnRecalibrate');
@@ -171,9 +183,53 @@ const btnUnhide = document.getElementById('btnUnhide');
 const intensitySlider = document.getElementById('intensitySlider');
 const intensityVal = document.getElementById('intensityVal');
 
-let lastHovered = null;
 let editing = new Set();
 let isPaused = false;
+
+// ---- Highlight selection (checkbox model) -------------------------------
+// `selected` is the set of object ids whose wash should be on the wall.
+// `selectAllMode` auto-selects newly detected objects while on.
+const selected = new Set();
+let selectAllMode = false;
+let knownIds = [];
+
+function pushSelection() {
+  const ids = knownIds.filter(id => selected.has(id));
+  fetch('/highlight_set', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }) });
+  syncSelectAllBox();
+}
+
+function syncSelectAllBox() {
+  const n = knownIds.filter(id => selected.has(id)).length;
+  chkSelectAll.checked = knownIds.length > 0 && n === knownIds.length;
+  chkSelectAll.indeterminate = n > 0 && n < knownIds.length;
+}
+
+function setSelected(id, on) {
+  if (on) selected.add(id); else { selected.delete(id); selectAllMode = false; }
+  const row = objList.querySelector(`[data-id="${id}"]`);
+  if (row) {
+    row.classList.toggle('selected', on);
+    const cb = row.querySelector('.obj-chk');
+    if (cb) cb.checked = on;
+  }
+  pushSelection();
+}
+
+chkSelectAll.addEventListener('change', () => {
+  selectAllMode = chkSelectAll.checked;
+  if (selectAllMode) knownIds.forEach(id => selected.add(id));
+  else selected.clear();
+  objList.querySelectorAll('.obj').forEach(r => {
+    const id = Number(r.dataset.id);
+    r.classList.toggle('selected', selected.has(id));
+    const cb = r.querySelector('.obj-chk');
+    if (cb) cb.checked = selected.has(id);
+  });
+  pushSelection();
+});
 
 function rgb(a) { return `rgb(${a[0]}, ${a[1]}, ${a[2]})`; }
 
@@ -190,10 +246,15 @@ btnPause.addEventListener('click', async () => {
   const j = await r.json();
   if ('paused' in j) setPaused(j.paused);
 });
-btnAll.addEventListener('click', () => {
-  fetch('/highlight_all', { method: 'POST' });
-});
 btnClear.addEventListener('click', () => {
+  selected.clear();
+  selectAllMode = false;
+  objList.querySelectorAll('.obj').forEach(r => {
+    r.classList.remove('selected');
+    const cb = r.querySelector('.obj-chk');
+    if (cb) cb.checked = false;
+  });
+  syncSelectAllBox();
   fetch('/clear', { method: 'POST' });
 });
 
@@ -433,6 +494,22 @@ function render(payload) {
   Array.from(objList.children).forEach(c => {
     if (!newIds.has(Number(c.dataset.id))) c.remove();
   });
+  // Track the live id set for the checkbox model. In select-all mode,
+  // newly detected objects join the selection automatically; ids that
+  // vanished are pruned so /highlight_set never carries stale entries.
+  const prevKnown = knownIds;
+  knownIds = objs.map(o => o.id).sort((a, b) => a - b);
+  let selectionChanged = false;
+  if (selectAllMode) {
+    knownIds.forEach(id => {
+      if (!selected.has(id)) { selected.add(id); selectionChanged = true; }
+    });
+  }
+  selected.forEach(id => {
+    if (!newIds.has(id)) { selected.delete(id); selectionChanged = true; }
+  });
+  if (selectionChanged) pushSelection();
+  else if (prevKnown.join() !== knownIds.join()) syncSelectAllBox();
   objs.sort((a, b) => a.id - b.id);
   objs.forEach(o => {
     let row = objList.querySelector(`[data-id="${o.id}"]`);
@@ -441,6 +518,7 @@ function render(payload) {
       row.className = 'obj';
       row.dataset.id = o.id;
       row.innerHTML = `
+        <input type="checkbox" class="obj-chk" title="Toggle highlight for this object on the wall">
         <div class="num"></div>
         <div class="swatch" title="click: cycle color · double-click: pin/unpin"></div>
         <div class="name">
@@ -449,10 +527,16 @@ function render(payload) {
         </div>
         <button class="edit-btn" title="Rename this object">✎</button>
         <button class="hide-btn" title="Hide this object — won't reappear until you click 'Unhide all'">✕</button>`;
-      const inp = row.querySelector('input');
+      const inp = row.querySelector('input[type=text]');
+      const chk = row.querySelector('.obj-chk');
       const swatch = row.querySelector('.swatch');
       const hideBtn = row.querySelector('.hide-btn');
       const editBtn = row.querySelector('.edit-btn');
+      chk.addEventListener('change', () => setSelected(o.id, chk.checked));
+      if (selected.has(o.id)) {
+        chk.checked = true;
+        row.classList.add('selected');
+      }
       editBtn.addEventListener('click', e => {
         e.stopPropagation();
         inp.classList.add('editing');
@@ -502,23 +586,18 @@ function render(payload) {
         }
       });
       inp.addEventListener('keydown', e => { if (e.key === 'Enter') inp.blur(); });
-      row.addEventListener('mouseenter', () => {
-        row.classList.add('hovered');
-        lastHovered = o.id;
-        fetch('/highlight', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: o.id }) });
-      });
-      row.addEventListener('mouseleave', () => {
-        row.classList.remove('hovered');
-        if (lastHovered === o.id) lastHovered = null;
-        fetch('/clear', { method: 'POST' });
-      });
       objList.appendChild(row);
     }
     row.querySelector('.num').textContent = `#${o.id}`;
     row.querySelector('.swatch').style.background = rgb(o.color);
+    // Keep checkbox + row tint in sync with the selection set (it can
+    // change out from under the row via select-all or vanish-pruning).
+    const cbx = row.querySelector('.obj-chk');
+    const isSel = selected.has(o.id);
+    if (cbx.checked !== isSel) cbx.checked = isSel;
+    row.classList.toggle('selected', isSel);
     if (!editing.has(o.id)) {
-      row.querySelector('input').value = o.name;
+      row.querySelector('input[type=text]').value = o.name;
     }
     row.querySelector('.meta-line').textContent =
       `${(o.score * 100).toFixed(0)}% · ${o.depth_m.toFixed(2)} m` +

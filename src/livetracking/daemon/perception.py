@@ -265,15 +265,20 @@ class PerceptionDaemon:
         self.proj_push.send_json(payload)
         return True
 
-    def _push_highlight_all(self) -> int:
+    def _push_highlight_all(self, ids: Optional[List[int]] = None) -> int:
         """Like _push_highlight but for the 'illuminate everything'
-        broadcast. Returns the count actually pushed."""
+        broadcast. When `ids` is given, only that subset of visible
+        objects is pushed (checkbox multi-select from the web UI).
+        Returns the count actually pushed."""
         with self.pipeline.tracker_lock:
             tracked = self.pipeline.tracker.visible()
+        idset = {int(i) for i in ids} if ids is not None else None
         # Re-warp every visible object from its raw cam_mask so live
         # cfg changes apply on the rebroadcast.
         objects: List[dict] = []
         for o in tracked:
+            if idset is not None and o.object_id not in idset:
+                continue
             if o.cam_mask is None:
                 continue
             try:
@@ -318,6 +323,8 @@ class PerceptionDaemon:
                 )
             elif last.get("kind") == "all":
                 self._push_highlight_all()
+            elif last.get("kind") == "set":
+                self._push_highlight_all(ids=list(last.get("ids", [])))
         except Exception as e:  # noqa: BLE001
             print(f"[perception] refresh failed: {e!r}")
 
@@ -480,6 +487,22 @@ class PerceptionDaemon:
         if cmd == "highlight_all":
             n = self._push_highlight_all()
             self._last_highlight = {"kind": "all"}
+            return {"ok": True, "count": n}
+        if cmd == "highlight_set":
+            # Checkbox multi-select: project exactly this set of objects.
+            # Empty list == clear (unless something is pinned).
+            try:
+                ids = [int(i) for i in (msg.get("ids") or [])]
+            except Exception:
+                return {"ok": False, "reason": "bad 'ids' payload"}
+            if not ids:
+                if self._pinned_id is not None:
+                    return {"ok": True, "count": 0, "ignored": "pinned"}
+                self.proj_push.send_json({"type": "clear"})
+                self._last_highlight = None
+                return {"ok": True, "count": 0}
+            n = self._push_highlight_all(ids=ids)
+            self._last_highlight = {"kind": "set", "ids": ids}
             return {"ok": True, "count": n}
         if cmd == "pause":
             self.paused = True

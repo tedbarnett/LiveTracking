@@ -314,6 +314,20 @@ def create_app() -> Flask:
     def highlight_all():
         return jsonify(_send_ctrl({"cmd": "highlight_all"}))
 
+    @app.route("/highlight_set", methods=["POST"])
+    def highlight_set():
+        # Checkbox multi-select from the web UI: {"ids": [2, 3, ...]}.
+        # Empty list clears the projection.
+        data = request.get_json(silent=True) or {}
+        ids = data.get("ids")
+        if not isinstance(ids, list):
+            return jsonify({"ok": False, "reason": "missing 'ids' list"}), 400
+        try:
+            ids = [int(i) for i in ids]
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "reason": "'ids' must be ints"}), 400
+        return jsonify(_send_ctrl({"cmd": "highlight_set", "ids": ids}))
+
     @app.route("/cycle_color", methods=["POST"])
     def cycle_color():
         data = request.get_json(silent=True) or {}
