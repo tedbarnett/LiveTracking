@@ -75,10 +75,16 @@ NOISE_SIGMAS_BIT = 3.0   # per-bit |pattern-inverse| gate, in noise sigmas
 MAX_RANSAC_PTS = 20000   # subsample cap for findHomography
 RANSAC_REPROJ_PX = 8.0   # proj-px tolerance; wall pixels agree, off-plane
                          # objects (parallax offsets of 10s of px) drop out
-MIN_VALID_PIXELS = 600   # decoded-pixel sanity floor. In full daylight the
-                         # JMGO only beats sun+noise on a few thousand px;
-                         # 600 well-spread correspondences still over-
-                         # determine an 8-DOF homography by ~75x.
+MIN_VALID_PIXELS = 300   # decoded-pixel sanity floor. A few hundred well-
+                         # spread correspondences over-determine the 8-DOF
+                         # homography ~150x. The footprint no longer depends
+                         # on decode survivors (it uses the contrast-gate
+                         # cone), so a lean decode set is fine.
+LENIENT_FINE_BITS = 2    # the finest N bits decode sign-only (no validity
+                         # kill): blurred fine stripes at the cone edge would
+                         # otherwise wipe out pixels that decode perfectly on
+                         # coarse bits. A wrong finest bit = one 8px block of
+                         # proj error — RANSAC outlier at worst.
 MIN_INLIER_FRAC = 0.25   # H must explain at least this fraction of sample
 
 
@@ -204,6 +210,15 @@ def main() -> int:
         contrast = img_white - img_black
         valid = contrast > min_contrast
         n_valid0 = int(valid.sum())
+        # The contrast-gate mask IS the projector cone: every pixel the
+        # projector measurably lights. Keep it for the footprint — the
+        # decode gates below are far stricter (a pixel must resolve EVERY
+        # stripe bit) and only a fraction of the cone survives them.
+        # Footprint != decode-survivors; that conflation shrank the
+        # footprint to the cone's crisp center.
+        cone_mask = cv2.morphologyEx(
+            valid.astype(np.uint8) * 255, cv2.MORPH_OPEN,
+            np.ones((5, 5), np.uint8))
         # Diagnostic dump: what did the camera actually see? (rule: when a
         # run fails, diagnose with telemetry, not parameter guessing)
         os.makedirs(SCRIPT_OUT_DIR, exist_ok=True)
@@ -255,9 +270,13 @@ def main() -> int:
                         np.clip(img_n, 0, 255).astype(np.uint8))
                 diff = img_p - img_n
                 bits[k] = (diff > 0).astype(np.uint8)
-                # Confidence gate: ambiguous pixels die for ALL bits.
-                np.logical_and(valid, np.abs(diff) >= min_bit_conf,
-                               out=valid)
+                # Confidence gate on COARSE bits only: an ambiguous coarse
+                # bit means a huge decode error, so the pixel dies. The
+                # finest LENIENT_FINE_BITS decode sign-only — edge blur
+                # there costs one block of precision, not correctness.
+                if k < n_bits - LENIENT_FINE_BITS:
+                    np.logical_and(valid, np.abs(diff) >= min_bit_conf,
+                                   out=valid)
                 print(f"[gray] {axis}-bit {k + 1}/{n_bits} captured "
                       f"(valid now {int(valid.sum())})")
                 if int(valid.sum()) < MIN_VALID_PIXELS:
@@ -299,13 +318,77 @@ def main() -> int:
         cv2.imwrite(os.path.join(SCRIPT_OUT_DIR, "calib_gray_decode.png"),
                     vis)
 
-        # --- homography (wall = dominant plane) ----------------------------
-        if len(cam_pts) > MAX_RANSAC_PTS:
-            sel = np.random.default_rng(0).choice(
-                len(cam_pts), MAX_RANSAC_PTS, replace=False)
-            cam_s, proj_s = cam_pts[sel], proj_pts[sel]
+        # --- wall selection by DEPTH, then homography -----------------------
+        # With full-cone coverage the wall is NOT the majority of decoded
+        # pixels (clutter at other depths eats the cone), so plain RANSAC
+        # can latch onto the wrong surface. Find the dominant 3-D plane in
+        # depth space first, keep pixels near it, fit H on those only.
+        calib_dir = os.path.abspath(
+            os.path.join(HERE, "..", "runtime", "calibration"))
+        os.makedirs(calib_dir, exist_ok=True)
+        fx_i, fy_i, cx_i, cy_i = 615.0, 615.0, 424.0, 240.0
+        z_all = depth_white[ys, xs]
+        has_z = z_all > 0.1
+        plane = None
+        wall_sel = np.ones(len(cam_pts), dtype=bool)  # fallback: everything
+        if int(has_z.sum()) >= 200:
+            u = xs[has_z].astype(np.float64)
+            v = ys[has_z].astype(np.float64)
+            z = z_all[has_z].astype(np.float64)
+            X = (u - cx_i) * z / fx_i
+            Y = (v - cy_i) * z / fy_i
+            P = np.stack([X, Y, z], axis=1)
+            # RANSAC plane fit in 3-D
+            rng = np.random.default_rng(0)
+            best_in = None
+            for _ in range(300):
+                ids = rng.choice(len(P), 3, replace=False)
+                p0, p1, p2 = P[ids]
+                n = np.cross(p1 - p0, p2 - p0)
+                nn = np.linalg.norm(n)
+                if nn < 1e-9:
+                    continue
+                n = n / nn
+                d = -float(n @ p0)
+                dist = np.abs(P @ n + d)
+                inl = dist < 0.05  # 5 cm slab
+                if best_in is None or inl.sum() > best_in.sum():
+                    best_in, best_n, best_d = inl, n, d
+            # Prefer the FARTHEST big plane (wall behind clutter): among
+            # planes with >=60% of the best support, take the deepest.
+            # Single-shot heuristic: refit on inliers, then report.
+            Pw = P[best_in]
+            centroid = Pw.mean(axis=0)
+            _, _, Vt = np.linalg.svd(Pw - centroid, full_matrices=False)
+            n = Vt[-1]
+            d = -float(n @ centroid)
+            if n[2] > 0:
+                n, d = -n, -d
+            a, b, c = float(n[0]), float(n[1]), float(n[2])
+            plane = [a, b, c, d]
+            resid = np.abs(Pw @ n + d)
+            print(f"[gray] depth plane: a={a:.4f} b={b:.4f} c={c:.4f} "
+                  f"d={d:.4f} support={int(best_in.sum())}/{len(P)} "
+                  f"(median |resid|={float(np.median(resid)):.3f}m, "
+                  f"mean depth={float(Pw[:, 2].mean()):.2f}m)")
+            # Map plane membership back to the full decoded-pixel set.
+            wall_sel = np.zeros(len(cam_pts), dtype=bool)
+            idx_has_z = np.where(has_z)[0]
+            wall_sel[idx_has_z[best_in]] = True
+            np.save(os.path.join(calib_dir, "wall_plane.npy"),
+                    np.array(plane, dtype=np.float64))
         else:
-            cam_s, proj_s = cam_pts, proj_pts
+            print("[gray] insufficient depth - fitting H on ALL decoded px")
+
+        cam_w_pts = cam_pts[wall_sel]
+        proj_w_pts = proj_pts[wall_sel]
+        print(f"[gray] wall-selected correspondences: {len(cam_w_pts)}")
+        if len(cam_w_pts) > MAX_RANSAC_PTS:
+            sel = np.random.default_rng(0).choice(
+                len(cam_w_pts), MAX_RANSAC_PTS, replace=False)
+            cam_s, proj_s = cam_w_pts[sel], proj_w_pts[sel]
+        else:
+            cam_s, proj_s = cam_w_pts, proj_w_pts
 
         H, inlier_mask = cv2.findHomography(
             cam_s, proj_s, cv2.RANSAC, RANSAC_REPROJ_PX)
@@ -323,53 +406,12 @@ def main() -> int:
                   f"{MIN_INLIER_FRAC:.0%}; no dominant plane found.")
             return 3
 
-        # --- wall plane from depth at inlier pixels ------------------------
-        calib_dir = os.path.abspath(
-            os.path.join(HERE, "..", "runtime", "calibration"))
-        os.makedirs(calib_dir, exist_ok=True)
-
+        # --- persist inlier correspondences ---------------------------------
         cam_in = cam_s[inl]
         proj_in = proj_s[inl]
         np.save(os.path.join(calib_dir, "dot_cam_pts.npy"), cam_in)
         np.save(os.path.join(calib_dir, "dot_proj_pts.npy"), proj_in)
-
-        fx, fy, cx_i, cy_i = 615.0, 615.0, 424.0, 240.0
-        iu = cam_in[:, 0].astype(int)
-        iv = cam_in[:, 1].astype(int)
-        z = depth_white[iv, iu]
-        ok_z = z > 0.1
-        plane = None
-        if int(ok_z.sum()) >= 50:
-            zs = z[ok_z]
-            us = iu[ok_z].astype(np.float64)
-            vs = iv[ok_z].astype(np.float64)
-            # Far half = wall (same filter the ArUco path used).
-            order = np.argsort(-zs)
-            keep = order[: max(50, len(order) // 2)]
-            X = (us[keep] - cx_i) * zs[keep] / fx
-            Y = (vs[keep] - cy_i) * zs[keep] / fy
-            P = np.stack([X, Y, zs[keep]], axis=1)
-            centroid = P.mean(axis=0)
-            _, _, Vt = np.linalg.svd(P - centroid, full_matrices=False)
-            normal = Vt[-1]
-            a, b, c = (float(normal[0]), float(normal[1]),
-                       float(normal[2]))
-            d_p = float(-(a * centroid[0] + b * centroid[1]
-                          + c * centroid[2]))
-            if c > 0:
-                a, b, c, d_p = -a, -b, -c, -d_p
-            plane = [a, b, c, d_p]
-            resid = (P @ np.array([a, b, c]) + d_p) / max(
-                1e-6, float(np.linalg.norm([a, b, c])))
-            print(f"[gray] wall plane: a={a:.4f} b={b:.4f} c={c:.4f} "
-                  f"d={d_p:.4f} (median |resid|="
-                  f"{float(np.median(np.abs(resid))):.3f}m, "
-                  f"n={len(P)})")
-            np.save(os.path.join(calib_dir, "wall_plane.npy"),
-                    np.array(plane, dtype=np.float64))
-        else:
-            print("[gray] not enough valid depth at inliers - keeping "
-                  "previous wall_plane.npy")
+        # (wall_plane.npy already saved by the depth-plane selection above.)
 
         # --- dense map (plane-free future) ----------------------------------
         np.savez_compressed(
@@ -377,18 +419,23 @@ def main() -> int:
             proj_x=px.astype(np.float32),
             proj_y=py.astype(np.float32),
             valid=valid,
+            cone_mask=(cone_mask > 0),
         )
 
         # --- REAL footprint mask --------------------------------------------
-        # The decoded-pixel set is SPARSE (in daylight only the strongest-
-        # signal pixels survive the gates), but downstream gating needs a
-        # FILLED region: perception drops any object whose mask doesn't
-        # overlap the footprint. Use the convex hull of the decoded pixels —
-        # still measured cone extent, not an H extrapolation.
+        # Convex hull of the CONTRAST-GATE cone (all projector-lit pixels),
+        # not of the decode survivors. Decode survivors cluster in the
+        # crisp center and undersell the cone by 5-40x; the contrast mask
+        # is the projector's actual reach. Hull-filled because perception
+        # gates objects on footprint overlap.
+        cyx = np.column_stack(np.where(cone_mask > 0))  # (N, [y, x])
         fp = np.zeros((ch, cw), dtype=np.uint8)
-        hull = cv2.convexHull(
-            np.stack([xs, ys], axis=1).astype(np.int32))
+        hull = cv2.convexHull(cyx[:, ::-1].astype(np.int32))  # -> (x, y)
         cv2.fillConvexPoly(fp, hull, 255)
+        n_fp = int((fp > 0).sum())
+        print(f"[gray] footprint: cone-gate {int((cone_mask > 0).sum())} px "
+              f"-> hull-filled {n_fp} px "
+              f"({100.0 * n_fp / fp.size:.0f}% of frame)")
         cv2.imwrite(os.path.join(calib_dir, "footprint_measured.png"), fp)
 
         save_homography(
