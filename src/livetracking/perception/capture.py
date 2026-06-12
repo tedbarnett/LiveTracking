@@ -74,6 +74,7 @@ class RealSenseCapture:
             sensor = profile.get_device().query_sensors()[1]
             sensor.set_option(rs.option.enable_auto_exposure, 0)
             sensor.set_option(rs.option.exposure, exposure)
+            self._color_sensor = sensor
             try:
                 sensor.set_option(rs.option.enable_auto_white_balance, 0)
                 sensor.set_option(rs.option.white_balance, 4600)  # ~daylight
@@ -100,6 +101,22 @@ class RealSenseCapture:
 
     def size(self) -> Tuple[int, int]:
         return self.width, self.height
+
+    def set_exposure(self, exposure: int) -> bool:
+        """Change color-sensor manual exposure live (e.g. calibration's
+        adaptive walk-down when ambient light saturates the sensor).
+        Returns True on success."""
+        sensor = getattr(self, "_color_sensor", None)
+        if sensor is None:
+            print("[capture] set_exposure: no color sensor handle")
+            return False
+        try:
+            import pyrealsense2 as rs
+            sensor.set_option(rs.option.exposure, int(exposure))
+            return True
+        except Exception as e:
+            print(f"[capture] set_exposure({exposure}) failed: {e}")
+            return False
 
     def close(self) -> None:
         if self._pipeline is not None:

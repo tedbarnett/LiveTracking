@@ -35,7 +35,15 @@ from livetracking.paths import RUNTIME_DIR  # noqa: E402
 STATUS_FILE = os.path.join(RUNTIME_DIR, "calibration_status.json")
 LOG_FILE = os.path.join(RUNTIME_DIR, "service-logs", "calibrate.log")
 VENV_PY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
-CALIB_SCRIPT = os.path.join(HERE, "calibrate_homography.py")
+# Gray-code structured light is the default: it needs no flat wall patches
+# (the room's guitars/AC/couch broke ArUco marker detection). Set
+# LIVETRACKING_CALIB_METHOD=aruco to fall back to the old marker approach.
+_METHOD = os.environ.get("LIVETRACKING_CALIB_METHOD", "graycode").lower()
+CALIB_SCRIPT = os.path.join(
+    HERE,
+    "calibrate_homography.py" if _METHOD == "aruco"
+    else "calibrate_graycode.py",
+)
 
 
 def _now() -> str:
@@ -115,7 +123,7 @@ def main() -> int:
             [VENV_PY, CALIB_SCRIPT],
             cwd=REPO, env=env,
             stdout=log, stderr=subprocess.STDOUT,
-            timeout=120,
+            timeout=240,
         )
         calib_ok = (r.returncode == 0)
         log.write(f"[orch] calibration exit={r.returncode}\n")
