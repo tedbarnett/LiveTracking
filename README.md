@@ -72,6 +72,8 @@ into one giant blob labeled "sofa couch."
 
 `https://livetracking.barnettlabs.tech` (or `http://localhost:5070`):
 
+<img src="docs/images/web-ui-mobile.jpg" alt="LiveTracking web UI on a phone: live camera view on top with three objects (bodhran, guitar, electric guitar) washed in color by the projector, checkbox object list and control panel below" width="360">
+
 **Auth:** every route except `/healthz` requires a shared-secret token
 (the tunnel is public internet). First browser visit:
 `https://livetracking.barnettlabs.tech/?token=<token>` — sets a 180-day
