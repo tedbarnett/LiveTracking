@@ -64,7 +64,11 @@ def _render_annotated(
     out[outside] = (out[outside] * 0.45).astype(np.uint8)
     cv2.polylines(out, [fp_corners.astype(np.int32)], True, (0, 255, 255), 2)
     for o in objects:
-        col = o.color_rgb
+        # color_rgb is RGB (matches the web UI swatch + pygame projector),
+        # but `out` is an OpenCV BGR frame — swap or the preview outline
+        # shows the wrong hue (blue objects ring red, amber rings cyan)
+        # and the user thinks the projector ignores the color box.
+        col = tuple(int(c) for c in o.color_rgb[::-1])
         # Smooth the mask before contour extraction so frame-to-frame
         # pixel-step noise on the SAM boundary doesn't drive jitter.
         # o.cam_mask is uint8 with values {0,1}; normalize to {0,255}
@@ -356,6 +360,10 @@ class PerceptionDaemon:
             new = self.pipeline.tracker.cycle_color(int(msg["id"]))
             if new is None:
                 return {"ok": False, "reason": "no such object"}
+            # Re-emit the active highlight so the projected wash changes
+            # color immediately — the projector paints the last pushed
+            # payload, which otherwise still carries the old color.
+            self._refresh_active_highlight()
             return {"ok": True, "color": list(new)}
         if cmd == "pin":
             # Like highlight but doesn't auto-clear on mouseleave.
