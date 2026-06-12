@@ -510,6 +510,21 @@ function render(payload) {
   // vanished are pruned so /highlight_set never carries stale entries.
   const prevKnown = knownIds;
   knownIds = objs.map(o => o.id).sort((a, b) => a - b);
+  // Apply a selection restored from /state exactly once, when we first
+  // know which objects exist. Purely local — the wall already shows
+  // this wash, so nothing is re-pushed.
+  if (_restoredSelection !== null && knownIds.length > 0) {
+    if (_restoredSelection === 'all') {
+      selectAllMode = true;
+      knownIds.forEach(id => selected.add(id));
+    } else {
+      _restoredSelection.forEach(id => {
+        if (newIds.has(id)) selected.add(id);
+      });
+    }
+    _restoredSelection = null;
+    syncSelectAllBox();
+  }
   let selectionChanged = false;
   if (selectAllMode) {
     knownIds.forEach(id => {
@@ -607,6 +622,10 @@ function render(payload) {
     const isSel = selected.has(o.id);
     if (cbx.checked !== isSel) cbx.checked = isSel;
     row.classList.toggle('selected', isSel);
+    if (_restoredPinnedId === o.id) {
+      row.classList.add('pinned');
+      _restoredPinnedId = null;
+    }
     if (!editing.has(o.id)) {
       row.querySelector('input[type=text]').value = o.name;
     }
@@ -616,8 +635,27 @@ function render(payload) {
   });
 }
 
-// Initial state sync
-fetch('/state').then(r => r.json()).then(j => { if ('paused' in j) setPaused(j.paused); });
+// Initial state sync. Besides paused/detector, the daemon reports what's
+// currently washed on the wall (highlight kind single/all/set), so a
+// fresh page load shows checkboxes that match reality instead of
+// starting empty while the projector keeps painting.
+let _restoredSelection = null;  // applied when the first object list arrives
+let _restoredPinnedId = null;
+fetch('/state').then(r => r.json()).then(j => {
+  if ('paused' in j) setPaused(j.paused);
+  const h = j.highlight;
+  if (!h) return;
+  if (h.kind === 'all') {
+    _restoredSelection = 'all';
+  } else if (h.kind === 'set' && Array.isArray(h.ids)) {
+    _restoredSelection = h.ids.map(Number);
+  } else if (h.kind === 'single' && typeof h.id === 'number') {
+    _restoredSelection = [h.id];
+    // A pinned single highlight also restores the pinned row style once
+    // rows exist (handled below alongside selection restore).
+    if (h.pinned) _restoredPinnedId = h.id;
+  }
+}).catch(() => {});
 
 btnUnhide.addEventListener('click', () => {
   fetch('/unhide_all', { method: 'POST' }).then(() => refreshHiddenCount());

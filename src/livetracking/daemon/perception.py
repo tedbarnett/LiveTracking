@@ -513,7 +513,9 @@ class PerceptionDaemon:
             return {"ok": True, "paused": False}
         if cmd == "state":
             return {"ok": True, "paused": self.paused,
-                    "detector": getattr(self, "detector_name", "dino")}
+                    "detector": getattr(self, "detector_name", "dino"),
+                    "highlight": self._last_highlight,
+                    "pinned_id": self._pinned_id}
         if cmd == "detector_info":
             return {"ok": True, "detector": getattr(self, "detector_name", "dino")}
         if cmd == "list":

@@ -175,6 +175,11 @@ def create_app() -> Flask:
         template_folder=os.path.join(here, "templates"),
         static_folder=os.path.join(here, "static"),
     )
+    # Reload templates from disk when they change. The Flask service is
+    # NSSM-managed and needs admin to restart; without this every
+    # index.html tweak costs a UAC round-trip. Python code changes still
+    # need a real restart — this only covers templates.
+    app.config["TEMPLATES_AUTO_RELOAD"] = True
 
     @app.route("/")
     def index():
