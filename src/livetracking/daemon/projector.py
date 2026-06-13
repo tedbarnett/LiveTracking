@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 import zmq
 
+from livetracking.daemon import effects
 from livetracking.paths import DISPLAY_INDEX, ZMQ_PROJECTOR_PULL, describe
 
 
@@ -62,6 +63,11 @@ class ProjectorDaemon:
         # cycle while the model is reloading. Cleared by a set_busy with an
         # empty/None text, or by clear_busy.
         self.busy_text: Optional[str] = None
+
+        # Monotonic clock for animated effects (flame/cloud). All effect
+        # phases derive from now()-t0 so every object animates in lockstep
+        # and the loop stays stateless per object.
+        self._anim_t0 = time.perf_counter()
 
         ctx = zmq.Context.instance()
         self.pull = ctx.socket(zmq.PULL)
@@ -105,30 +111,64 @@ class ProjectorDaemon:
                     self.busy_text = None
             time.sleep(0)
 
+    def _blit_flat(self, mask: np.ndarray, color, intensity: float):
+        """Original flat-color path: tint the whole silhouette one color.
+        The mask grayscale is the alpha (anti-aliased soft edges preserved)."""
+        tint = np.zeros((self.PH, self.PW, 4), dtype=np.uint8)
+        tint[..., 0] = color[0]
+        tint[..., 1] = color[1]
+        tint[..., 2] = color[2]
+        tint[..., 3] = (
+            mask.astype(np.float32) * intensity
+        ).clip(0, 255).astype(np.uint8)
+        surf = self.pygame.image.frombuffer(
+            tint.tobytes(), (self.PW, self.PH), "RGBA"
+        )
+        self.screen.blit(surf, (0, 0))
+
+    def _blit_effect(self, mask: np.ndarray, effect: str, intensity: float):
+        """Animated-texture path (flame/cloud).
+
+        Renders the procedural effect ONLY at the mask's bounding box (not
+        the full 4K surface) for speed, stencils it through the mask alpha,
+        and blits it at the bbox offset. The effect texture is RGB on black;
+        the mask grayscale drives alpha so soft warp edges stay soft and the
+        dark parts of the flame fall to zero alpha (vanish on the wall)."""
+        ys, xs = np.where(mask > 0)
+        if ys.size == 0:
+            return
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        bw, bh = x1 - x0, y1 - y0
+        if bw <= 0 or bh <= 0:
+            return
+        t = time.perf_counter() - self._anim_t0
+        tex = effects.render_effect(effect, bw, bh, t)      # (bh, bw, 3) RGB
+        sub_mask = mask[y0:y1, x0:x1].astype(np.float32) / 255.0
+        # Alpha = object mask * effect's own luminance, so the dark gaps in
+        # the flame texture are transparent (only the bright licks light up
+        # the object), then scaled by the user intensity.
+        tex_lum = tex.max(axis=2).astype(np.float32) / 255.0
+        alpha = (sub_mask * tex_lum * intensity * 255.0).clip(0, 255)
+        rgba = np.dstack([tex, alpha.astype(np.uint8)]).astype(np.uint8)
+        surf = self.pygame.image.frombuffer(
+            np.ascontiguousarray(rgba).tobytes(), (bw, bh), "RGBA"
+        )
+        self.screen.blit(surf, (x0, y0))
+
     def _paint_one(self, cur: dict):
         mask_path = cur.get("mask_path")
         color = tuple(cur.get("color", (255, 200, 0)))
+        effect = cur.get("effect", "color")
         mask = None
         if mask_path and os.path.exists(mask_path):
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is not None and mask.shape == (self.PH, self.PW):
             intensity = max(0.0, min(1.0, self.intensity))
-            tint = np.zeros((self.PH, self.PW, 4), dtype=np.uint8)
-            tint[..., 0] = color[0]
-            tint[..., 1] = color[1]
-            tint[..., 2] = color[2]
-            # Use the mask's grayscale value directly as alpha (scaled by
-            # the user's intensity setting). The mask is the upstream
-            # warp's anti-aliased output — soft edges here = soft edges
-            # on the wall. The old (mask > 0) * alpha_val binarized this
-            # and produced hard pixelated boundaries.
-            tint[..., 3] = (
-                mask.astype(np.float32) * intensity
-            ).clip(0, 255).astype(np.uint8)
-            surf = self.pygame.image.frombuffer(
-                tint.tobytes(), (self.PW, self.PH), "RGBA"
-            )
-            self.screen.blit(surf, (0, 0))
+            if effects.is_effect(effect):
+                self._blit_effect(mask, effect, intensity)
+            else:
+                self._blit_flat(mask, color, intensity)
         pc = cur.get("proj_centroid")
         if pc is not None:
             cx_p, cy_p = int(pc[0]), int(pc[1])

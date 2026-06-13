@@ -341,6 +341,23 @@ def create_app() -> Flask:
             return err
         return jsonify(_send_ctrl({"cmd": "cycle_color", "id": oid}))
 
+    @app.route("/cycle_effect", methods=["POST"])
+    def cycle_effect():
+        data = request.get_json(silent=True) or {}
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        return jsonify(_send_ctrl({"cmd": "cycle_effect", "id": oid}))
+
+    @app.route("/effect", methods=["POST"])
+    def set_effect():
+        data = request.get_json(silent=True) or {}
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        eff = str(data.get("effect", "color"))
+        return jsonify(_send_ctrl({"cmd": "set_effect", "id": oid, "effect": eff}))
+
     @app.route("/pin", methods=["POST"])
     def pin():
         data = request.get_json(silent=True) or {}

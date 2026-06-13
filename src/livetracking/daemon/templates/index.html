@@ -43,6 +43,9 @@
   .swatch { width: 18px; height: 18px; border-radius: 4px; flex-shrink: 0; border: 1px solid #000; box-shadow: 0 0 0 1px #444; }
   .hide-btn { background: transparent; border: 1px solid #444; color: #888; width: 22px; height: 22px; border-radius: 4px; padding: 0; font-size: 12px; cursor: pointer; flex-shrink: 0; }
   .hide-btn:hover { background: #4a1f1f; border-color: #c44; color: #fff; }
+  .fx-btn { background: transparent; border: 1px solid #444; color: #888; width: 24px; height: 22px; border-radius: 4px; padding: 0; font-size: 13px; cursor: pointer; flex-shrink: 0; line-height: 1; }
+  .fx-btn:hover { background: #3a2a1a; border-color: #c47a2a; color: #fff; }
+  .fx-btn.fx-active { border-color: #c47a2a; background: #2a1f12; }
   .edit-btn { background: transparent; border: 1px solid #444; color: #888; width: 22px; height: 22px; border-radius: 4px; padding: 0; font-size: 11px; cursor: pointer; flex-shrink: 0; line-height: 1; }
   .edit-btn:hover { background: #2a3a4a; border-color: #5a8ac4; color: #fff; }
   .num { width: 24px; text-align: right; color: #888; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; }
@@ -722,6 +725,7 @@ function render(payload) {
         <input type="checkbox" class="obj-chk" title="Toggle highlight for this object on the wall">
         <div class="num"></div>
         <div class="swatch" title="click: cycle color · double-click: pin/unpin"></div>
+        <button class="fx-btn" title="Cycle projection effect: solid color → flames → clouds">●</button>
         <div class="name">
           <input type="text" readonly />
           <div class="meta-line"></div>
@@ -775,6 +779,12 @@ function render(payload) {
           fetch('/unpin', { method: 'POST' });
         }
       });
+      const fxBtn = row.querySelector('.fx-btn');
+      fxBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        fetch('/cycle_effect', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: o.id }) });
+      });
       inp.addEventListener('focus', () => editing.add(o.id));
       inp.addEventListener('blur', () => {
         editing.delete(o.id);
@@ -791,6 +801,14 @@ function render(payload) {
     }
     row.querySelector('.num').textContent = `#${o.id}`;
     row.querySelector('.swatch').style.background = rgb(o.color);
+    // Reflect the current projection effect on the fx button.
+    const fxBtn = row.querySelector('.fx-btn');
+    if (fxBtn) {
+      const FX = { color: '●', flame: '🔥', cloud: '☁' };
+      const eff = o.effect || 'color';
+      fxBtn.textContent = FX[eff] || '●';
+      fxBtn.classList.toggle('fx-active', eff !== 'color');
+    }
     // Keep checkbox + row tint in sync with the selection set (it can
     // change out from under the row via select-all or vanish-pruning).
     const cbx = row.querySelector('.obj-chk');

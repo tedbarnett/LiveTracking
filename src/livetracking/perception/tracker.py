@@ -386,6 +386,38 @@ class ObjectTracker:
         track.obj.color_rgb = new
         return new
 
+    # Ordered effect cycle. "color" is the flat single-color default; the
+    # animated effects come from daemon/effects.py. Kept as a plain list
+    # here (rather than importing effects) so the perception process has no
+    # dependency on pygame/cv2 render code.
+    _EFFECT_CYCLE = ("color", "flame", "cloud")
+
+    def set_effect(self, object_id: int, effect: str) -> Optional[str]:
+        """Set the object's render effect explicitly. Returns the new effect
+        name, or None if no such object. Unknown names fall back to 'color'."""
+        track = self._tracks.get(object_id)
+        if track is None:
+            return None
+        if effect not in self._EFFECT_CYCLE:
+            effect = "color"
+        track.obj.effect = effect
+        return effect
+
+    def cycle_effect(self, object_id: int) -> Optional[str]:
+        """Advance the object's effect to the next entry in the cycle.
+        Returns the new effect name, or None if no such object."""
+        track = self._tracks.get(object_id)
+        if track is None:
+            return None
+        cur = getattr(track.obj, "effect", "color")
+        try:
+            idx = self._EFFECT_CYCLE.index(cur)
+        except ValueError:
+            idx = -1
+        new = self._EFFECT_CYCLE[(idx + 1) % len(self._EFFECT_CYCLE)]
+        track.obj.effect = new
+        return new
+
     # ---- per-frame update ----
     def update(self, fresh: List[FreshDetection]) -> List[DetectedObject]:
         now = time.time()
