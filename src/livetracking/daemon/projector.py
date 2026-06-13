@@ -69,6 +69,16 @@ class ProjectorDaemon:
         # and the loop stays stateless per object.
         self._anim_t0 = time.perf_counter()
 
+        # Per-object mask cache. Decoding a 4K mask PNG (~16 ms) and scanning
+        # it for its bbox (~24 ms) every frame, for every painted object, is
+        # what made multi-object animations crawl (Select-all + 2 animated
+        # objects = ~80 ms/frame). The mask only changes when perception
+        # rewrites the PNG (~every 2 s on a DINO refresh), so we cache the
+        # decoded mask + bbox keyed by (path, mtime, size) and only re-read
+        # when the file actually changes. Keyed by mask_path.
+        # value: {"key": (mtime, size), "mask": ndarray, "bbox": (x0,y0,x1,y1)}
+        self._mask_cache: dict = {}
+
         ctx = zmq.Context.instance()
         self.pull = ctx.socket(zmq.PULL)
         self.pull.bind(ZMQ_PROJECTOR_PULL)
@@ -111,6 +121,43 @@ class ProjectorDaemon:
                     self.busy_text = None
             time.sleep(0)
 
+    def _load_mask(self, mask_path: str):
+        """Return (mask, bbox) for mask_path, decoding from disk only when the
+        file has changed since last read. bbox is (x0, y0, x1, y1) or None for
+        an empty mask. Returns (None, None) if the file is missing/unreadable.
+
+        This is the hot-path optimization: without caching, every frame
+        re-decoded the 4K PNG (~16 ms) and re-scanned it for its bbox
+        (~24 ms) per object, so animating multiple selected objects dropped
+        to single-digit fps. The mask only changes on a perception refresh,
+        so we key the cache on (mtime, size) and reuse otherwise."""
+        if not mask_path:
+            return None, None
+        try:
+            st = os.stat(mask_path)
+        except OSError:
+            return None, None
+        key = (st.st_mtime, st.st_size)
+        ent = self._mask_cache.get(mask_path)
+        if ent is not None and ent["key"] == key:
+            return ent["mask"], ent["bbox"]
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            return None, None
+        ys, xs = np.where(mask > 0)
+        if ys.size == 0:
+            bbox = None
+        else:
+            bbox = (int(xs.min()), int(ys.min()),
+                    int(xs.max()) + 1, int(ys.max()) + 1)
+        self._mask_cache[mask_path] = {"key": key, "mask": mask, "bbox": bbox}
+        # Bound the cache so a long session with many transient ids doesn't
+        # grow without limit. Drop the oldest entries past a soft cap.
+        if len(self._mask_cache) > 64:
+            for k in list(self._mask_cache.keys())[:16]:
+                self._mask_cache.pop(k, None)
+        return mask, bbox
+
     def _blit_flat(self, mask: np.ndarray, color, intensity: float):
         """Original flat-color path: tint the whole silhouette one color.
         The mask grayscale is the alpha (anti-aliased soft edges preserved)."""
@@ -126,31 +173,39 @@ class ProjectorDaemon:
         )
         self.screen.blit(surf, (0, 0))
 
-    def _blit_effect(self, mask: np.ndarray, effect: str, intensity: float):
-        """Animated-texture path (flame/cloud).
+    def _blit_effect(self, mask: np.ndarray, bbox, effect: str,
+                     intensity: float):
+        """Animated-texture path (flame/cloud/water).
 
         Renders the procedural effect ONLY at the mask's bounding box (not
         the full 4K surface) for speed, stencils it through the mask alpha,
         and blits it at the bbox offset. The effect texture is RGB on black;
         the mask grayscale drives alpha so soft warp edges stay soft and the
-        dark parts of the flame fall to zero alpha (vanish on the wall)."""
-        ys, xs = np.where(mask > 0)
-        if ys.size == 0:
+        dark parts of the flame fall to zero alpha (vanish on the wall).
+
+        `bbox` (x0, y0, x1, y1) is precomputed by _load_mask and cached, so
+        the hot loop no longer scans the full 4K mask every frame. The RGBA
+        (incl. the effect's own luminance alpha) is composited at capped
+        resolution inside render_effect_rgba; here we only fold in the object
+        mask + user intensity on the alpha channel."""
+        if bbox is None:
             return
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        x0, y0, x1, y1 = bbox
         bw, bh = x1 - x0, y1 - y0
         if bw <= 0 or bh <= 0:
             return
         t = time.perf_counter() - self._anim_t0
-        tex = effects.render_effect(effect, bw, bh, t)      # (bh, bw, 3) RGB
-        sub_mask = mask[y0:y1, x0:x1].astype(np.float32) / 255.0
-        # Alpha = object mask * effect's own luminance, so the dark gaps in
-        # the flame texture are transparent (only the bright licks light up
-        # the object), then scaled by the user intensity.
-        tex_lum = tex.max(axis=2).astype(np.float32) / 255.0
-        alpha = (sub_mask * tex_lum * intensity * 255.0).clip(0, 255)
-        rgba = np.dstack([tex, alpha.astype(np.uint8)]).astype(np.uint8)
+        rgba = effects.render_effect_rgba(effect, bw, bh, t)  # (bh, bw, 4)
+        # Fold the object mask + intensity into alpha. Both in 0..255 uint8;
+        # use a uint16 multiply then >>8 (≈ /255) — far cheaper than building
+        # two float32 million-pixel arrays every frame.
+        sub_mask = mask[y0:y1, x0:x1]
+        a = rgba[..., 3].astype(np.uint16)
+        a *= sub_mask.astype(np.uint16)
+        a >>= 8
+        if intensity < 0.999:
+            a = (a * int(intensity * 256)) >> 8
+        rgba[..., 3] = a.astype(np.uint8)
         surf = self.pygame.image.frombuffer(
             np.ascontiguousarray(rgba).tobytes(), (bw, bh), "RGBA"
         )
@@ -160,13 +215,11 @@ class ProjectorDaemon:
         mask_path = cur.get("mask_path")
         color = tuple(cur.get("color", (255, 200, 0)))
         effect = cur.get("effect", "color")
-        mask = None
-        if mask_path and os.path.exists(mask_path):
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        mask, bbox = self._load_mask(mask_path)
         if mask is not None and mask.shape == (self.PH, self.PW):
             intensity = max(0.0, min(1.0, self.intensity))
             if effects.is_effect(effect):
-                self._blit_effect(mask, effect, intensity)
+                self._blit_effect(mask, bbox, effect, intensity)
             else:
                 self._blit_flat(mask, color, intensity)
         pc = cur.get("proj_centroid")

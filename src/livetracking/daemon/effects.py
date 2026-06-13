@@ -295,3 +295,35 @@ def render_effect(name: str, w: int, h: int, t: float) -> np.ndarray:
         small = fn(rw, rh, float(t))
         return _resize(small, w, h)
     return fn(w, h, float(t))
+
+
+def render_effect_rgba(name: str, w: int, h: int, t: float) -> np.ndarray:
+    """Like render_effect but returns (h, w, 4) RGBA, with alpha = the
+    effect's own per-pixel luminance (so dark texels are transparent and the
+    bright licks/glints carry the light).
+
+    Critical perf path: the RGBA is fully composited at the capped internal
+    resolution (luminance + alpha channel built on the small ~360px image),
+    then the whole RGBA is upscaled in ONE cv2.resize. This avoids the
+    per-frame million-pixel float ops (tex.max(axis=2) ~19 ms and np.dstack
+    ~14 ms for a ~1 MP object) that made multi-object animation crawl — those
+    now run on the ~140 kpx small image instead. The caller then only has to
+    fold in the object mask + intensity on the alpha channel."""
+    fn = _RENDERERS.get(name)
+    w, h = int(w), int(h)
+    if fn is None or w <= 0 or h <= 0:
+        return np.zeros((max(h, 1), max(w, 1), 4), dtype=np.uint8)
+    long_side = max(w, h)
+    if long_side > _RENDER_CAP_PX:
+        scale = _RENDER_CAP_PX / float(long_side)
+        rw, rh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    else:
+        rw, rh = w, h
+    rgb_small = fn(rw, rh, float(t))                    # (rh, rw, 3) uint8
+    lum_small = rgb_small.max(axis=2)                   # (rh, rw) uint8 — cheap
+    rgba_small = np.dstack([rgb_small, lum_small])      # (rh, rw, 4) — cheap
+    if (rw, rh) != (w, h):
+        if cv2 is not None:
+            return cv2.resize(rgba_small, (w, h), interpolation=cv2.INTER_LINEAR)
+        return _resize(rgba_small, w, h)
+    return rgba_small
