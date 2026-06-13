@@ -116,6 +116,7 @@ def _objects_to_payload(objects: List[DetectedObject], timings: dict) -> dict:
                 "depth_m": round(o.median_depth_m, 3),
                 "score": round(o.label_score, 3),
                 "has_proj_mask": o.proj_mask is not None,
+                "effect": getattr(o, "effect", "color"),
             }
             for o in objects
         ],
@@ -276,6 +277,7 @@ class PerceptionDaemon:
             "id": obj_id,
             "name": target.name,
             "color": list(target.color_rgb),
+            "effect": getattr(target, "effect", "color"),
             "proj_centroid": (
                 list(target.centroid_proj) if target.centroid_proj else None
             ),
@@ -319,6 +321,7 @@ class PerceptionDaemon:
                 "id": o.object_id,
                 "name": o.name,
                 "color": list(o.color_rgb),
+                "effect": getattr(o, "effect", "color"),
                 "proj_centroid": (
                     list(o.centroid_proj) if o.centroid_proj else None
                 ),
@@ -393,6 +396,30 @@ class PerceptionDaemon:
             # payload, which otherwise still carries the old color.
             self._refresh_active_highlight()
             return {"ok": True, "color": list(new)}
+        if cmd == "set_color":
+            rgb = msg.get("rgb") or msg.get("color")
+            if not (isinstance(rgb, (list, tuple)) and len(rgb) == 3):
+                return {"ok": False, "reason": "bad rgb"}
+            new = self.pipeline.tracker.set_color(int(msg["id"]), tuple(rgb))
+            if new is None:
+                return {"ok": False, "reason": "no such object"}
+            self._refresh_active_highlight()
+            return {"ok": True, "color": list(new)}
+        if cmd == "cycle_effect":
+            new = self.pipeline.tracker.cycle_effect(int(msg["id"]))
+            if new is None:
+                return {"ok": False, "reason": "no such object"}
+            # Re-emit so the projector swaps to the new effect immediately.
+            self._refresh_active_highlight()
+            return {"ok": True, "effect": new}
+        if cmd == "set_effect":
+            new = self.pipeline.tracker.set_effect(
+                int(msg["id"]), str(msg.get("effect", "color"))
+            )
+            if new is None:
+                return {"ok": False, "reason": "no such object"}
+            self._refresh_active_highlight()
+            return {"ok": True, "effect": new}
         if cmd == "pin":
             # Like highlight but doesn't auto-clear on mouseleave.
             obj_id = int(msg["id"])

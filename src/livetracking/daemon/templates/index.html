@@ -43,6 +43,29 @@
   .swatch { width: 18px; height: 18px; border-radius: 4px; flex-shrink: 0; border: 1px solid #000; box-shadow: 0 0 0 1px #444; }
   .hide-btn { background: transparent; border: 1px solid #444; color: #888; width: 22px; height: 22px; border-radius: 4px; padding: 0; font-size: 12px; cursor: pointer; flex-shrink: 0; }
   .hide-btn:hover { background: #4a1f1f; border-color: #c44; color: #fff; }
+  .swatch { cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 12px; }
+  .swatch.has-fx { box-shadow: 0 0 0 1px #c47a2a, 0 0 6px #c47a2a55; }
+  /* Color/effect popup */
+  .obj-popup { position: fixed; z-index: 1000; background: #1c1c1f; border: 1px solid #3a3f4a;
+    border-radius: 10px; padding: 10px; box-shadow: 0 8px 30px #000a; width: 184px; }
+  .obj-popup[hidden] { display: none; }
+  .pop-sec-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: #888;
+    margin: 2px 2px 6px; }
+  .pop-colors { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-bottom: 10px; }
+  .pop-colors .sw { width: 22px; height: 22px; border-radius: 5px; cursor: pointer; border: 1px solid #000;
+    box-shadow: 0 0 0 1px #444; }
+  .pop-colors .sw:hover { transform: scale(1.12); }
+  .pop-colors .sw.sel { box-shadow: 0 0 0 2px #fff; }
+  .pop-effects { display: flex; gap: 6px; margin-bottom: 8px; }
+  .pop-effects .fx { flex: 1; background: #2a2a2e; border: 1px solid #444; border-radius: 7px;
+    padding: 7px 4px; cursor: pointer; text-align: center; font-size: 11px; color: #ddd; }
+  .pop-effects .fx:hover { border-color: #5a8ac4; }
+  .pop-effects .fx.sel { border-color: #c47a2a; background: #2a1f12; color: #fff; }
+  .pop-effects .fx .ic { font-size: 18px; display: block; margin-bottom: 2px; }
+  .pop-foot { display: flex; justify-content: flex-end; border-top: 1px solid #2a2a2a; padding-top: 8px; }
+  .pop-pin { background: #2a2a2e; border: 1px solid #444; color: #bbb; border-radius: 6px;
+    padding: 5px 10px; cursor: pointer; font-size: 12px; }
+  .pop-pin.sel { background: #2d5a2d; border-color: #4a8a4a; color: #fff; }
   .edit-btn { background: transparent; border: 1px solid #444; color: #888; width: 22px; height: 22px; border-radius: 4px; padding: 0; font-size: 11px; cursor: pointer; flex-shrink: 0; line-height: 1; }
   .edit-btn:hover { background: #2a3a4a; border-color: #5a8ac4; color: #fff; }
   .num { width: 24px; text-align: right; color: #888; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; }
@@ -97,6 +120,16 @@
 </style>
 </head>
 <body>
+<!-- Shared color/effect popup, positioned next to whichever swatch was tapped. -->
+<div id="objPopup" class="obj-popup" hidden>
+  <div class="pop-sec-label">Color</div>
+  <div id="popColors" class="pop-colors"></div>
+  <div class="pop-sec-label">Effects</div>
+  <div id="popEffects" class="pop-effects"></div>
+  <div class="pop-foot">
+    <button id="popPin" class="pop-pin" title="Pin: keep this object lit even when not hovered">📌 Pin</button>
+  </div>
+</div>
 <header>
   <h1>LiveTracking</h1>
   <div class="controls">
@@ -307,6 +340,130 @@ chkSelectAll.addEventListener('change', () => {
 });
 
 function rgb(a) { return `rgb(${a[0]}, ${a[1]}, ${a[2]})`; }
+
+// ---- Color/effect popup -------------------------------------------------
+// One shared popup, repositioned next to whichever swatch was tapped. It
+// offers the preset color grid (from /palette), the animated effects
+// (Fire/Cloud/Water), and a Pin toggle. Selections POST immediately and the
+// wall updates live; the popup stays open so you can audition options.
+let _popupObjId = null;
+let _palette = [];
+let _lastObjs = [];
+const POST_JSON = (url, body) => fetch(url, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body || {}),
+});
+const EFFECT_DEFS = [
+  { key: 'flame', label: 'Fire', ic: '🔥' },
+  { key: 'cloud', label: 'Cloud', ic: '☁' },
+  { key: 'water', label: 'Water', ic: '💧' },
+];
+
+fetch('/palette').then(r => r.json()).then(j => {
+  if (j && j.ok && Array.isArray(j.palette)) _palette = j.palette;
+}).catch(() => {});
+
+const _popup = document.getElementById('objPopup');
+const _popColors = document.getElementById('popColors');
+const _popEffects = document.getElementById('popEffects');
+const _popPin = document.getElementById('popPin');
+
+function _buildPopupOnce() {
+  if (_popColors.childElementCount === 0 && _palette.length) {
+    _palette.forEach(c => {
+      const d = document.createElement('div');
+      d.className = 'sw';
+      d.style.background = rgb(c);
+      d.dataset.rgb = c.join(',');
+      d.title = `Set color ${rgb(c)}`;
+      d.addEventListener('click', e => {
+        e.stopPropagation();
+        if (_popupObjId == null) return;
+        POST_JSON('/set_color', { id: _popupObjId, rgb: c });
+      });
+      _popColors.appendChild(d);
+    });
+  }
+  if (_popEffects.childElementCount === 0) {
+    EFFECT_DEFS.forEach(fx => {
+      const b = document.createElement('div');
+      b.className = 'fx';
+      b.dataset.fx = fx.key;
+      b.innerHTML = `<span class="ic">${fx.ic}</span>${fx.label}`;
+      b.title = `Project animated ${fx.label.toLowerCase()} onto this object`;
+      b.addEventListener('click', e => {
+        e.stopPropagation();
+        if (_popupObjId == null) return;
+        // Toggle: tapping the active effect turns it back to flat color.
+        const active = b.classList.contains('sel');
+        POST_JSON('/effect', { id: _popupObjId, effect: active ? 'color' : fx.key });
+      });
+      _popEffects.appendChild(b);
+    });
+  }
+}
+
+function syncPopupState(o) {
+  // Reflect the object's live color/effect/pin in the open popup.
+  if (_popupObjId !== o.id) return;
+  const eff = o.effect || 'color';
+  _popEffects.querySelectorAll('.fx').forEach(b =>
+    b.classList.toggle('sel', b.dataset.fx === eff));
+  const cur = (o.color || []).join(',');
+  _popColors.querySelectorAll('.sw').forEach(s =>
+    s.classList.toggle('sel', eff === 'color' && s.dataset.rgb === cur));
+  const row = objList.querySelector(`[data-id="${o.id}"]`);
+  _popPin.classList.toggle('sel', !!(row && row.classList.contains('pinned')));
+}
+
+function openObjPopup(objId, anchorEl, row) {
+  _buildPopupOnce();
+  _popupObjId = objId;
+  // Make sure this object is lit so the popup's changes are visible.
+  POST_JSON('/highlight', { id: objId });
+  _popup.hidden = false;
+  // Position next to the swatch, clamped to the viewport.
+  const r = anchorEl.getBoundingClientRect();
+  const pw = _popup.offsetWidth, ph = _popup.offsetHeight;
+  let left = r.right + 8, top = r.top;
+  if (left + pw > window.innerWidth - 8) left = r.left - pw - 8;
+  if (left < 8) left = 8;
+  if (top + ph > window.innerHeight - 8) top = window.innerHeight - ph - 8;
+  if (top < 8) top = 8;
+  _popup.style.left = left + 'px';
+  _popup.style.top = top + 'px';
+  // Seed current state from the row's last-known data if available.
+  const last = _lastObjs.find(o => o.id === objId);
+  if (last) syncPopupState(last);
+}
+
+function closePopup() {
+  _popup.hidden = true;
+  _popupObjId = null;
+}
+
+_popPin.addEventListener('click', e => {
+  e.stopPropagation();
+  if (_popupObjId == null) return;
+  const row = objList.querySelector(`[data-id="${_popupObjId}"]`);
+  const willPin = !(row && row.classList.contains('pinned'));
+  if (willPin) {
+    objList.querySelectorAll('.obj.pinned').forEach(r => r.classList.remove('pinned'));
+    if (row) row.classList.add('pinned');
+    POST_JSON('/pin', { id: _popupObjId });
+  } else {
+    if (row) row.classList.remove('pinned');
+    fetch('/unpin', { method: 'POST' });
+  }
+  _popPin.classList.toggle('sel', willPin);
+});
+
+// Dismiss the popup on outside click / Escape.
+document.addEventListener('click', e => {
+  if (_popup.hidden) return;
+  if (!_popup.contains(e.target) && !e.target.classList.contains('swatch')) closePopup();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePopup(); });
 
 function setPaused(p) {
   isPaused = !!p;
@@ -667,6 +824,7 @@ setInterval(refreshDetector, 3000);
 
 function render(payload) {
   const objs = payload.objects || [];
+  _lastObjs = objs;
   renderOverlay(objs);
   setPaused(payload.paused === true);
   statusEl.textContent = `${objs.length} object${objs.length === 1 ? '' : 's'}, ${new Date(payload.t * 1000).toLocaleTimeString()}`;
@@ -721,7 +879,7 @@ function render(payload) {
       row.innerHTML = `
         <input type="checkbox" class="obj-chk" title="Toggle highlight for this object on the wall">
         <div class="num"></div>
-        <div class="swatch" title="click: cycle color · double-click: pin/unpin"></div>
+        <div class="swatch" title="Tap to choose color or effect"></div>
         <div class="name">
           <input type="text" readonly />
           <div class="meta-line"></div>
@@ -750,30 +908,10 @@ function render(payload) {
         fetch('/hide', { method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id: o.id }) });
       });
-      let clickTimer = null;
+      // Tapping the swatch opens the shared color/effect popup for this object.
       swatch.addEventListener('click', e => {
         e.stopPropagation();
-        if (clickTimer) return;
-        clickTimer = setTimeout(() => {
-          clickTimer = null;
-          fetch('/cycle_color', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: o.id }) });
-        }, 220);
-      });
-      swatch.addEventListener('dblclick', e => {
-        e.stopPropagation();
-        if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
-        const wasPinned = row.classList.toggle('pinned');
-        if (wasPinned) {
-          // unpin any prior pinned row
-          objList.querySelectorAll('.obj.pinned').forEach(r => {
-            if (r !== row) r.classList.remove('pinned');
-          });
-          fetch('/pin', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: o.id }) });
-        } else {
-          fetch('/unpin', { method: 'POST' });
-        }
+        openObjPopup(o.id, swatch, row);
       });
       inp.addEventListener('focus', () => editing.add(o.id));
       inp.addEventListener('blur', () => {
@@ -790,7 +928,23 @@ function render(payload) {
       objList.appendChild(row);
     }
     row.querySelector('.num').textContent = `#${o.id}`;
-    row.querySelector('.swatch').style.background = rgb(o.color);
+    // Swatch shows the object's color; when an animated effect is active it
+    // shows an effect glyph overlay + a marker class so you can see at a
+    // glance which objects are running fire/cloud/water.
+    const sw = row.querySelector('.swatch');
+    const eff = o.effect || 'color';
+    const FXGLYPH = { flame: '🔥', cloud: '☁', water: '💧' };
+    if (eff !== 'color') {
+      sw.style.background = '#111';
+      sw.textContent = FXGLYPH[eff] || '';
+      sw.classList.add('has-fx');
+    } else {
+      sw.style.background = rgb(o.color);
+      sw.textContent = '';
+      sw.classList.remove('has-fx');
+    }
+    // Keep the open popup (if it's for this object) in sync with live state.
+    if (_popupObjId === o.id) syncPopupState(o);
     // Keep checkbox + row tint in sync with the selection set (it can
     // change out from under the row via select-all or vanish-pruning).
     const cbx = row.querySelector('.obj-chk');

@@ -34,4 +34,5 @@ class DetectedObject:
     label_score: float = 0.0           # confidence from Grounding DINO (0..1)
     dino_label: str = ""               # last DINO class for this track (survives rename)
     hidden: bool = False               # user-hidden — filtered out of UI/projection
+    effect: str = "color"              # render mode: "color" (flat) | "flame" | "cloud"
     aux: dict = field(default_factory=dict)

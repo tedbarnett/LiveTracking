@@ -341,6 +341,42 @@ def create_app() -> Flask:
             return err
         return jsonify(_send_ctrl({"cmd": "cycle_color", "id": oid}))
 
+    @app.route("/set_color", methods=["POST"])
+    def set_color():
+        data = request.get_json(silent=True) or {}
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        rgb = data.get("rgb") or data.get("color")
+        if not (isinstance(rgb, (list, tuple)) and len(rgb) == 3):
+            return jsonify({"ok": False, "reason": "rgb must be [r,g,b]"}), 400
+        return jsonify(_send_ctrl({"cmd": "set_color", "id": oid, "rgb": list(rgb)}))
+
+    @app.route("/palette", methods=["GET"])
+    def palette():
+        # The 12 preset swatches the popup's color grid offers. Sourced from
+        # the tracker palette so UI + auto-assignment stay in sync.
+        from livetracking.perception.tracker import PALETTE
+        return jsonify({"ok": True, "palette": [list(c) for c in PALETTE],
+                        "effects": ["flame", "cloud", "water"]})
+
+    @app.route("/cycle_effect", methods=["POST"])
+    def cycle_effect():
+        data = request.get_json(silent=True) or {}
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        return jsonify(_send_ctrl({"cmd": "cycle_effect", "id": oid}))
+
+    @app.route("/effect", methods=["POST"])
+    def set_effect():
+        data = request.get_json(silent=True) or {}
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        eff = str(data.get("effect", "color"))
+        return jsonify(_send_ctrl({"cmd": "set_effect", "id": oid, "effect": eff}))
+
     @app.route("/pin", methods=["POST"])
     def pin():
         data = request.get_json(silent=True) or {}
