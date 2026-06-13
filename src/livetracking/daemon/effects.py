@@ -90,6 +90,34 @@ _FIRE_LUT = _build_fire_lut()
 _CLOUD_LUT = _build_cloud_lut()
 
 
+def _build_water_lut() -> np.ndarray:
+    """Deep-blue -> aqua -> cyan -> white ramp for rippling water/caustics.
+
+    Authored on black like the others (projector adds light). The bright end
+    is a bluish-white so caustic highlights read as glints on the water
+    surface rather than washing the object out."""
+    lut = np.zeros((256, 3), dtype=np.uint8)
+    stops = [
+        (0.00, (0, 0, 0)),
+        (0.30, (0, 18, 48)),
+        (0.55, (0, 70, 140)),
+        (0.75, (0, 150, 200)),
+        (0.90, (80, 220, 235)),
+        (1.00, (210, 250, 255)),
+    ]
+    for i in range(256):
+        t = i / 255.0
+        for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+            if t0 <= t <= t1:
+                u = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+                lut[i] = [int(c0[k] + u * (c1[k] - c0[k])) for k in range(3)]
+                break
+    return lut
+
+
+_WATER_LUT = _build_water_lut()
+
+
 # --- tileable value-noise field (precomputed once) --------------------------
 
 def _make_tileable_noise(h: int, w: int, seed: int) -> np.ndarray:
@@ -133,6 +161,7 @@ _NOISE_H, _NOISE_W = 512, 256
 _RENDER_CAP_PX = 360
 _FLAME_NOISE = _make_tileable_noise(_NOISE_H, _NOISE_W, seed=1664)
 _CLOUD_NOISE = _make_tileable_noise(_NOISE_H, _NOISE_W, seed=4661)
+_WATER_NOISE = _make_tileable_noise(_NOISE_H, _NOISE_W, seed=2024)
 
 
 def _resize(src: np.ndarray, w: int, h: int) -> np.ndarray:
@@ -195,9 +224,40 @@ def _cloud(w: int, h: int, t: float) -> np.ndarray:
     return _CLOUD_LUT[idx]
 
 
+def _water(w: int, h: int, t: float) -> np.ndarray:
+    """Rippling water with caustic glints.
+
+    Two counter-scrolling noise layers interfere to make a shifting ripple
+    field; a sharpening curve turns the brightest crests into thin bright
+    caustic bands (the glints you see on a pool floor). Drifts mostly
+    horizontally with a gentle vertical component."""
+    if w <= 0 or h <= 0:
+        return np.zeros((max(h, 1), max(w, 1), 3), dtype=np.uint8)
+    # Layer 1: drift right + slightly down.
+    sx1 = int((t * 70.0) % _NOISE_W)
+    sy1 = int((t * 22.0) % _NOISE_H)
+    l1 = np.roll(np.roll(_WATER_NOISE, sx1, axis=1), -sy1, axis=0)
+    # Layer 2: drift left + slightly up, different speed -> interference.
+    sx2 = int((t * 48.0) % _NOISE_W)
+    sy2 = int((t * 15.0) % _NOISE_H)
+    l2 = np.roll(np.roll(_WATER_NOISE, -sx2, axis=1), sy2, axis=0)
+    inter = _resize(l1, w, h) * 0.5 + _resize(l2, w, h) * 0.5
+    # Fold the interference around its midpoint so crests (high) and troughs
+    # (low) both become bright ridges -> ripple lines, like real caustics.
+    ridges = 1.0 - np.abs(inter - 0.5) * 2.0
+    ridges = np.clip(ridges, 0.0, 1.0)
+    # Sharpen so only the tightest crests glint white; rest stays deep blue.
+    val = 0.30 + 0.70 * (ridges ** 3.0)
+    # Subtle global shimmer.
+    val *= 0.92 + 0.08 * np.sin(t * 4.0)
+    idx = (np.clip(val, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return _WATER_LUT[idx]
+
+
 _RENDERERS = {
     "flame": _flame,
     "cloud": _cloud,
+    "water": _water,
 }
 
 # Effect names selectable in the UI (the flat single-color mode is "color"

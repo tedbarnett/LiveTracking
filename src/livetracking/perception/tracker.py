@@ -386,11 +386,26 @@ class ObjectTracker:
         track.obj.color_rgb = new
         return new
 
+    def set_color(self, object_id: int,
+                  rgb: Tuple[int, int, int]) -> Optional[Tuple[int, int, int]]:
+        """Set the object's highlight color to an explicit RGB triple (each
+        0..255). Returns the clamped color, or None if no such object.
+        Also resets the effect to flat "color" so picking a color from the
+        popup implicitly turns off any active flame/cloud/water."""
+        track = self._tracks.get(object_id)
+        if track is None:
+            return None
+        r, g, b = (max(0, min(255, int(c))) for c in rgb)
+        new = (r, g, b)
+        track.obj.color_rgb = new
+        track.obj.effect = "color"
+        return new
+
     # Ordered effect cycle. "color" is the flat single-color default; the
     # animated effects come from daemon/effects.py. Kept as a plain list
     # here (rather than importing effects) so the perception process has no
     # dependency on pygame/cv2 render code.
-    _EFFECT_CYCLE = ("color", "flame", "cloud")
+    _EFFECT_CYCLE = ("color", "flame", "cloud", "water")
 
     def set_effect(self, object_id: int, effect: str) -> Optional[str]:
         """Set the object's render effect explicitly. Returns the new effect

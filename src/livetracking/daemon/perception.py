@@ -396,6 +396,15 @@ class PerceptionDaemon:
             # payload, which otherwise still carries the old color.
             self._refresh_active_highlight()
             return {"ok": True, "color": list(new)}
+        if cmd == "set_color":
+            rgb = msg.get("rgb") or msg.get("color")
+            if not (isinstance(rgb, (list, tuple)) and len(rgb) == 3):
+                return {"ok": False, "reason": "bad rgb"}
+            new = self.pipeline.tracker.set_color(int(msg["id"]), tuple(rgb))
+            if new is None:
+                return {"ok": False, "reason": "no such object"}
+            self._refresh_active_highlight()
+            return {"ok": True, "color": list(new)}
         if cmd == "cycle_effect":
             new = self.pipeline.tracker.cycle_effect(int(msg["id"]))
             if new is None:
