@@ -26,7 +26,7 @@ import signal
 import sys
 import threading
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -279,6 +279,24 @@ class PerceptionDaemon:
         self._fast_seed_seq: int = 0   # recognize_seq we last reseeded at
         # Telemetry for the live tuning pass: per-object follow stats.
         self._fast_stats: dict = {}
+        # ---- Lock mode (interactive "light the thing I'm holding/playing") --
+        # When an object is LOCKED, the slow DINO+SAM tracker is forbidden from
+        # touching its wash: we freeze the mask captured at lock time and drive
+        # position purely from the fast tracker's depth-band gate + CSRT, which
+        # reject the player's body (it sits at a different, nearer depth). This
+        # severs all three ways the slow tracker poisons a held object: id
+        # reassignment, reseed from an arm-merged mask, and Step-1 re-push of a
+        # poisoned mask shape. None = not locked.
+        self._locked_id: Optional[int] = None
+        # Anchor captured at lock time (cam centroid + depth) — the offset the
+        # projector applies is (live_proj - anchor_proj), so the frozen mask
+        # slides to follow the object without ever re-warping.
+        self._lock_anchor_cam: Optional[Tuple[float, float]] = None
+        self._lock_depth: float = 0.0
+        # Seed state: 'pending' = lock requested, fast tracker not yet seeded
+        # (the ctrl thread has no live frame; the main loop seeds on the next
+        # frame when the object is visible). 'seeded' = running. None = unlocked.
+        self._lock_state: Optional[str] = None
         # When > current time, suppress perception's own projector messages
         # so a `test_point` highlight from /test_light stays on screen.
         self._test_hold_until: float = 0.0
@@ -469,6 +487,74 @@ class PerceptionDaemon:
             return [o.object_id for o in visible]
         return []
 
+    def _lock_follow_step(self, color, depth_m) -> None:
+        """Lock-mode follow: drive the LOCKED object's wash purely from the
+        fast tracker (depth-band gate + CSRT), with ZERO input from the slow
+        DINO+SAM tracker after the initial clean acquire.
+
+        This is the interactive "light the guitar I'm playing" path. The slow
+        tracker is the thing the player's arm/body poisons (id reassignment,
+        arm-merged masks, poisoned re-push). Lock severs all of it:
+
+          * Seed ONCE from the mask captured at lock time (a clean moment),
+            never reseed from the slow tracker again.
+          * Position comes only from the fast tracker, whose depth band rejects
+            the player's body (it sits ~1 m closer than the guitar) and whose
+            CSRT holds the guitar's appearance through partial occlusion.
+          * The projector keeps the frozen lock-time mask and just slides it by
+            (live_proj - anchor_proj); no re-warp, no PNG rewrite.
+        """
+        oid = self._locked_id
+        if oid is None:
+            return
+        if self._fast is None:
+            from livetracking.perception.fasttrack import FastTracker
+            self._fast = FastTracker()
+
+        # First frame after a lock request: seed from the object's current
+        # clean mask. The ctrl thread captured the anchor but had no live color
+        # frame, so the CSRT seed (which needs the frame) happens here.
+        if self._lock_state == "pending":
+            with self.pipeline.tracker_lock:
+                visible = self.pipeline.tracker.visible()
+                target = next(
+                    (o for o in visible if o.object_id == oid), None)
+            if target is None or target.cam_mask is None:
+                # Object not visible this frame (e.g. briefly occluded during
+                # the acquire). Keep waiting — the frozen mask still shows.
+                return
+            self._fast.retain_only([oid])
+            self._fast.reseed(oid, target.cam_mask, target.bbox_cam,
+                              target.median_depth_m, color=color)
+            self._lock_anchor_cam = tuple(target.centroid_cam)
+            self._lock_depth = float(target.median_depth_m)
+            self._lock_state = "seeded"
+            return
+
+        # Running: estimate live camera centroid from depth+CSRT only.
+        est = self._fast.update(oid, color, depth_m)
+        if est is None or self._lock_anchor_cam is None:
+            return
+        live_proj = self.pipeline.cam_to_proj_point(
+            (est.cx, est.cy), self._lock_depth)
+        anchor_proj = self.pipeline.cam_to_proj_point(
+            self._lock_anchor_cam, self._lock_depth)
+        if live_proj is None or anchor_proj is None:
+            return
+        ox = live_proj[0] - anchor_proj[0]
+        oy = live_proj[1] - anchor_proj[1]
+        self._fast_stats[oid] = {
+            "moved_cam_px": round(est.moved_px, 1),
+            "offset_proj_px": [round(ox, 1), round(oy, 1)],
+            "conf": round(est.confidence, 2),
+            "source": est.source,
+            "locked": True,
+        }
+        self.proj_push.send_json({
+            "type": "set_offsets",
+            "offsets": {str(oid): [round(ox, 1), round(oy, 1)]},
+        })
+
     def _fast_track_step(self, color, depth_m) -> None:
         """Step-2 inter-pass fusion: between SAM passes, estimate each
         highlighted object's live camera centroid and send the projector a
@@ -643,6 +729,51 @@ class PerceptionDaemon:
             self.proj_push.send_json({"type": "clear"})
             self._last_highlight = None
             return {"ok": True}
+        if cmd == "lock":
+            # Interactive "light the thing I'm holding/playing": acquire the
+            # object cleanly NOW, then hand it to the fast tracker and forbid
+            # the slow DINO+SAM tracker from ever touching its wash again. The
+            # depth-band gate + CSRT reject the player's body (different depth),
+            # so reaching in / playing can't steal the highlight.
+            obj_id = int(msg["id"])
+            with self.pipeline.tracker_lock:
+                tracked = self.pipeline.tracker.visible()
+            target = next((o for o in tracked if o.object_id == obj_id), None)
+            if target is None or target.cam_mask is None:
+                return {"ok": False, "reason": "no such object / no cam_mask"}
+            # Push the clean highlight one last time (frozen mask the projector
+            # will keep and just slide via set_offsets from here on).
+            ok = self._push_highlight(obj_id)
+            if not ok:
+                return {"ok": False, "reason": "highlight push failed"}
+            self._locked_id = obj_id
+            self._last_highlight = {"kind": "single", "id": obj_id,
+                                    "pinned": True, "locked": True}
+            self._pinned_id = obj_id  # locked implies pinned (no auto-clear)
+            self._lock_anchor_cam = tuple(target.centroid_cam)
+            self._lock_depth = float(target.median_depth_m)
+            # Seed happens in the main loop where the live color frame exists.
+            self._lock_state = "pending"
+            if not (self.fast_track and self.fast_track_fusion):
+                return {"ok": True, "warn": (
+                    "locked, but fast_track + fast_track_fusion must both be "
+                    "ON for the wash to follow without the slow tracker")}
+            return {"ok": True, "locked_id": obj_id}
+        if cmd == "unlock":
+            self._locked_id = None
+            self._lock_state = None
+            self._lock_anchor_cam = None
+            self._lock_depth = 0.0
+            self._pinned_id = None
+            if self._fast is not None:
+                try:
+                    self._fast.retain_only([])
+                except Exception:
+                    pass
+            self.proj_push.send_json({"type": "set_offsets", "offsets": {}})
+            self.proj_push.send_json({"type": "clear"})
+            self._last_highlight = None
+            return {"ok": True}
         if cmd == "test_point":
             # Project a fixed-size white square at the projector coordinates
             # for camera (cam_x, cam_y). If parallax=True and depth_m is
@@ -772,7 +903,9 @@ class PerceptionDaemon:
             return {"ok": True, "paused": self.paused,
                     "detector": getattr(self, "detector_name", "dino"),
                     "highlight": self._last_highlight,
-                    "pinned_id": self._pinned_id}
+                    "pinned_id": self._pinned_id,
+                    "locked_id": self._locked_id,
+                    "lock_state": self._lock_state}
         if cmd == "detector_info":
             return {"ok": True, "detector": getattr(self, "detector_name", "dino")}
         if cmd == "fast_stats":
@@ -782,6 +915,8 @@ class PerceptionDaemon:
             return {"ok": True,
                     "fast_track": self.fast_track,
                     "fast_track_fusion": self.fast_track_fusion,
+                    "locked_id": self._locked_id,
+                    "lock_state": self._lock_state,
                     "objects": {str(k): v for k, v in self._fast_stats.items()}}
         if cmd == "list":
             with self.pipeline.tracker_lock:
@@ -942,14 +1077,26 @@ class PerceptionDaemon:
             ])
             # Fast-follow: if a heavy pass just landed fresh positions,
             # re-push the active highlight so the wash tracks the object.
-            self._maybe_repush_active_highlight()
-            # Step-2: between passes, slide the cached wash to the object's
-            # live position via cheap depth+CSRT tracking (flag-gated).
-            if self.fast_track and self.fast_track_fusion:
+            #
+            # LOCK MODE takes over completely when an object is locked: the
+            # slow tracker is barred from touching the locked wash (no re-push,
+            # no fusion reseed), and a dedicated depth+CSRT follow drives it so
+            # the player's body can't steal it. Otherwise run the normal
+            # Step-1 re-push (+ Step-2 fusion) highlight flow.
+            if self._locked_id is not None:
                 try:
-                    self._fast_track_step(frame.color, frame.depth_m)
+                    self._lock_follow_step(frame.color, frame.depth_m)
                 except Exception as e:  # noqa: BLE001
-                    print(f"[perception] fast_track_step error: {e!r}")
+                    print(f"[perception] lock_follow_step error: {e!r}")
+            else:
+                self._maybe_repush_active_highlight()
+                # Step-2: between passes, slide the cached wash to the object's
+                # live position via cheap depth+CSRT tracking (flag-gated).
+                if self.fast_track and self.fast_track_fusion:
+                    try:
+                        self._fast_track_step(frame.color, frame.depth_m)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[perception] fast_track_step error: {e!r}")
             annotated = _render_annotated(
                 frame.color, self.pipeline.footprint, self.fp_corners, objects
             )
