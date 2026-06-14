@@ -644,6 +644,57 @@ class Pipeline:
         py, px = np.where(proj_mask > 0)
         return proj_mask, (float(px.mean()), float(py.mean()))
 
+    # ---- cheap single-point cam->proj map (Step-2 fast tracking) ------
+    def cam_to_proj_point(
+        self, cam_xy: Tuple[float, float], med_z: float,
+    ) -> Optional[Tuple[float, float]]:
+        """Map ONE camera-space point to projector space using the same
+        depth-aware homography selection as the mask warp, but without
+        touching the 4K mask buffer.
+
+        This is the hot path for inter-pass fast tracking: the FastTracker
+        produces a camera centroid every frame; we map it to a projector
+        centroid here (a single perspectiveTransform — microseconds) and the
+        projector shifts its CACHED mask by the delta. We never re-warp or
+        re-decode the 4K PNG between SAM passes, so the mask-cache perf fix
+        is preserved.
+
+        Mirrors the M selection in _warp_with_parallax_image_first so the
+        fast-tracked centroid lands where a full re-warp would have put it.
+        Returns None if inputs are degenerate.
+        """
+        cx_c, cy_c = float(cam_xy[0]), float(cam_xy[1])
+        M = self.H
+        if (self.H_wall_calib is not None
+                and self.H_near_calib is not None
+                and self.z_near_calib > 0.1
+                and self.z_wall_calib > self.z_near_calib + 0.1
+                and self.cfg.parallax_compensate
+                and med_z > 0.1):
+            M = homography_for_depth(
+                self.H_wall_calib, self.H_near_calib,
+                self.z_wall_calib, self.z_near_calib, med_z,
+                alpha_max=1.5,
+            )
+        elif (self.cfg.parallax_compensate
+              and self.wall_plane is not None
+              and med_z > 0.1):
+            z_wall = self._wall_z_at(cx_c, cy_c)
+            shift_x = constant_k_shift_px(
+                z_obj=med_z, z_wall=z_wall,
+                k_px_m=self.cfg.parallax_k_px_m,
+                sign=self.cfg.parallax_sign,
+                scale=self.cfg.parallax_scale,
+            )
+            if abs(shift_x) > 0.5:
+                M = shift_matrix(shift_x) @ self.H
+        try:
+            pt = np.array([[[cx_c, cy_c]]], dtype=np.float64)
+            out = cv2.perspectiveTransform(pt, M).reshape(2)
+        except Exception:
+            return None
+        return (float(out[0]), float(out[1]))
+
     # ---- back-compat _warp_with_parallax used by perception ctrl ------
     def _warp_with_parallax(
         self, cam_mask: np.ndarray, depth_m: np.ndarray, plane

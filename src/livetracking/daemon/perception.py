@@ -198,6 +198,17 @@ class PerceptionDaemon:
         print(f"[perception] fast_track (auto re-push on SAM pass): "
               f"{self.fast_track}")
 
+        # Step 2: inter-pass fusion tracking (depth-blob + CSRT). Default OFF
+        # — Step 1 (re-push on SAM pass) is the safe floor. When ON, the main
+        # loop runs a fast per-frame tracker for highlighted objects and sends
+        # the projector live position offsets so the wash follows in real time
+        # between SAM passes. Requires fast_track on to do anything useful
+        # (the offsets ride alongside the Step-1 re-push).
+        self.fast_track_fusion = parse_bool(
+            "LIVETRACKING_FAST_TRACK_FUSION", False)
+        print(f"[perception] fast_track_fusion (inter-pass depth+CSRT): "
+              f"{self.fast_track_fusion}")
+
         # DINO detection knobs (env overrides for boot-time tuning; the web
         # UI's Detection panel live-mutates the same fields via dino_tune).
         cfg.dino_box_thresh = parse_float(
@@ -262,6 +273,12 @@ class PerceptionDaemon:
         # whenever this falls behind the pipeline counter (i.e. a new SAM
         # pass landed fresh positions), so the wash follows a moving object.
         self._last_repush_seq: int = 0
+        # Step-2 fusion tracker (created lazily only if the flag is on, so the
+        # import cost / cv2 tracker allocation is skipped when unused).
+        self._fast: Optional[object] = None
+        self._fast_seed_seq: int = 0   # recognize_seq we last reseeded at
+        # Telemetry for the live tuning pass: per-object follow stats.
+        self._fast_stats: dict = {}
         # When > current time, suppress perception's own projector messages
         # so a `test_point` highlight from /test_light stays on screen.
         self._test_hold_until: float = 0.0
@@ -435,6 +452,96 @@ class PerceptionDaemon:
             return
         with self._ctrl_lock:
             self._refresh_active_highlight()
+
+    def _highlighted_ids(self, visible) -> list:
+        """Resolve the currently-shown highlight to a concrete id list.
+        ``visible`` is the tracker's visible() list (passed in so we don't
+        re-lock). Returns [] when nothing is highlighted."""
+        last = self._last_highlight
+        if not last:
+            return []
+        kind = last.get("kind")
+        if kind == "single":
+            return [int(last["id"])]
+        if kind == "set":
+            return [int(i) for i in last.get("ids", [])]
+        if kind == "all":
+            return [o.object_id for o in visible]
+        return []
+
+    def _fast_track_step(self, color, depth_m) -> None:
+        """Step-2 inter-pass fusion: between SAM passes, estimate each
+        highlighted object's live camera centroid and send the projector a
+        per-object projector-pixel offset so the wash follows in real time.
+
+        Reseeds the fusion tracker from fresh SAM masks whenever a heavy pass
+        lands (recognize_seq advances) — that's the drift-bounding ground
+        truth. Between passes, only the cheap depth-blob + CSRT estimators run
+        and we emit a `set_offsets` message (no mask data, no PNG rewrite).
+        """
+        from livetracking.perception.fasttrack import FastTracker
+        if self._fast is None:
+            self._fast = FastTracker()
+
+        with self.pipeline.tracker_lock:
+            visible = self.pipeline.tracker.visible()
+            ids = self._highlighted_ids(visible)
+            by_id = {o.object_id: o for o in visible}
+            seq = self.pipeline.recognize_seq
+
+        if not ids:
+            # Nothing highlighted — drop all tracks and clear any offsets once.
+            if self._fast.active_ids():
+                self._fast.retain_only([])
+                self.proj_push.send_json({"type": "set_offsets",
+                                          "offsets": {}})
+            return
+
+        # Reseed on a fresh SAM pass (positions just refreshed = ground truth).
+        if seq != self._fast_seed_seq:
+            self._fast_seed_seq = seq
+            self._fast.retain_only(ids)
+            for oid in ids:
+                obj = by_id.get(oid)
+                if obj is None or obj.cam_mask is None:
+                    continue
+                self._fast.reseed(
+                    oid, obj.cam_mask, obj.bbox_cam,
+                    obj.median_depth_m, color=color,
+                )
+
+        # Per-frame estimate -> projector-pixel offset for each object.
+        offsets = {}
+        for oid in ids:
+            obj = by_id.get(oid)
+            if obj is None:
+                continue
+            est = self._fast.update(oid, color, depth_m)
+            if est is None:
+                continue
+            # Map the live camera centroid to projector space, and the object's
+            # SAM-anchored camera centroid too; the offset is the delta. Using
+            # the delta (not absolute) means the cached mask — already warped
+            # and positioned at the anchor — just slides by how far the object
+            # moved, which is exactly right for a rigid translation.
+            live_proj = self.pipeline.cam_to_proj_point(
+                (est.cx, est.cy), obj.median_depth_m)
+            anchor_proj = self.pipeline.cam_to_proj_point(
+                obj.centroid_cam, obj.median_depth_m)
+            if live_proj is None or anchor_proj is None:
+                continue
+            ox = live_proj[0] - anchor_proj[0]
+            oy = live_proj[1] - anchor_proj[1]
+            offsets[str(oid)] = [round(ox, 1), round(oy, 1)]
+            self._fast_stats[oid] = {
+                "moved_cam_px": round(est.moved_px, 1),
+                "offset_proj_px": [round(ox, 1), round(oy, 1)],
+                "conf": round(est.confidence, 2),
+                "source": est.source,
+            }
+        if offsets:
+            self.proj_push.send_json({"type": "set_offsets",
+                                      "offsets": offsets})
 
     def _handle_ctrl_message(self, msg: dict):
         """Web-app -> daemon control: rename, highlight, clear, snapshot."""
@@ -650,6 +757,14 @@ class PerceptionDaemon:
                     "pinned_id": self._pinned_id}
         if cmd == "detector_info":
             return {"ok": True, "detector": getattr(self, "detector_name", "dino")}
+        if cmd == "fast_stats":
+            # Step-2 telemetry for the live tuning pass: per-object follow
+            # state (how far it moved, the projector offset applied, fusion
+            # source, confidence) plus the flag states.
+            return {"ok": True,
+                    "fast_track": self.fast_track,
+                    "fast_track_fusion": self.fast_track_fusion,
+                    "objects": {str(k): v for k, v in self._fast_stats.items()}}
         if cmd == "list":
             with self.pipeline.tracker_lock:
                 act = self.pipeline.tracker.visible()
@@ -810,6 +925,13 @@ class PerceptionDaemon:
             # Fast-follow: if a heavy pass just landed fresh positions,
             # re-push the active highlight so the wash tracks the object.
             self._maybe_repush_active_highlight()
+            # Step-2: between passes, slide the cached wash to the object's
+            # live position via cheap depth+CSRT tracking (flag-gated).
+            if self.fast_track and self.fast_track_fusion:
+                try:
+                    self._fast_track_step(frame.color, frame.depth_m)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[perception] fast_track_step error: {e!r}")
             annotated = _render_annotated(
                 frame.color, self.pipeline.footprint, self.fp_corners, objects
             )

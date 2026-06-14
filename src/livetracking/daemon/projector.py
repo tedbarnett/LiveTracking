@@ -79,6 +79,15 @@ class ProjectorDaemon:
         # value: {"key": (mtime, size), "mask": ndarray, "bbox": (x0,y0,x1,y1)}
         self._mask_cache: dict = {}
 
+        # Per-object projector-pixel offsets from inter-pass fast tracking
+        # (id -> (ox, oy)). Applied to the cached mask at render time so a
+        # moving object's wash follows between SAM passes without a re-warp.
+        # Reset whenever a fresh highlight/clear arrives (a new push carries
+        # up-to-date positions, so any old offset is stale).
+        self._offsets: dict = {}
+        # Render-time snapshot of _offsets (set under state_lock in _render).
+        self._offsets_snapshot: dict = {}
+
         ctx = zmq.Context.instance()
         self.pull = ctx.socket(zmq.PULL)
         self.pull.bind(ZMQ_PROJECTOR_PULL)
@@ -102,12 +111,15 @@ class ProjectorDaemon:
                 if t == "clear":
                     self.current = None
                     self.current_many = None
+                    self._offsets = {}
                 elif t == "highlight":
                     self.current = msg
                     self.current_many = None
+                    self._offsets = {}
                 elif t == "highlight_all":
                     self.current = None
                     self.current_many = msg
+                    self._offsets = {}
                 elif t == "set_intensity":
                     self.intensity = float(msg.get("value", 0.78))
                 elif t == "set_white_light":
@@ -119,6 +131,19 @@ class ProjectorDaemon:
                     ) or None
                 elif t == "clear_busy":
                     self.busy_text = None
+                elif t == "set_offsets":
+                    # Inter-pass fast tracking: lightweight per-frame position
+                    # update. Maps object id -> (ox, oy) projector-pixel shift
+                    # applied to the CACHED mask at render time. No mask data,
+                    # no PNG rewrite — this is what keeps fast following cheap.
+                    offs = msg.get("offsets") or {}
+                    parsed = {}
+                    for k, v in offs.items():
+                        try:
+                            parsed[int(k)] = (float(v[0]), float(v[1]))
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                    self._offsets = parsed
             time.sleep(0)
 
     def _load_mask(self, mask_path: str):
@@ -158,9 +183,15 @@ class ProjectorDaemon:
                 self._mask_cache.pop(k, None)
         return mask, bbox
 
-    def _blit_flat(self, mask: np.ndarray, color, intensity: float):
+    def _blit_flat(self, mask: np.ndarray, color, intensity: float,
+                   offset=(0, 0)):
         """Original flat-color path: tint the whole silhouette one color.
-        The mask grayscale is the alpha (anti-aliased soft edges preserved)."""
+        The mask grayscale is the alpha (anti-aliased soft edges preserved).
+
+        `offset` (ox, oy) shifts the whole wash by that many projector pixels
+        — used by inter-pass fast tracking to follow a moving object without
+        re-warping the 4K mask (we blit the CACHED surface at a new position).
+        """
         tint = np.zeros((self.PH, self.PW, 4), dtype=np.uint8)
         tint[..., 0] = color[0]
         tint[..., 1] = color[1]
@@ -171,10 +202,10 @@ class ProjectorDaemon:
         surf = self.pygame.image.frombuffer(
             tint.tobytes(), (self.PW, self.PH), "RGBA"
         )
-        self.screen.blit(surf, (0, 0))
+        self.screen.blit(surf, (int(offset[0]), int(offset[1])))
 
     def _blit_effect(self, mask: np.ndarray, bbox, effect: str,
-                     intensity: float):
+                     intensity: float, offset=(0, 0)):
         """Animated-texture path (flame/cloud/water).
 
         Renders the procedural effect ONLY at the mask's bounding box (not
@@ -209,22 +240,34 @@ class ProjectorDaemon:
         surf = self.pygame.image.frombuffer(
             np.ascontiguousarray(rgba).tobytes(), (bw, bh), "RGBA"
         )
-        self.screen.blit(surf, (x0, y0))
+        self.screen.blit(surf, (x0 + int(offset[0]), y0 + int(offset[1])))
 
     def _paint_one(self, cur: dict):
         mask_path = cur.get("mask_path")
         color = tuple(cur.get("color", (255, 200, 0)))
         effect = cur.get("effect", "color")
+        # Inter-pass fast tracking sends a per-object projector-pixel offset
+        # so the CACHED mask is blitted at the object's live position without
+        # a 4K re-warp. Absent (Step-1 / fusion off) => (0, 0), no shift.
+        # Precedence: live offsets table (set_offsets) by id, else any inline
+        # offset on the payload, else none.
+        off = (0, 0)
+        oid = cur.get("id")
+        if oid is not None and oid in self._offsets_snapshot:
+            off = self._offsets_snapshot[oid]
+        elif cur.get("offset"):
+            off = cur["offset"]
+        ox, oy = int(off[0]), int(off[1])
         mask, bbox = self._load_mask(mask_path)
         if mask is not None and mask.shape == (self.PH, self.PW):
             intensity = max(0.0, min(1.0, self.intensity))
             if effects.is_effect(effect):
-                self._blit_effect(mask, bbox, effect, intensity)
+                self._blit_effect(mask, bbox, effect, intensity, (ox, oy))
             else:
-                self._blit_flat(mask, color, intensity)
+                self._blit_flat(mask, color, intensity, (ox, oy))
         pc = cur.get("proj_centroid")
         if pc is not None:
-            cx_p, cy_p = int(pc[0]), int(pc[1])
+            cx_p, cy_p = int(pc[0]) + ox, int(pc[1]) + oy
             num_str = "#" + str(cur.get("id", "?"))
             name_str = str(cur.get("name", "")).strip()
 
@@ -252,6 +295,9 @@ class ProjectorDaemon:
             cur = self.current
             many = self.current_many
             white = self.white_light
+            # Snapshot offsets under the lock; _paint_one reads the snapshot
+            # so a concurrent set_offsets can't mutate the dict mid-render.
+            self._offsets_snapshot = dict(self._offsets)
         if white:
             self.screen.fill((255, 255, 255))
             self.pygame.display.flip()

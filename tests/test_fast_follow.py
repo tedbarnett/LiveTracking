@@ -197,3 +197,55 @@ class TestRecognizeSeqTrigger:
         )
         # And the seq advanced so the daemon would have re-pushed.
         assert pipe.recognize_seq > seq_before
+
+
+# ---- cam_to_proj_point (Step-2 cheap offset mapping) --------------------
+
+class TestCamToProjPoint:
+    def _pipe(self):
+        pytest.importorskip("cv2")
+        from livetracking.perception.pipeline import Pipeline, PipelineConfig
+        cfg = PipelineConfig(proj_w=1920, proj_h=1080)
+        cfg.parallax_compensate = False  # isolate the plain-H mapping
+        H = np.eye(3, dtype=np.float64)
+        return Pipeline(H, 848, 480, cfg, recognizer=object())
+
+    def test_identity_homography_maps_point_through(self):
+        try:
+            pipe = self._pipe()
+        except Exception as e:  # pragma: no cover
+            pytest.skip(f"pipeline unavailable: {e!r}")
+        # With identity H and parallax off, a camera point maps to itself.
+        out = pipe.cam_to_proj_point((400.0, 250.0), med_z=1.5)
+        assert out is not None
+        assert out[0] == pytest.approx(400.0, abs=1e-6)
+        assert out[1] == pytest.approx(250.0, abs=1e-6)
+
+    def test_scaling_homography_applies(self):
+        try:
+            pipe = self._pipe()
+        except Exception as e:  # pragma: no cover
+            pytest.skip(f"pipeline unavailable: {e!r}")
+        # A 2x scale homography should double the coordinates — proves the
+        # mapping actually runs perspectiveTransform through self.H.
+        pipe.H = np.array([[2.0, 0, 0], [0, 2.0, 0], [0, 0, 1.0]],
+                          dtype=np.float64)
+        out = pipe.cam_to_proj_point((100.0, 50.0), med_z=1.5)
+        assert out == pytest.approx((200.0, 100.0))
+
+    def test_offset_delta_is_translation_invariant(self):
+        """The daemon sends (live_proj - anchor_proj). Under a linear-ish H,
+        a camera translation should yield a proportional projector delta —
+        the property the cached-mask slide relies on."""
+        try:
+            pipe = self._pipe()
+        except Exception as e:  # pragma: no cover
+            pytest.skip(f"pipeline unavailable: {e!r}")
+        pipe.H = np.array([[1.5, 0, 10], [0, 1.5, 20], [0, 0, 1.0]],
+                          dtype=np.float64)
+        anchor = pipe.cam_to_proj_point((200.0, 200.0), 1.5)
+        live = pipe.cam_to_proj_point((260.0, 200.0), 1.5)  # +60 px in x
+        assert anchor is not None and live is not None
+        # 60 cam px * 1.5 scale = 90 proj px, independent of the translation.
+        assert (live[0] - anchor[0]) == pytest.approx(90.0)
+        assert (live[1] - anchor[1]) == pytest.approx(0.0, abs=1e-6)
