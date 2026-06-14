@@ -396,6 +396,21 @@ def create_app() -> Flask:
     def unpin():
         return jsonify(_send_ctrl({"cmd": "unpin"}))
 
+    @app.route("/lock", methods=["POST"])
+    def lock():
+        # Interactive "light the thing I'm holding/playing": acquire the
+        # object now, then follow it with the slow DINO+SAM tracker barred
+        # from the wash so the player's body can't steal the highlight.
+        data = request.get_json(silent=True) or {}
+        oid, err = _require_int(data, "id")
+        if err:
+            return err
+        return jsonify(_send_ctrl({"cmd": "lock", "id": oid}))
+
+    @app.route("/unlock", methods=["POST"])
+    def unlock():
+        return jsonify(_send_ctrl({"cmd": "unlock"}))
+
     @app.route("/intensity", methods=["POST"])
     def intensity():
         data = request.get_json(silent=True) or {}
