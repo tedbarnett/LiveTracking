@@ -510,12 +510,27 @@ class PerceptionDaemon:
                     obj.median_depth_m, color=color,
                 )
 
-        # Per-frame estimate -> projector-pixel offset for each object.
+        # Split the highlighted ids into those whose track is still live and
+        # those whose track has died (churned away / disappeared since the last
+        # SAM pass). A dead highlighted track MUST have its offset cleared this
+        # frame: set_offsets fully replaces the projector's offset table, so if
+        # we silently skip a dead id (the old behavior) the projector keeps
+        # applying that object's last offset to its still-cached mask and the
+        # wash flies off across the room. Prune dead ids from the fast tracker
+        # and telemetry, and make sure we still emit set_offsets below so the
+        # stale offset is dropped (wash falls back to its last anchored
+        # position instead of running away).
+        live_ids = [oid for oid in ids if oid in by_id]
+        dead_ids = [oid for oid in ids if oid not in by_id]
+        if dead_ids:
+            self._fast.retain_only(live_ids)
+            for oid in dead_ids:
+                self._fast_stats.pop(oid, None)
+
+        # Per-frame estimate -> projector-pixel offset for each live object.
         offsets = {}
-        for oid in ids:
-            obj = by_id.get(oid)
-            if obj is None:
-                continue
+        for oid in live_ids:
+            obj = by_id[oid]
             est = self._fast.update(oid, color, depth_m)
             if est is None:
                 continue
@@ -539,7 +554,10 @@ class PerceptionDaemon:
                 "conf": round(est.confidence, 2),
                 "source": est.source,
             }
-        if offsets:
+        # Emit when we have live offsets OR a track just died (so the
+        # projector replaces its offset table and drops the dead object's
+        # stale offset — sending an empty dict is the clear).
+        if offsets or dead_ids:
             self.proj_push.send_json({"type": "set_offsets",
                                       "offsets": offsets})
 
