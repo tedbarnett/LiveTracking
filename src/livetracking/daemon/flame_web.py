@@ -315,6 +315,13 @@ def create_app() -> Flask:
     def state():
         return jsonify(_send_ctrl({"cmd": "state"}))
 
+    @app.route("/fast_stats")
+    def fast_stats():
+        """Step-2 fast-tracking telemetry (per-object follow state + flags).
+        Used during the live tuning pass to read follow quality with numbers
+        instead of eyeballing the wall."""
+        return jsonify(_send_ctrl({"cmd": "fast_stats"}))
+
     @app.route("/highlight_all", methods=["POST"])
     def highlight_all():
         return jsonify(_send_ctrl({"cmd": "highlight_all"}))
