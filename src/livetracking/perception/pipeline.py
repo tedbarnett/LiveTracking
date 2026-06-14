@@ -204,6 +204,13 @@ class Pipeline:
         self._async_running = False
 
         self._frame_idx = 0
+        # Monotonic counter bumped once per completed heavy (DINO+SAM) pass.
+        # The perception daemon watches this to re-push the active highlight
+        # only when object positions actually changed, so the projector wash
+        # follows a moving object within one SAM pass instead of staying
+        # frozen until the next unrelated UI poke. Cheap to read, no lock
+        # needed for a plain int read on CPython.
+        self.recognize_seq = 0
 
     # ---- async lifecycle -----------------------------------------------
     def start_async(self):
@@ -241,6 +248,7 @@ class Pipeline:
             with self.tracker_lock:
                 self.tracker.update(fresh)
                 self.last_timings_ms = timings
+                self.recognize_seq += 1
 
     # ---- public step entry --------------------------------------------
     def step_auto(self, color: np.ndarray, depth_m: np.ndarray
@@ -263,6 +271,7 @@ class Pipeline:
                     fresh, timings = self._recognize_one(color, depth_m)
                     self.tracker.update(fresh)
                     self.last_timings_ms = timings
+                    self.recognize_seq += 1
                 return self.tracker.visible()
 
         # Sync mode.
@@ -270,6 +279,7 @@ class Pipeline:
         with self.tracker_lock:
             self.tracker.update(fresh)
             self.last_timings_ms = timings
+            self.recognize_seq += 1
             return self.tracker.visible()
 
     # ---- the heavy pass -----------------------------------------------

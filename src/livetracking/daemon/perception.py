@@ -53,6 +53,41 @@ from livetracking.perception.types import DetectedObject
 JPEG_QUALITY = 78
 
 
+def _repush_decision(
+    fast_track: bool,
+    cur_seq: int,
+    last_repush_seq: int,
+    has_active_highlight: bool,
+    now: float,
+    test_hold_until: float,
+) -> tuple[bool, int]:
+    """Pure decision for the Step-1 fast-follow re-push (no I/O, no locks).
+
+    Returns ``(should_push, new_last_repush_seq)``.
+
+    Logic, kept in one testable place:
+      - fast_track off            -> never push, seq unchanged.
+      - seq has not advanced      -> never push, seq unchanged (no redundant
+                                     PNG rewrites between SAM passes — this is
+                                     what protects the projector mask cache).
+      - seq advanced              -> consume the new seq (advance the marker
+                                     even when we ultimately skip, so we don't
+                                     re-evaluate the same pass), then push iff
+                                     a highlight is active AND we're not inside
+                                     a /test_light hold window.
+    """
+    if not fast_track:
+        return False, last_repush_seq
+    if cur_seq == last_repush_seq:
+        return False, last_repush_seq
+    new_seq = cur_seq
+    if not has_active_highlight:
+        return False, new_seq
+    if now < test_hold_until:
+        return False, new_seq
+    return True, new_seq
+
+
 def _render_annotated(
     color: np.ndarray,
     footprint: np.ndarray,
@@ -151,6 +186,18 @@ class PerceptionDaemon:
               f"sign={cfg.parallax_sign} scale={cfg.parallax_scale} "
               f"k_px_m={cfg.parallax_k_px_m}")
 
+        # Fast object-following. When a highlighted object moves, the
+        # projector wash only re-lands on it when perception re-pushes the
+        # highlight. Step 1 (this flag, default ON): re-push the active
+        # highlight every time a heavy DINO+SAM pass produces fresh
+        # positions, so the wash follows within one SAM pass (~2.5 Hz)
+        # instead of staying frozen until an unrelated UI poke. Set
+        # LIVETRACKING_FAST_TRACK=0 to restore the old push-on-UI-event-only
+        # behavior if the re-push ever misbehaves at the rig.
+        self.fast_track = parse_bool("LIVETRACKING_FAST_TRACK", True)
+        print(f"[perception] fast_track (auto re-push on SAM pass): "
+              f"{self.fast_track}")
+
         # DINO detection knobs (env overrides for boot-time tuning; the web
         # UI's Detection panel live-mutates the same fields via dino_tune).
         cfg.dino_box_thresh = parse_float(
@@ -210,6 +257,11 @@ class PerceptionDaemon:
         # mask without waiting for the next user hover. None = nothing
         # shown. {"kind":"single","id":N} or {"kind":"all"}.
         self._last_highlight: Optional[dict] = None
+        # Last pipeline.recognize_seq we re-pushed the highlight for. When
+        # fast_track is on, the main loop re-pushes the active highlight
+        # whenever this falls behind the pipeline counter (i.e. a new SAM
+        # pass landed fresh positions), so the wash follows a moving object.
+        self._last_repush_seq: int = 0
         # When > current time, suppress perception's own projector messages
         # so a `test_point` highlight from /test_light stays on screen.
         self._test_hold_until: float = 0.0
@@ -351,6 +403,38 @@ class PerceptionDaemon:
                 self._push_highlight_all(ids=list(last.get("ids", [])))
         except Exception as e:  # noqa: BLE001
             print(f"[perception] refresh failed: {e!r}")
+
+    def _maybe_repush_active_highlight(self) -> None:
+        """Step-1 fast-follow: when a heavy DINO+SAM pass has landed fresh
+        object positions (pipeline.recognize_seq advanced), re-emit the
+        active highlight so the projector wash re-lands on the object's new
+        location. Without this the wash only moves when an unrelated UI event
+        (color change, object appear/disappear) happens to re-push.
+
+        Gated on:
+          - fast_track flag (off => legacy push-on-UI-event-only behavior),
+          - an active highlight existing,
+          - the test-point hold lock (don't stomp a /test_light square),
+          - the recognize_seq actually advancing (no redundant PNG rewrites
+            between SAM passes — protects the projector's mask-decode cache).
+
+        Runs under _ctrl_lock so it can't interleave with a ctrl-thread push
+        mid-payload. Tracker reads inside _push_highlight* take tracker_lock
+        separately, so this never blocks the GPU loop.
+        """
+        should, new_seq = _repush_decision(
+            fast_track=self.fast_track,
+            cur_seq=self.pipeline.recognize_seq,
+            last_repush_seq=self._last_repush_seq,
+            has_active_highlight=bool(self._last_highlight),
+            now=time.time(),
+            test_hold_until=self._test_hold_until,
+        )
+        self._last_repush_seq = new_seq
+        if not should:
+            return
+        with self._ctrl_lock:
+            self._refresh_active_highlight()
 
     def _handle_ctrl_message(self, msg: dict):
         """Web-app -> daemon control: rename, highlight, clear, snapshot."""
@@ -723,6 +807,9 @@ class PerceptionDaemon:
             self.objects_pub.send_multipart([
                 b"objects", json.dumps(payload).encode("utf-8"),
             ])
+            # Fast-follow: if a heavy pass just landed fresh positions,
+            # re-push the active highlight so the wash tracks the object.
+            self._maybe_repush_active_highlight()
             annotated = _render_annotated(
                 frame.color, self.pipeline.footprint, self.fp_corners, objects
             )
