@@ -88,6 +88,57 @@ def _repush_decision(
     return True, new_seq
 
 
+def _cam_mask_iou(a, b) -> float:
+    """IoU of two camera-space masks (any nonzero = foreground). Returns 1.0
+    for two empty masks (nothing vs nothing = unchanged), 0.0 when exactly
+    one is empty. Cheap: operates on the 848x480 SAM masks, not the 8.3 MP
+    projector buffer."""
+    import numpy as _np
+    ab = a > 0
+    bb = b > 0
+    inter = int(_np.logical_and(ab, bb).sum())
+    union = int(_np.logical_or(ab, bb).sum())
+    if union == 0:
+        return 1.0
+    return inter / union
+
+
+def _highlight_mask_stable(
+    prev_centroid_cam,
+    new_centroid_cam,
+    prev_cam_mask,
+    new_cam_mask,
+    move_px: float,
+    iou_thresh: float,
+) -> bool:
+    """Hysteresis gate for the select-all re-push (pure, no I/O).
+
+    Returns True when the freshly-detected mask is close enough to what is
+    already shown that re-pushing would only inject SAM's run-to-run wobble
+    (so we should HOLD the current mask). Returns False when the object
+    genuinely moved or changed shape and the projector should update.
+
+    Stable iff BOTH:
+      * camera-space centroid moved <= ``move_px``, AND
+      * IoU(new, shown) >= ``iou_thresh``.
+
+    Any missing input (first show, no prior mask) => not stable (update),
+    so a newly-highlighted object always paints immediately.
+    """
+    if prev_centroid_cam is None or new_centroid_cam is None:
+        return False
+    if prev_cam_mask is None or new_cam_mask is None:
+        return False
+    dx = float(new_centroid_cam[0]) - float(prev_centroid_cam[0])
+    dy = float(new_centroid_cam[1]) - float(prev_centroid_cam[1])
+    moved = (dx * dx + dy * dy) ** 0.5
+    if moved > move_px:
+        return False
+    if _cam_mask_iou(new_cam_mask, prev_cam_mask) < iou_thresh:
+        return False
+    return True
+
+
 def _render_annotated(
     color: np.ndarray,
     footprint: np.ndarray,
@@ -208,6 +259,37 @@ class PerceptionDaemon:
             "LIVETRACKING_FAST_TRACK_FUSION", False)
         print(f"[perception] fast_track_fusion (inter-pass depth+CSRT): "
               f"{self.fast_track_fusion}")
+
+        # Select-all / multi-highlight stabilization. The "illuminate
+        # everything" path re-warps every object from its fresh SAM mask on
+        # every DINO+SAM pass (~2.5 Hz) and rewrites the projector PNG. SAM
+        # boundaries wobble a few px run-to-run even on a static object, so
+        # the wash visibly JERKS every ~2 s. With this on, an object's mask
+        # is only re-pushed when it actually moved (centroid shift in camera
+        # px) or changed shape (IoU drop vs the last shown mask); otherwise
+        # the displayed mask is held, killing the jitter (and skipping the
+        # 8.3 MP warp + PNG write for stable objects). Set
+        # LIVETRACKING_HIGHLIGHT_HYSTERESIS=0 to restore re-warp-every-pass.
+        self.highlight_hysteresis = parse_bool(
+            "LIVETRACKING_HIGHLIGHT_HYSTERESIS", True)
+        # Re-push when the camera-space centroid moves more than this many
+        # pixels since the last shown mask (real motion should update).
+        self.highlight_move_px = parse_float(
+            "LIVETRACKING_HIGHLIGHT_MOVE_PX", 6.0, min_value=0.0,
+            max_value=200.0)
+        # Re-push when IoU(new_cam_mask, shown_cam_mask) drops below this
+        # (shape changed for real). SAM run-to-run wobble on a static object
+        # sits well above ~0.9; genuine reshape falls below.
+        self.highlight_iou = parse_float(
+            "LIVETRACKING_HIGHLIGHT_IOU", 0.90, min_value=0.0, max_value=1.0)
+        print(f"[perception] highlight_hysteresis: "
+              f"{self.highlight_hysteresis} "
+              f"(move>{self.highlight_move_px}px or IoU<{self.highlight_iou})")
+        # Per-object record of what is CURRENTLY shown on the projector for
+        # the select-all path: {oid: {"cam_mask", "centroid_cam",
+        # "proj_mask", "centroid_proj", "mask_path"}}. Used by the hysteresis
+        # gate to decide whether a fresh SAM pass should actually re-push.
+        self._highlight_shown: dict = {}
 
         # DINO detection knobs (env overrides for boot-time tuning; the web
         # UI's Detection panel live-mutates the same fields via dino_tune).
@@ -379,18 +461,57 @@ class PerceptionDaemon:
         """Like _push_highlight but for the 'illuminate everything'
         broadcast. When `ids` is given, only that subset of visible
         objects is pushed (checkbox multi-select from the web UI).
-        Returns the count actually pushed."""
+        Returns the count actually pushed.
+
+        Hysteresis: when self.highlight_hysteresis is on, an object whose
+        fresh SAM mask hasn't moved/reshaped beyond threshold reuses the
+        mask already on screen instead of re-warping. This kills the ~2 s
+        jerk that SAM's run-to-run boundary wobble would otherwise inject on
+        static objects (and skips the 8.3 MP warp + PNG write for them)."""
         with self.pipeline.tracker_lock:
             tracked = self.pipeline.tracker.visible()
         idset = {int(i) for i in ids} if ids is not None else None
-        # Re-warp every visible object from its raw cam_mask so live
-        # cfg changes apply on the rebroadcast.
         objects: List[dict] = []
+        live_ids = set()
         for o in tracked:
             if idset is not None and o.object_id not in idset:
                 continue
             if o.cam_mask is None:
                 continue
+            live_ids.add(o.object_id)
+            prev = self._highlight_shown.get(o.object_id)
+            # Decide whether the on-screen mask still represents this object.
+            stable = False
+            if self.highlight_hysteresis and prev is not None:
+                stable = _highlight_mask_stable(
+                    prev.get("centroid_cam"),
+                    tuple(o.centroid_cam) if o.centroid_cam is not None
+                    else None,
+                    prev.get("cam_mask"),
+                    o.cam_mask,
+                    self.highlight_move_px,
+                    self.highlight_iou,
+                )
+            if stable:
+                # Hold: reuse the mask already on the projector. Refresh only
+                # the live metadata (color/effect/name can change without a
+                # reshape) — the heavy mask PNG and warp are untouched.
+                o.proj_mask = prev.get("proj_mask")
+                o.centroid_proj = prev.get("centroid_proj")
+                objects.append({
+                    "id": o.object_id,
+                    "name": o.name,
+                    "color": list(o.color_rgb),
+                    "effect": getattr(o, "effect", "color"),
+                    "proj_centroid": (
+                        list(prev["centroid_proj"])
+                        if prev.get("centroid_proj") else None
+                    ),
+                    "mask_path": prev.get("mask_path"),
+                })
+                continue
+            # Update: re-warp from the fresh cam_mask (live cfg changes like
+            # mask softness also apply here) and rewrite the projector PNG.
             try:
                 new_proj, new_centroid = (
                     self.pipeline._warp_with_parallax_image_first(
@@ -404,6 +525,7 @@ class PerceptionDaemon:
                 pass
             if o.proj_mask is None:
                 continue
+            mask_path = _save_mask_png(o)
             objects.append({
                 "id": o.object_id,
                 "name": o.name,
@@ -412,8 +534,25 @@ class PerceptionDaemon:
                 "proj_centroid": (
                     list(o.centroid_proj) if o.centroid_proj else None
                 ),
-                "mask_path": _save_mask_png(o),
+                "mask_path": mask_path,
             })
+            # Record what is now shown for the next pass's gate. Copy the
+            # cam_mask so a later in-place tracker update can't mutate our
+            # reference out from under the comparison.
+            self._highlight_shown[o.object_id] = {
+                "centroid_cam": (
+                    tuple(o.centroid_cam)
+                    if o.centroid_cam is not None else None
+                ),
+                "cam_mask": o.cam_mask.copy(),
+                "proj_mask": o.proj_mask,
+                "centroid_proj": o.centroid_proj,
+                "mask_path": mask_path,
+            }
+        # Drop records for objects no longer in this highlight set so the
+        # dict can't grow without bound across many select/deselect cycles.
+        for dead in [k for k in self._highlight_shown if k not in live_ids]:
+            del self._highlight_shown[dead]
         self.proj_push.send_json({
             "type": "highlight_all", "objects": objects,
         })
