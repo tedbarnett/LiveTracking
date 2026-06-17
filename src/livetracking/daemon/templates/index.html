@@ -187,6 +187,13 @@
         <span>soft</span>
         <span id="smoothVal">3</span>
       </div>
+      <h2 style="margin-top:12px;">Shrink</h2>
+      <div class="slider-row" title="Erode the object outline inward (camera pixels) so the projected light stays inside the object and doesn't spill onto the background. 0 = full size.">
+        <span>full</span>
+        <input id="shrinkSlider" type="range" min="0" max="40" value="0">
+        <span>small</span>
+        <span id="shrinkVal">0</span>
+      </div>
     </div>
     <div id="status">connecting…</div>
   </aside>
@@ -355,6 +362,7 @@ const POST_JSON = (url, body) => fetch(url, {
 });
 const EFFECT_DEFS = [
   { key: 'flame', label: 'Fire', ic: '🔥' },
+  { key: 'fire2', label: 'Fire2', ic: '🔥' },
   { key: 'cloud', label: 'Cloud', ic: '☁' },
   { key: 'water', label: 'Water', ic: '💧' },
 ];
@@ -636,6 +644,33 @@ smoothSlider.addEventListener('change', () => {
     if (j && j.ok && typeof j.smooth_px === 'number') {
       smoothSlider.value = j.smooth_px;
       smoothVal.textContent = j.smooth_px;
+    }
+  } catch (_e) { /* daemon not ready yet — slider keeps its HTML default */ }
+})();
+
+// Shrink slider ---------------------------------------------------------
+const shrinkSlider = document.getElementById('shrinkSlider');
+const shrinkVal = document.getElementById('shrinkVal');
+shrinkSlider.addEventListener('input', () => {
+  shrinkVal.textContent = shrinkSlider.value;
+});
+shrinkSlider.addEventListener('change', () => {
+  fetch('/mask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ shrink_px: parseInt(shrinkSlider.value, 10) })
+  });
+});
+// Pull initial shrink value from the daemon (shares the /mask GET above,
+// but fetch again so this block is self-contained after a restart).
+(async () => {
+  try {
+    const r = await fetch('/mask');
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j && j.ok && typeof j.shrink_px === 'number') {
+      shrinkSlider.value = j.shrink_px;
+      shrinkVal.textContent = j.shrink_px;
     }
   } catch (_e) { /* daemon not ready yet — slider keeps its HTML default */ }
 })();
@@ -933,7 +968,7 @@ function render(payload) {
     // glance which objects are running fire/cloud/water.
     const sw = row.querySelector('.swatch');
     const eff = o.effect || 'color';
-    const FXGLYPH = { flame: '🔥', cloud: '☁', water: '💧' };
+    const FXGLYPH = { flame: '🔥', fire2: '🔥', cloud: '☁', water: '💧' };
     if (eff !== 'color') {
       sw.style.background = '#111';
       sw.textContent = FXGLYPH[eff] || '';

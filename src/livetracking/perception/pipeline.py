@@ -105,6 +105,12 @@ class PipelineConfig:
     # glow. Live-tunable via /mask POST.
     mask_smooth_px: int = 3
 
+    # Erode the SAM mask inward by this many CAMERA pixels before warping, so
+    # the projected light sits inside the object's silhouette instead of
+    # spilling onto the wall/background behind it. 0 = no shrink (mask as
+    # detected). Applied before the smooth blur. Live-tunable via /mask POST.
+    mask_shrink_px: int = 0
+
     # Wall-plane depth gating. Drop SAM masks whose median depth is more
     # than this many meters DEEPER than the calibrated wall plane at the
     # mask centroid. Catches detections seen through a doorway, in a
@@ -621,6 +627,14 @@ class Pipeline:
         # live-tunable via cfg.mask_smooth_px (0 disables).
         if cam_mask.dtype != np.uint8:
             cam_mask = cam_mask.astype(np.uint8)
+        # Shrink the mask inward first so the light stays inside the object
+        # silhouette (no spill onto the background). Erosion by a disk of the
+        # requested radius; cheap on the 848x480 cam mask.
+        shrink_px = max(0, int(self.cfg.mask_shrink_px))
+        if shrink_px > 0 and cv2 is not None:
+            k = 2 * shrink_px + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            cam_mask = cv2.erode(cam_mask, kernel)
         smooth_px = max(0, int(self.cfg.mask_smooth_px))
         if smooth_px > 0:
             k = 2 * smooth_px + 1

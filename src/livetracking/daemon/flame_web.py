@@ -740,6 +740,8 @@ def create_app() -> Flask:
         payload = {"cmd": "mask_tune"}
         if "smooth_px" in data:
             payload["smooth_px"] = data["smooth_px"]
+        if "shrink_px" in data:
+            payload["shrink_px"] = data["shrink_px"]
         return jsonify(_send_ctrl(payload))
 
     @app.route("/dino", methods=["GET"])

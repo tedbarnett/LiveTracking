@@ -260,6 +260,27 @@ _RENDERERS = {
     "water": _water,
 }
 
+
+def _shader_renderer(name: str):
+    """Wrap a GPU shader effect as a (w, h, t) -> (h, w, 3) RGB callable so it
+    drops into the same dispatch + cap + alpha path as the numpy effects. On
+    any GL failure the shader module returns None and we emit black, which the
+    projector composites as 'nothing lit' (graceful fallback)."""
+    def _fn(w: int, h: int, t: float) -> np.ndarray:
+        out = _shaders.render_shader(name, w, h, t)
+        if out is None:
+            return np.zeros((max(h, 1), max(w, 1), 3), dtype=np.uint8)
+        return out
+    return _fn
+
+
+try:
+    from livetracking.daemon import shader_effects as _shaders
+    for _sn in _shaders.SHADER_EFFECTS:
+        _RENDERERS[_sn] = _shader_renderer(_sn)
+except Exception:  # pragma: no cover - shader module/optional dep missing
+    _shaders = None
+
 # Effect names selectable in the UI (the flat single-color mode is "color"
 # and is handled directly by the projector, not here).
 EFFECTS = tuple(_RENDERERS.keys())
