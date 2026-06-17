@@ -419,14 +419,52 @@ class PerceptionDaemon:
         """Look up an object, warp its current cam_mask through the
         pipeline (so live cfg changes like mask_smooth_px take effect),
         and push the highlight to the projector. Returns True on success.
+
+        Hysteresis: same gate as _push_highlight_all — if the fresh SAM mask
+        hasn't moved/reshaped past threshold vs what's on screen, reuse the
+        shown mask instead of re-warping, so SAM's run-to-run wobble can't
+        jerk a static highlighted object every ~2 s.
         """
         with self.pipeline.tracker_lock:
             tracked = self.pipeline.tracker.visible()
         target = next((o for o in tracked if o.object_id == obj_id), None)
         if target is None or target.cam_mask is None:
             return False
-        # Re-warp from raw cam_mask using the LIVE cfg so a slider tweak
-        # is reflected immediately. Falls back to the cached proj_mask
+        prev = self._highlight_shown.get(obj_id)
+        stable = False
+        if self.highlight_hysteresis and prev is not None:
+            stable = _highlight_mask_stable(
+                prev.get("centroid_cam"),
+                tuple(target.centroid_cam)
+                if target.centroid_cam is not None else None,
+                prev.get("cam_mask"),
+                target.cam_mask,
+                self.highlight_move_px,
+                self.highlight_iou,
+            )
+        if stable:
+            # Hold: reuse the mask already on the projector; refresh only the
+            # live metadata (color/effect/name). No re-warp, no PNG rewrite.
+            target.proj_mask = prev.get("proj_mask")
+            target.centroid_proj = prev.get("centroid_proj")
+            payload = {
+                "type": "highlight",
+                "id": obj_id,
+                "name": target.name,
+                "color": list(target.color_rgb),
+                "effect": getattr(target, "effect", "color"),
+                "proj_centroid": (
+                    list(prev["centroid_proj"])
+                    if prev.get("centroid_proj") else None
+                ),
+                "mask_path": prev.get("mask_path"),
+            }
+            if pinned:
+                payload["pinned"] = True
+            self.proj_push.send_json(payload)
+            return True
+        # Update: re-warp from raw cam_mask using the LIVE cfg so a slider
+        # tweak is reflected immediately. Falls back to the cached proj_mask
         # if re-warp fails (shouldn't, but safety net).
         try:
             new_proj, new_centroid = (
@@ -441,6 +479,7 @@ class PerceptionDaemon:
             print(f"[perception] _push_highlight rewarp failed: {e!r}")
         if target.proj_mask is None:
             return False
+        mask_path = _save_mask_png(target)
         payload = {
             "type": "highlight",
             "id": obj_id,
@@ -450,11 +489,21 @@ class PerceptionDaemon:
             "proj_centroid": (
                 list(target.centroid_proj) if target.centroid_proj else None
             ),
-            "mask_path": _save_mask_png(target),
+            "mask_path": mask_path,
         }
         if pinned:
             payload["pinned"] = True
         self.proj_push.send_json(payload)
+        self._highlight_shown[obj_id] = {
+            "centroid_cam": (
+                tuple(target.centroid_cam)
+                if target.centroid_cam is not None else None
+            ),
+            "cam_mask": target.cam_mask.copy(),
+            "proj_mask": target.proj_mask,
+            "centroid_proj": target.centroid_proj,
+            "mask_path": mask_path,
+        }
         return True
 
     def _push_highlight_all(self, ids: Optional[List[int]] = None) -> int:
