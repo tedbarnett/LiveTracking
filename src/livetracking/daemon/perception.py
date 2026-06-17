@@ -1122,7 +1122,8 @@ class PerceptionDaemon:
         if cmd == "mask_get":
             cfg = self.pipeline.cfg
             return {"ok": True,
-                    "smooth_px": int(cfg.mask_smooth_px)}
+                    "smooth_px": int(cfg.mask_smooth_px),
+                    "shrink_px": int(cfg.mask_shrink_px)}
         if cmd == "dino_get":
             cfg = self.pipeline.cfg
             return {"ok": True,
@@ -1177,14 +1178,22 @@ class PerceptionDaemon:
                 v = int(msg["smooth_px"])
                 cfg.mask_smooth_px = max(0, min(25, v))
                 changed["smooth_px"] = cfg.mask_smooth_px
+            if "shrink_px" in msg:
+                v = int(msg["shrink_px"])
+                cfg.mask_shrink_px = max(0, min(40, v))
+                changed["shrink_px"] = cfg.mask_shrink_px
             print(f"[perception] mask_tune applied: {changed}")
             # Re-push the currently-shown highlight so the user sees the
-            # softness change immediately, without having to mouse-off
-            # and mouse-back-on the object row.
+            # change immediately, without having to mouse-off and
+            # mouse-back-on the object row. The shrink changes the mask
+            # itself, so invalidate the hysteresis hold to force a re-warp.
             if changed:
+                if "shrink_px" in changed:
+                    self._highlight_shown.clear()
                 self._refresh_active_highlight()
             return {"ok": True, "changed": changed,
-                    "current": {"smooth_px": int(cfg.mask_smooth_px)}}
+                    "current": {"smooth_px": int(cfg.mask_smooth_px),
+                                "shrink_px": int(cfg.mask_shrink_px)}}
         if cmd == "parallax_tune":
             # Live-mutate the pipeline config from a remote HTTP request.
             # Pipeline reads cfg on every frame, so changes take effect on
