@@ -114,6 +114,56 @@ def _dot_based_footprint_quad(
         return None
 
 
+def projector_quad_footprint(
+    H: np.ndarray,
+    proj_w: int,
+    proj_h: int,
+    cam_w: int,
+    cam_h: int,
+    min_px: int = 100,
+) -> Optional[np.ndarray]:
+    """Build a footprint mask from the projector's own RECTANGLE.
+
+    The projector physically throws a rectangle; its four frame corners
+    mapped back through H^-1 (H maps cam->proj) trace where that rectangle
+    lands in the camera image. For a wall-plane homography (as produced by
+    the gray-code calibrator, which RANSAC-selects the dominant plane before
+    fitting H) this is the true projector region on the wall — and it does
+    NOT depend on how brightly the cone edges reflect, so it is stable across
+    calibrations instead of shrinking to the contrast-gate's crisp center.
+
+    Returns a uint8 {0,255} mask sized (cam_h, cam_w), or None if H is
+    singular, the mapped quad is non-finite / lands wildly out of frame
+    (a sign the homography is bad), or the filled area is < ``min_px``.
+    Callers should fall back to a measured contrast-gate hull on None.
+    """
+    try:
+        H_inv = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return None
+    corners = np.array(
+        [[[0.0, 0.0]], [[proj_w, 0.0]], [[proj_w, proj_h]], [[0.0, proj_h]]],
+        dtype=np.float32,
+    )
+    quad = cv2.perspectiveTransform(corners, H_inv).reshape(-1, 2)
+    if not np.all(np.isfinite(quad)):
+        return None
+    # A sane wall-plane H keeps the projector throw near the frame. Allow a
+    # one-frame margin on every side; a quad that explodes beyond that means
+    # H is bad and we should not trust the quad for the footprint.
+    if not (
+        np.all(quad[:, 0] >= -cam_w) and np.all(quad[:, 0] <= 2 * cam_w)
+        and np.all(quad[:, 1] >= -cam_h) and np.all(quad[:, 1] <= 2 * cam_h)
+    ):
+        return None
+    quad_clip = np.clip(quad, [0, 0], [cam_w - 1, cam_h - 1]).astype(np.int32)
+    mask = np.zeros((cam_h, cam_w), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, quad_clip, 255)
+    if int((mask > 0).sum()) < min_px:
+        return None
+    return mask
+
+
 def save_homography(
     H: np.ndarray,
     proj_size: Tuple[int, int],

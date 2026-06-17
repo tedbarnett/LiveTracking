@@ -53,7 +53,10 @@ if SRC not in sys.path:
 
 from livetracking.paths import DISPLAY_INDEX, SCRIPT_OUT_DIR, describe
 from livetracking.perception.capture import RealSenseCapture
-from livetracking.perception.footprint import save_homography
+from livetracking.perception.footprint import (
+    projector_quad_footprint,
+    save_homography,
+)
 
 # ----------------------------------------------------------------------------
 # Tunables
@@ -423,18 +426,32 @@ def main() -> int:
         )
 
         # --- REAL footprint mask --------------------------------------------
-        # Convex hull of the CONTRAST-GATE cone (all projector-lit pixels),
-        # not of the decode survivors. Decode survivors cluster in the
-        # crisp center and undersell the cone by 5-40x; the contrast mask
-        # is the projector's actual reach. Hull-filled because perception
+        # The projector physically throws a RECTANGLE. Its outline in the
+        # camera image is the four projector-frame corners mapped back through
+        # H^-1. Because the gray-code H is fit on the RANSAC-dominant wall
+        # plane, this quad is the true blue projector region on the wall and
+        # does NOT depend on how brightly the cone edges reflect — so it stays
+        # the same shape/size every calibration instead of shrinking to the
+        # contrast-gate's crisp center.
+        #
+        # Fallback: if H is degenerate or the mapped quad lands wildly out of
+        # frame (bad H), fall back to the convex hull of the contrast-gate
+        # cone (all measurably-lit pixels). Hull-filled because perception
         # gates objects on footprint overlap.
-        cyx = np.column_stack(np.where(cone_mask > 0))  # (N, [y, x])
-        fp = np.zeros((ch, cw), dtype=np.uint8)
-        hull = cv2.convexHull(cyx[:, ::-1].astype(np.int32))  # -> (x, y)
-        cv2.fillConvexPoly(fp, hull, 255)
+        fp = projector_quad_footprint(H, PW, PH, cw, ch, min_px=MIN_VALID_PIXELS)
+        if fp is not None:
+            footprint_src = "projector-quad"
+        else:
+            print("[gray] projector-quad footprint rejected (bad/degenerate "
+                  "H); falling back to cone-gate hull")
+            footprint_src = "cone-hull-fallback"
+            fp = np.zeros((ch, cw), dtype=np.uint8)
+            cyx = np.column_stack(np.where(cone_mask > 0))  # (N, [y, x])
+            hull = cv2.convexHull(cyx[:, ::-1].astype(np.int32))  # -> (x, y)
+            cv2.fillConvexPoly(fp, hull, 255)
         n_fp = int((fp > 0).sum())
-        print(f"[gray] footprint: cone-gate {int((cone_mask > 0).sum())} px "
-              f"-> hull-filled {n_fp} px "
+        print(f"[gray] footprint [{footprint_src}]: cone-gate "
+              f"{int((cone_mask > 0).sum())} px -> {n_fp} px "
               f"({100.0 * n_fp / fp.size:.0f}% of frame)")
         cv2.imwrite(os.path.join(calib_dir, "footprint_measured.png"), fp)
 
