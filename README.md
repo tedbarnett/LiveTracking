@@ -31,6 +31,10 @@ The right v2 architecture (Ted's idea, 2026-05-25): project the camera frame bac
 
 ## Web UI
 
+**Preserved UI checkpoint — October 23, 2026:** the previously uncommitted compact layout uses a single status/control bar, a smaller camera/table split, compact nudge controls, and rounded coordinate/error displays. Existing daemon commands are unchanged. Python syntax verification passed; no camera/projector runtime or browser acceptance was performed for this preservation. The local checkout diverges from upstream main, so this checkpoint is published on `backup/pc5090-20261023`, not merged into upstream main or deployed.
+
+*Last updated by Helm — October 23, 2026*
+
 The projection daemon publishes its state to a Flask web app for monitoring
 and control:
 

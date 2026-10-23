@@ -63,17 +63,34 @@ INDEX_HTML = """<!doctype html>
 <link rel=\"manifest\" href=\"/manifest.webmanifest\">
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-         background: #111; color: #eee; margin: 0; padding: 20px; }
-  h1 { margin: 0 0 10px 0; font-size: 22px; }
-  .row { display: flex; gap: 20px; flex-wrap: wrap; }
-  .col { flex: 1; min-width: 320px; }
-  img.frame { width: 100%; max-width: 848px; border: 1px solid #333;
-              border-radius: 6px; background: #000; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { padding: 6px 10px; border-bottom: 1px solid #333; text-align: left;
-           font-variant-numeric: tabular-nums; }
-  th { background: #1c1c1c; color: #9cf; font-weight: 500; }
-  /* Per-target row colors match the projected + signs: 1=red, 2=green, 3=blue. */
+         background: #111; color: #eee; margin: 0; padding: 8px 10px; font-size: 13px; }
+  .topbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+            margin-bottom: 6px; }
+  .topbar h1 { margin: 0; font-size: 15px; color: #9cf; font-weight: 500;
+               letter-spacing: 0.5px; }
+  .status { color: #9cf; font-size: 11px;
+            font-variant-numeric: tabular-nums; }
+  .status .label { color: #666; margin-right: 3px; }
+  .status .sep { color: #333; margin: 0 6px; }
+  .controls { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+  .controls button { min-width: 40px; height: 36px; font-size: 18px;
+                     padding: 0 12px; }
+  button { background: #2d4a8a; color: white; border: none; padding: 8px 12px;
+           border-radius: 4px; cursor: pointer; font-size: 14px; }
+  button:hover { background: #3a5fb0; }
+  button.active { background: #4a8acc; }
+  button.danger { background: #8a3a3a; }
+  button.danger:hover { background: #b04a4a; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+  .col-cam { flex: 1 1 480px; min-width: 320px; }
+  .col-tbl { flex: 0 1 auto; min-width: 320px; }
+  img.frame { width: 100%; max-width: 720px; border: 1px solid #333;
+              border-radius: 4px; background: #000; display: block; }
+  table { border-collapse: collapse; font-size: 11px; }
+  th, td { padding: 2px 5px; border-bottom: 1px solid #222; text-align: left;
+           font-variant-numeric: tabular-nums; white-space: nowrap; }
+  th { background: #1c1c1c; color: #888; font-weight: 500; font-size: 10px;
+       text-transform: uppercase; letter-spacing: 0.5px; }
   tr.target-1 td { color: #ff7070; }
   tr.target-2 td { color: #70ff70; }
   tr.target-3 td { color: #80a0ff; }
@@ -83,58 +100,53 @@ INDEX_HTML = """<!doctype html>
   .nudge-grid { display: inline-grid;
                 grid-template-columns: 28px 28px 28px;
                 grid-template-rows: 22px 22px 22px;
-                gap: 2px; }
-  .nudge-grid button { padding: 0; font-size: 12px; line-height: 1;
-                       background: #2d4a8a; color: #eee; border: 1px solid #1a1a1a;
-                       border-radius: 3px; cursor: pointer; }
+                gap: 2px; vertical-align: middle; }
+  .nudge-grid button { padding: 0; font-size: 14px; line-height: 1;
+                       background: #2d4a8a; color: #eee; border: 0;
+                       border-radius: 3px; cursor: pointer; min-width: 0;
+                       height: 22px; }
   .nudge-grid button:hover { background: #3a5fb0; }
   .nudge-grid .empty { visibility: hidden; }
-  .nudge-grid .nudge-reset { background: #555; font-size: 10px; }
-  .nudge-label { font-size: 11px; color: #888; margin-top: 2px;
-                 font-variant-numeric: tabular-nums; }
-  .controls { display: flex; gap: 10px; margin: 16px 0; flex-wrap: wrap; }
-  button { background: #2d4a8a; color: white; border: none; padding: 10px 18px;
-           border-radius: 5px; cursor: pointer; font-size: 14px; }
-  button:hover { background: #3a5fb0; }
-  button.active { background: #4a8acc; }
-  button.danger { background: #8a3a3a; }
-  button.danger:hover { background: #b04a4a; }
-  .status { color: #9cf; font-size: 13px; margin-top: 6px;
-            font-variant-numeric: tabular-nums; }
-  .status .label { color: #888; margin-right: 6px; }
-  .toast { position: fixed; right: 20px; bottom: 20px; background: #2d4a8a;
-           color: white; padding: 10px 16px; border-radius: 5px; opacity: 0;
-           transition: opacity 0.3s; pointer-events: none; }
+  .nudge-grid .nudge-reset { background: #444; font-size: 11px; }
+  .nudge-label { font-size: 9px; color: #666; margin-left: 4px;
+                 font-variant-numeric: tabular-nums; display: inline-block;
+                 vertical-align: middle; }
+  .toast { position: fixed; right: 12px; bottom: 12px; background: #2d4a8a;
+           color: white; padding: 6px 10px; font-size: 11px; border-radius: 4px;
+           opacity: 0; transition: opacity 0.3s; pointer-events: none; }
   .toast.show { opacity: 1; }
 </style>
 </head>
 <body>
-  <h1>LiveTracking</h1>
-  <div class=\"status\">
-    <span class=\"label\">Mode:</span><span id=\"mode\">-</span>
-    <span class=\"label\" style=\"margin-left:14px\">Uptime:</span><span id=\"uptime\">-</span>
-    <span class=\"label\" style=\"margin-left:14px\">Heals:</span><span id=\"heals\">-</span>
-    <span class=\"label\" style=\"margin-left:14px\">Targets:</span><span id=\"target_count\">-</span>
-    <span class=\"label\" style=\"margin-left:14px\">Status:</span><span id=\"status\">-</span>
-  </div>
-
-  <div class=\"controls\">
-    <button id=\"btn_fill\" onclick=\"sendCmd('mode_fill')\">Fill mode</button>
-    <button id=\"btn_plus\" onclick=\"sendCmd('mode_plus')\">+ sign mode</button>
-    <button onclick=\"sendCmd('screenshot')\">Screenshot</button>
-    <button class=\"danger\" onclick=\"if (confirm('Re-detect all targets from scratch?')) sendCmd('restart')\">Restart / Recalibrate</button>
+  <div class=\"topbar\">
+    <h1>LiveTracking</h1>
+    <div class=\"status\">
+      <span id=\"status\">-</span>
+      <span class=\"sep\">·</span>
+      <span class=\"label\">mode</span><span id=\"mode\">-</span>
+      <span class=\"sep\">·</span>
+      <span class=\"label\">up</span><span id=\"uptime\">-</span>
+      <span class=\"sep\">·</span>
+      <span class=\"label\">heals</span><span id=\"heals\">-</span>
+      <span class=\"sep\">·</span>
+      <span class=\"label\">n</span><span id=\"target_count\">-</span>
+    </div>
+    <div class=\"controls\">
+      <button id=\"btn_plus\" onclick=\"sendCmd('mode_plus')\" title=\"+ sign mode\">+</button>
+      <button id=\"btn_fill\" onclick=\"sendCmd('mode_fill')\" title=\"Fill mode\">■</button>
+      <button onclick=\"sendCmd('screenshot')\" title=\"Screenshot\">📷</button>
+      <button class=\"danger\" onclick=\"if (confirm('Re-detect all targets from scratch?')) sendCmd('restart')\" title=\"Restart / Recalibrate\">↻</button>
+    </div>
   </div>
 
   <div class=\"row\">
-    <div class=\"col\">
-      <h3 style=\"margin-top:0\">Camera view</h3>
+    <div class=\"col-cam\">
       <img class=\"frame\" id=\"frame\" src=\"/api/frame.jpg\" alt=\"camera frame\">
     </div>
-    <div class=\"col\">
-      <h3 style=\"margin-top:0\">Tracked targets</h3>
+    <div class=\"col-tbl\">
       <table>
         <thead>
-          <tr><th>#</th><th>Cam (x, y)</th><th>Proj (x, y)</th><th>Err</th><th>Angle</th><th>Nudge</th></tr>
+          <tr><th>#</th><th>Cam</th><th>Proj</th><th>Err</th><th>°</th><th>Nudge</th></tr>
         </thead>
         <tbody id=\"targets\"></tbody>
       </table>
@@ -204,14 +216,17 @@ async function refresh() {
         '<span class=\"empty\"></span>' +
           '<button onclick=\"sendCmd(\\'nudge_' + idx + '_down\\')\">\u25bc</button>' +
           '<span class=\"empty\"></span>' +
-        '</div>' +
-        '<div class=\"nudge-label\">(' + nx + ', ' + ny + ')</div>';
+        '</div>';
+      const cx = Math.round(t.cam_xy[0]), cy = Math.round(t.cam_xy[1]);
+      const px = Math.round(t.proj_xy[0]), py = Math.round(t.proj_xy[1]);
+      const err = (typeof t.err_px === 'number') ? t.err_px.toFixed(1) : t.err_px;
+      const ang = (typeof t.angle_deg === 'number') ? Math.round(t.angle_deg) : t.angle_deg;
       tr.innerHTML = '<td>' + t.index + '</td>' +
-                      '<td>(' + t.cam_xy[0] + ', ' + t.cam_xy[1] + ')</td>' +
-                      '<td>(' + t.proj_xy[0] + ', ' + t.proj_xy[1] + ')</td>' +
-                      '<td>' + t.err_px + '</td>' +
-                      '<td>' + t.angle_deg + '\u00b0</td>' +
-                      '<td>' + grid + '</td>';
+                      '<td>' + cx + ',' + cy + '</td>' +
+                      '<td>' + px + ',' + py + '</td>' +
+                      '<td>' + err + '</td>' +
+                      '<td>' + ang + '</td>' +
+                      '<td>' + grid + '<span class=\"nudge-label\">(' + nx + ',' + ny + ')</span></td>';
       tbody.appendChild(tr);
     });
   } catch (e) {
